@@ -120,10 +120,8 @@ pub fn parse_binding_response(
             ATTR_XOR_MAPPED_ADDRESS => {
                 return decode_mapped_address(value, &txid, true);
             }
-            ATTR_MAPPED_ADDRESS => {
-                if fallback.is_none() {
-                    fallback = decode_mapped_address(value, &txid, false).ok();
-                }
+            ATTR_MAPPED_ADDRESS if fallback.is_none() => {
+                fallback = decode_mapped_address(value, &txid, false).ok();
             }
             _ => {}
         }
