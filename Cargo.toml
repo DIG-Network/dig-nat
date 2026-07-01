@@ -25,12 +25,16 @@ categories = ["network-programming"]
 
 [dependencies]
 # Canonical relay endpoint (DIG_RELAY_URL = wss://relay.dig.net:9450) — single source of truth.
-# `path` is used for local/superproject builds; `version` is what `cargo publish` records, so the
-# published dig-nat depends on the crates.io `dig-constants`. RELEASE ORDERING: dig-constants 0.2.x
-# (the version that introduced DIG_RELAY_URL) must be published to crates.io BEFORE dig-nat can be
-# published — the publish workflow will (correctly) fail until it is. This is the ecosystem's
-# release-first-for-shared-contracts rule; the orchestrator sequences the tags.
-dig-constants = { version = "0.2", path = "../dig-constants" }
+#
+# Sourcing: `DIG_RELAY_URL` was added in dig-constants 0.2.x, which is NOT yet on crates.io (only
+# 0.1.0 is). Until 0.2.x is published we resolve from the DIG-Network git repo so both the standalone
+# CI checkout and the superproject build compile against the real constant. `version = "0.2"` is what
+# `cargo publish` records, so the PUBLISHED dig-nat depends on the crates.io `dig-constants` (>=0.2).
+# RELEASE ORDERING (ecosystem rule: release-first for shared contracts): dig-constants 0.2.x must be
+# published to crates.io, and this `git` source swapped for the plain crates.io version, BEFORE
+# dig-nat is published — `cargo publish` rejects a git dependency, so the publish workflow enforces
+# this. The orchestrator sequences the tags.
+dig-constants = { version = "0.2", git = "https://github.com/DIG-Network/dig-constants" }
 
 # Async runtime + networking (UDP for NAT-PMP/PCP/STUN, TCP for direct/mTLS).
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
