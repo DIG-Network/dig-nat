@@ -1,0 +1,81 @@
+# dig-nat — abstract NAT traversal for DIG Node peer connections.
+#
+# One `connect(peer)` API establishes a mutually-authenticated (mTLS) peer connection using the
+# best available traversal method, transparently, with `relay.dig.net` as the LAST-RESORT fallback.
+# The caller never chooses the method.
+#
+# Dependency philosophy (mirrors the ecosystem's dig-relay / dig-node vendoring rationale):
+# the small, well-specified NAT datagrams (NAT-PMP RFC 6886, PCP RFC 6887, STUN RFC 5389) are
+# implemented DIRECTLY here — they are tiny fixed-layout packets, so implementing them keeps the
+# dependency tree small AND makes every byte unit-testable against the RFC layout with NO real
+# network. UPnP/IGD (SSDP discovery + SOAP) is the one genuinely large protocol, so we use the
+# maintained `igd-next` crate for the live gateway call, behind the same `TraversalMethod` trait as
+# the others so the ordering/fallback strategy is tested with mock methods regardless.
+[package]
+name = "dig-nat"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75.0"
+license = "Apache-2.0 OR MIT"
+description = "Abstract NAT traversal for DIG Node peer connections — one connect() API over direct, UPnP/IGD, NAT-PMP, PCP, relay-coordinated hole-punch, and relay.dig.net as last-resort fallback; establishes an mTLS peer connection with peer_id = SHA256(TLS SPKI DER)."
+repository = "https://github.com/DIG-Network/dig-nat"
+readme = "README.md"
+keywords = ["nat", "traversal", "p2p", "stun", "dig"]
+categories = ["network-programming"]
+
+[dependencies]
+# Canonical relay endpoint (DIG_RELAY_URL = wss://relay.dig.net:9450) — single source of truth.
+# `path` is used for local/superproject builds; `version` is what `cargo publish` records, so the
+# published dig-nat depends on the crates.io `dig-constants`. RELEASE ORDERING: dig-constants 0.2.x
+# (the version that introduced DIG_RELAY_URL) must be published to crates.io BEFORE dig-nat can be
+# published — the publish workflow will (correctly) fail until it is. This is the ecosystem's
+# release-first-for-shared-contracts rule; the orchestrator sequences the tags.
+dig-constants = { version = "0.2", path = "../dig-constants" }
+
+# Async runtime + networking (UDP for NAT-PMP/PCP/STUN, TCP for direct/mTLS).
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
+async-trait = "0.1"
+
+# Relay transport: JSON RelayMessage wire over a (secure) WebSocket.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Efficient byte-array (de)serialization for RangeFrame ciphertext payloads.
+serde_bytes = "0.11"
+
+# Stream multiplexing over the single mTLS byte stream: many cheap concurrent logical streams
+# (no head-of-line blocking) so several transfers — e.g. different byte ranges of a resource — run
+# at once to the same peer. `yamux` is the canonical maintained Rust mux; it runs over any
+# futures `AsyncRead + AsyncWrite`, so we bridge the tokio mTLS stream with `tokio-util`'s compat.
+yamux = "0.13"
+tokio-util = { version = "0.7", features = ["compat"] }
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+
+# mTLS transport. rustls (pure-Rust, no OpenSSL) so peer-cert capture + a custom verifier that
+# pins peer_id = SHA256(SPKI DER) is straightforward and portable across all target OSes.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1"
+# Parse the peer leaf certificate to lift the SubjectPublicKeyInfo DER (matches dig-gossip's
+# `peer_id_from_tls_spki_der` — SHA256 of the SPKI raw DER).
+x509-parser = "0.16"
+sha2 = "0.10"
+
+# UPnP/IGD port mapping — the one large protocol we don't hand-roll. `igd-next` is the maintained
+# fork of `igd`; its live SSDP+SOAP call sits behind the `TraversalMethod` trait.
+igd-next = { version = "0.17", features = ["aio_tokio"] }
+
+# Structured errors + observability.
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+# Loopback relay + fake IGD + mock methods drive the tests entirely in-process (no real network).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "test-util"] }
+tokio-tungstenite = "0.24"
+# Generate an ephemeral self-signed leaf cert for the mTLS identity + peer_id round-trip tests.
+rcgen = "0.13"
+
+[profile.release]
+overflow-checks = true
