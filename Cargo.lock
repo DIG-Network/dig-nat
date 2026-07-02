@@ -516,6 +516,7 @@ dependencies = [
  "tracing",
  "x509-parser",
  "yamux",
+ "zeroize",
 ]
 
 [[package]]

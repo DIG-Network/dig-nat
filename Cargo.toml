@@ -79,6 +79,13 @@ igd-next = { version = "0.17", features = ["aio_tokio"] }
 thiserror = "2"
 tracing = "0.1"
 
+# LocalIdentity.key_der (the node's mTLS private key, PKCS#8 DER) is held in Zeroizing<Vec<u8>> so
+# every clone (one per dial, see dialer.rs) and every drop scrubs the plaintext key bytes from
+# memory instead of leaving them in freed heap (matches the ecosystem's dig-keystore identity-key
+# hygiene, CLAUDE.md SS5.2). Already present transitively (via blst/chia-bls); declared directly
+# because dig-nat's own public type now depends on it.
+zeroize = "1"
+
 [dev-dependencies]
 # Loopback relay + fake IGD + mock methods drive the tests entirely in-process (no real network).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "test-util"] }

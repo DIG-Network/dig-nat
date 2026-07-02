@@ -227,7 +227,10 @@ impl MtlsDialer {
         captured: CapturedPeerId,
     ) -> Result<ClientConfig, String> {
         let cert = CertificateDer::from(self.identity.cert_der.clone());
-        let key = PrivateKeyDer::try_from(self.identity.key_der.clone())
+        // `key_der` is `Zeroizing<Vec<u8>>` (#179 finding 4); `.to_vec()` copies the bytes out into
+        // a plain `Vec<u8>` for rustls (which takes ownership into its own `PrivateKeyDer`) — the
+        // `Zeroizing` original still scrubs itself on drop as normal.
+        let key = PrivateKeyDer::try_from(self.identity.key_der.to_vec())
             .map_err(|e| format!("invalid private key: {e}"))?;
 
         let verifier = Arc::new(PeerIdPinningVerifier::new(Some(expected), captured));

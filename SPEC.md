@@ -24,6 +24,10 @@ connection.
   reject the handshake unless the remote's derived `peer_id` equals the `peer_id` the caller asked to
   reach (`PeerIdPinningVerifier`). The verified identity **MUST** be reported on the returned
   connection.
+- `LocalIdentity::key_der` (this node's PKCS#8 private key DER) **MUST** be held in a zeroizing
+  container (`zeroize::Zeroizing<Vec<u8>>`) so the plaintext key bytes are scrubbed on every clone
+  and drop — `LocalIdentity` is cloned per dial. Implementations **MUST NOT** hold the private key
+  material in a plain, non-zeroizing buffer.
 
 ## 3. Address-family policy — IPv6-first, IPv4-fallback (NORMATIVE)
 
