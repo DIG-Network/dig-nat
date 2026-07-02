@@ -154,6 +154,50 @@ async fn stun_query_reflexive_address_against_loopback_server() {
     assert_eq!(got.ip(), IpAddr::V4(Ipv4Addr::new(203, 0, 113, 55)));
 }
 
+/// #179 MEDIUM regression: `query_reflexive_address` previously discarded the datagram source
+/// (`let (n, _from) = ...`) and accepted ANY reply that passed the txid check, regardless of which
+/// host sent it. Here an "attacker" socket (NOT the queried `server`) sends a well-formed
+/// BINDING_SUCCESS with the correct (sniffed) transaction id and a poisoned reflexive address,
+/// racing ahead of the real server's genuine reply. The client MUST ignore the off-server datagram
+/// and keep waiting within the deadline for a reply that actually originates from `server`.
+#[tokio::test]
+async fn stun_ignores_response_from_non_queried_source() {
+    let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let attacker = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+
+    let genuine_reflexive = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 55)), 41234);
+    let poisoned_reflexive = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 66)), 6666);
+
+    tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        let (_, from) = server.recv_from(&mut buf).await.unwrap();
+        let txid: [u8; 12] = buf[8..20].try_into().unwrap();
+
+        // The attacker (a different socket/address than `server`) sends a well-formed, correctly
+        // txid'd BINDING_SUCCESS FIRST, carrying a poisoned reflexive address.
+        let spoofed = build_xor_mapped_response(&txid, poisoned_reflexive);
+        attacker.send_to(&spoofed, from).await.unwrap();
+
+        // Give the spoofed datagram a moment to arrive and (if the bug is present) be accepted
+        // before the genuine reply is sent.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The real server's genuine reply follows.
+        let genuine = build_xor_mapped_response(&txid, genuine_reflexive);
+        server.send_to(&genuine, from).await.unwrap();
+    });
+
+    let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let got = query_reflexive_address(&client, server_addr, Duration::from_secs(2))
+        .await
+        .expect("keeps waiting past the spoofed datagram and accepts the genuine reply");
+    assert_eq!(
+        got, genuine_reflexive,
+        "must return the server's genuine reflexive address, not the attacker's poisoned one"
+    );
+}
+
 #[tokio::test]
 async fn stun_query_times_out_when_no_server() {
     let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
