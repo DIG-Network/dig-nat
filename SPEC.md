@@ -120,7 +120,33 @@ winning stream.
   `dig.fetchRange`), and availability pre-checks (`PeerConnection::query_availability`,
   `dig.getAvailability`). Field names + wire shapes conform to the L7 peer-network spec.
 
-## 6. Configuration + defaults
+## 6. STUN/PCP anti-spoof requirements (NORMATIVE)
+
+STUN Binding responses (RFC 5389) and PCP MAP responses (RFC 6887) travel over unauthenticated UDP.
+Both protocols correlate a response to its request with a caller-chosen id (a 96-bit STUN transaction
+id / a 96-bit PCP MAP nonce) that is the primary defense against an off-path attacker forging a
+response before the real server's reply arrives. This crate additionally validates the response
+source address. Both properties are REQUIRED, independently of each other:
+
+- **Id/nonce generation MUST use a CSPRNG.** `stun::new_transaction_id` and the PCP MAP nonce
+  generator **MUST** fill every byte of the 96-bit id/nonce from a cryptographically secure random
+  source (`ring::rand::SystemRandom`). They **MUST NOT** derive the id/nonce from wall-clock time,
+  a counter, or any other attacker-predictable input — RFC 5389 §10.1 requires the STUN transaction
+  id be "uniformly and randomly chosen"; RFC 6887 §11.1 requires the PCP nonce be unpredictable.
+  A predictable id/nonce is a poisoning vulnerability: it is the only check that gates a forged
+  `BINDING_SUCCESS` / MAP-success response.
+- **Response source validation.** A STUN client performing [`stun::query_reflexive_address`] and the
+  PCP method's `transact` **MUST** verify the response datagram's source address equals the address
+  the request was sent to (the configured STUN `server` / the PCP `gateway`) before accepting the
+  response. A response from any other source **MUST** be discarded and the client **MUST** continue
+  waiting within the transaction's deadline (dropping the whole transaction on one mismatched
+  datagram would let a single spoofed packet defeat it). This is independent, defense-in-depth
+  hygiene alongside the id/nonce check — it does not replace it.
+- Both checks apply to every UDP request/response protocol this crate speaks (STUN today; PCP's
+  nonce check is the same pattern). NAT-PMP (RFC 6886) has no per-transaction nonce by protocol design
+  and is not held to the id/nonce requirement, but source validation still applies where practical.
+
+## 7. Configuration + defaults
 
 - `NatConfig` selects the enabled methods (default: all six), the per-method timeout, the relay
   endpoint (default `dig_constants::DIG_RELAY_URL`, `DIG_RELAY_URL=off` opt-out honored), and the STUN
@@ -128,7 +154,7 @@ winning stream.
 - `HappyEyeballsConfig` defaults to a ~250ms stagger and a generous per-attempt timeout (the strategy
   per-method timeout is the real outer bound).
 
-## 7. Public API surface (normative)
+## 8. Public API surface (normative)
 
 ```
 PeerTarget::with_addr(peer_id, addr, network_id)            // single candidate
@@ -151,7 +177,7 @@ dialer::MtlsDialer::new(identity).with_happy_eyeballs(cfg)
 connect(peer, identity, config) -> Result<PeerConnection, NatError>
 ```
 
-## 8. Conformance
+## 9. Conformance
 
 - Candidate ordering: given a mixed list, `direct_addrs()` returns all IPv6 before any IPv4, stable
   within family; the ordering is by `IpAddr` family, not the string form.
@@ -161,3 +187,7 @@ connect(peer, identity, config) -> Result<PeerConnection, NatError>
 - IPv6 selection: `select_global_ipv6` returns a global-unicast IPv6 and rejects link-local / ULA /
   loopback / unspecified.
 - Identity: `peer_id = SHA-256(SPKI DER)` matches `dig-gossip` (cross-crate conformance test).
+- STUN/PCP anti-spoof: transaction id / MAP nonce samples show CSPRNG-level variation across their
+  full byte range (not a wall-clock-derived pattern); `query_reflexive_address` and the PCP
+  `transact` accept a response only from the address the request was sent to, looping past a
+  mismatched-source datagram rather than failing the transaction outright.
