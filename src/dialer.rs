@@ -90,8 +90,17 @@ where
 
     // Defensive IPv6-first ordering: the priority index is the position in this ordered list, so
     // index 0 is the most-preferred (IPv6) candidate regardless of the caller's input order.
+    //
+    // #179 finding 5 (optimization): callers (`PeerTarget::direct_addrs`,
+    // `MethodOutcome::candidates`) already hand us an IPv6-first list, so cloning + re-sorting on
+    // EVERY connect attempt is redundant almost always. `is_ipv6_first` is a cheap O(n) check;
+    // only pay for the clone+sort when the input genuinely isn't already ordered — the ordering
+    // GUARANTEE itself is never dropped (a caller that hands in unsorted input still gets it
+    // corrected here).
     let mut ordered: Vec<std::net::SocketAddr> = candidates.to_vec();
-    crate::peer::sort_ipv6_first(&mut ordered);
+    if !crate::peer::is_ipv6_first(&ordered) {
+        crate::peer::sort_ipv6_first(&mut ordered);
+    }
     let total = ordered.len();
 
     // Each attempt yields (priority, addr, result); FuturesUnordered runs them concurrently. The

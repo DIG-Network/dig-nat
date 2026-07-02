@@ -68,6 +68,9 @@ fallback when the IPv6 candidate(s) fail or stall:
 
 - Candidates are attempted in IPv6-first priority order. The implementation **MUST** defensively
   re-order the candidates IPv6-first before racing (it does not rely on the caller having sorted).
+  An implementation **MAY** skip the re-order step when it can cheaply prove the input is already
+  IPv6-first (e.g. `peer::is_ipv6_first`) — this is a pure performance optimization and **MUST NOT**
+  weaken the guarantee: genuinely unsorted input **MUST** still be corrected.
 - The IPv6 candidate(s) **MUST** be started first. A lower-priority (IPv4) candidate **MAY** be
   started as a hedge once the preferred candidate has not completed within a configurable stagger
   (RFC 8305 "Connection Attempt Delay").
@@ -168,6 +171,7 @@ PeerTarget::direct_addrs() -> &[SocketAddr]                 // ordered IPv6-firs
 PeerTarget::direct_addr()  -> Option<SocketAddr>            // first (IPv6-preferred) candidate
 PeerTarget::set_direct_addrs(Vec<SocketAddr>)               // replace, re-sort IPv6-first
 peer::sort_ipv6_first(&mut [SocketAddr])                    // the ordering primitive
+peer::is_ipv6_first(&[SocketAddr]) -> bool                  // cheap "already ordered?" check
 
 MethodOutcome::single(kind, addr)                           // hole-punch / relayed (one address)
 MethodOutcome::candidates(kind, Vec<SocketAddr>)            // direct / mapping (IPv6-first list)

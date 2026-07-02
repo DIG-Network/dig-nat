@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 
 use dig_nat::method::direct::DirectMethod;
 use dig_nat::method::{TraversalKind, TraversalMethod};
+use dig_nat::peer::is_ipv6_first;
 use dig_nat::{PeerId, PeerTarget};
 
 fn sa(s: &str) -> SocketAddr {
@@ -98,6 +99,43 @@ fn peer_target_relay_only_has_no_candidates() {
     assert!(peer.direct_addrs().is_empty());
     assert_eq!(peer.direct_addr(), None);
 }
+
+// ---- #179 LOW/optimization: cheap "already IPv6-first?" check for the dial hot path ----
+//
+// `happy_eyeballs_connect` (dialer.rs) clones + re-sorts the WHOLE candidate slice on every connect
+// attempt even though callers (PeerTarget::direct_addrs, MethodOutcome::candidates) already hand it
+// an IPv6-first list. `is_ipv6_first` is the cheap `O(n)` check that lets the hot path skip the
+// clone+sort when it would be a no-op, while still catching genuinely unsorted input so the
+// defensive re-order guarantee is never dropped.
+
+#[test]
+fn is_ipv6_first_true_for_already_ordered_lists() {
+    assert!(is_ipv6_first(&[]), "empty list is trivially ordered");
+    assert!(is_ipv6_first(&[sa("[2001:db8::1]:1")]));
+    assert!(is_ipv6_first(&[sa("10.0.0.1:1")]));
+    assert!(is_ipv6_first(&[
+        sa("[2001:db8::1]:1"),
+        sa("[2001:db8::2]:1"),
+        sa("10.0.0.1:1"),
+        sa("10.0.0.2:1"),
+    ]));
+}
+
+#[test]
+fn is_ipv6_first_false_for_ipv4_before_ipv6() {
+    assert!(!is_ipv6_first(&[sa("10.0.0.1:1"), sa("[2001:db8::1]:1")]));
+    // A single IPv4 candidate ahead of a mixed tail is still unsorted.
+    assert!(!is_ipv6_first(&[
+        sa("10.0.0.1:1"),
+        sa("[2001:db8::1]:1"),
+        sa("10.0.0.2:1"),
+    ]));
+}
+
+// `happy_eyeballs_connect` must still defensively re-order genuinely-unsorted input (the
+// optimization must never drop the IPv6-first ordering guarantee) — covered end-to-end by
+// `attempts_ipv6_before_ipv4_on_all_fail` in `tests/happy_eyeballs.rs`, which passes an
+// intentionally IPv4-first candidate list straight into the public dial function.
 
 // ---- Direct method carries the whole ordered candidate list ----
 
