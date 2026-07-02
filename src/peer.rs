@@ -115,6 +115,30 @@ pub fn sort_ipv6_first(addrs: &mut [SocketAddr]) {
     addrs.sort_by_key(|a| if a.is_ipv6() { 0u8 } else { 1u8 });
 }
 
+/// Whether `addrs` is ALREADY ordered IPv6-first (every IPv6 candidate at or before every IPv4
+/// candidate) — i.e. [`sort_ipv6_first`] would be a no-op.
+///
+/// #179 finding 5 (optimization): the dial hot path ([`crate::dialer::happy_eyeballs_connect`])
+/// previously cloned + re-sorted the candidate slice on EVERY connect attempt even though callers
+/// (e.g. [`PeerTarget::direct_addrs`], [`crate::method::MethodOutcome::candidates`]) already produce
+/// IPv6-first-ordered lists. This cheap `O(n)` check lets the hot path skip the clone+sort when it
+/// would be redundant, while still defensively re-sorting when the input genuinely is not ordered
+/// (the ordering guarantee is never dropped — see [`crate::dialer::happy_eyeballs_connect`]).
+pub fn is_ipv6_first(addrs: &[SocketAddr]) -> bool {
+    // Equivalent to `addrs.is_sorted_by_key(...)`, hand-rolled because `is_sorted_by_key` only
+    // stabilized in Rust 1.82 and this crate's MSRV is 1.75.0.
+    fn family_key(a: &SocketAddr) -> u8 {
+        if a.is_ipv6() {
+            0
+        } else {
+            1
+        }
+    }
+    addrs
+        .windows(2)
+        .all(|w| family_key(&w[0]) <= family_key(&w[1]))
+}
+
 /// An established, mutually-authenticated, **multiplexed** connection to a peer.
 ///
 /// The connection is one mTLS byte stream whose remote presented a certificate whose `peer_id`
