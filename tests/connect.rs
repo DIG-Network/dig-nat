@@ -56,6 +56,24 @@ fn local_identity_rejects_bad_cert() {
     assert!(LocalIdentity::from_der(b"not a cert".to_vec(), b"key".to_vec()).is_none());
 }
 
+/// #179 LOW regression: `LocalIdentity.key_der` used to be a plain `Vec<u8>` — cloned per dial
+/// (`dialer.rs`) and never zeroized on drop, so DER private-key bytes lingered in freed heap. The
+/// field type MUST be `zeroize::Zeroizing<Vec<u8>>` so every clone/drop scrubs the bytes
+/// automatically. This is a type-level/compile-time proof: it only compiles if `key_der` is exactly
+/// that wrapper (a plain `Vec<u8>` would fail to coerce to `&[u8]` through `Zeroizing`'s `Deref`
+/// identically, and — more importantly — would not need the `zeroize` import at all for the
+/// `ZeroizeOnDrop` assertion below to be meaningful).
+#[test]
+fn local_identity_key_der_is_zeroizing() {
+    fn assert_zeroizing<T: zeroize::Zeroize>(_: &zeroize::Zeroizing<T>) {}
+
+    let id = local_identity();
+    assert_zeroizing(&id.key_der);
+    // Deref to &[u8] still works transparently for existing call sites (e.g. building a rustls
+    // PrivateKeyDer from it).
+    let _: &[u8] = &id.key_der;
+}
+
 /// With no enabled methods, connect returns NoMethodsEnabled (never panics).
 #[tokio::test]
 async fn connect_no_methods_enabled() {

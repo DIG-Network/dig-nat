@@ -4,6 +4,8 @@
 
 use std::time::Duration;
 
+use zeroize::Zeroizing;
+
 use crate::identity::PeerId;
 use crate::method::TraversalKind;
 
@@ -18,7 +20,12 @@ pub struct LocalIdentity {
     /// This node's leaf certificate, DER-encoded.
     pub cert_der: Vec<u8>,
     /// The matching private key, DER-encoded (PKCS#8).
-    pub key_der: Vec<u8>,
+    ///
+    /// #179 finding 4: wrapped in [`Zeroizing`] (rather than a plain `Vec<u8>`) so every clone
+    /// (`LocalIdentity` is cloned per dial, see `dialer.rs`) and every drop scrubs the private-key
+    /// bytes from memory instead of leaving them in freed heap. Derefs transparently to `&[u8]` for
+    /// existing call sites (e.g. building a `rustls::pki_types::PrivateKeyDer`).
+    pub key_der: Zeroizing<Vec<u8>>,
     /// This node's own `peer_id` = SHA-256(cert SPKI DER).
     pub peer_id: PeerId,
 }
@@ -30,7 +37,7 @@ impl LocalIdentity {
         let peer_id = crate::identity::peer_id_from_leaf_cert_der(&cert_der)?;
         Some(LocalIdentity {
             cert_der,
-            key_der,
+            key_der: Zeroizing::new(key_der),
             peer_id,
         })
     }
