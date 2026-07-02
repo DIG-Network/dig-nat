@@ -61,6 +61,11 @@ futures = { version = "0.3", default-features = false, features = ["std", "async
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = "1"
+# CSPRNG for STUN transaction ids (RFC 5389 §10.1) and PCP MAP nonces (RFC 6887 §11.1) — both are
+# the sole anti-spoof check on their respective UDP responses and MUST be unpredictable, not derived
+# from wall-clock time. `ring` is already pulled in transitively by rustls; declared directly here
+# because dig-nat itself now calls `ring::rand::SystemRandom`, not just rustls internals.
+ring = "0.17"
 # Parse the peer leaf certificate to lift the SubjectPublicKeyInfo DER (matches dig-gossip's
 # `peer_id_from_tls_spki_der` — SHA256 of the SPKI raw DER).
 x509-parser = "0.16"

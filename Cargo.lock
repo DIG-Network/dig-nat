@@ -501,6 +501,7 @@ dependencies = [
  "futures-util",
  "igd-next",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-pki-types",
  "serde",

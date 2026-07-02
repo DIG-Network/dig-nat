@@ -215,14 +215,28 @@ pub async fn query_reflexive_address(
     parse_binding_response(&buf[..n], Some(&txid))
 }
 
-/// Generate a 96-bit transaction id. Uses the current time + socket-ish entropy; STUN only needs it
-/// to be unpredictable enough to match a response to a request, not cryptographically random.
-fn new_transaction_id() -> [u8; 12] {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+/// Generate a 96-bit STUN transaction id from a CSPRNG (RFC 5389 §10.1: "It primarily serves to
+/// correlate requests with responses... **and MUST be uniformly and randomly chosen from the
+/// interval 0 .. 2**96 - 1, and SHOULD be cryptographically random").
+///
+/// The transaction id is the ONLY anti-spoof mechanism [`query_reflexive_address`] applies to a
+/// Binding response (the datagram source is not validated in isolation — see
+/// [`query_reflexive_address`]'s source check): a predictable id (e.g. one derived from wall-clock
+/// time) lets an off-path attacker who can approximate the send instant forge a `BINDING_SUCCESS`
+/// carrying a poisoned reflexive address before the real STUN server's reply arrives. Sourcing every
+/// bit from [`ring::rand::SystemRandom`] (already in the dependency tree via rustls) closes that.
+///
+/// `pub` so tests can assert directly on the id's statistical properties (see `tests/stun.rs`)
+/// without re-running the full network transaction.
+pub fn new_transaction_id() -> [u8; 12] {
+    use ring::rand::{SecureRandom, SystemRandom};
+
     let mut id = [0u8; 12];
-    id.copy_from_slice(&now.to_le_bytes()[..12]);
+    // `SystemRandom::fill` only fails on catastrophic RNG unavailability (e.g. no OS entropy
+    // source) — there is no sane fallback in that case, so we panic rather than silently degrade
+    // back to a predictable id (which would reopen exactly the vulnerability this fixes).
+    SystemRandom::new()
+        .fill(&mut id)
+        .expect("OS CSPRNG must be available to generate a STUN transaction id");
     id
 }
