@@ -56,7 +56,7 @@ async fn natpmp_attempt_succeeds_against_loopback_gateway() {
     m.timeout = Duration::from_secs(2);
     let out = m.attempt(&peer("198.51.100.7:4444")).await.unwrap();
     assert_eq!(out.kind, TraversalKind::NatPmp);
-    assert_eq!(out.dial_addr, "198.51.100.7:4444".parse().unwrap());
+    assert_eq!(out.dial_addr(), Some("198.51.100.7:4444".parse().unwrap()));
 }
 
 /// No gateway listening → the NAT-PMP method times out (and reports a timeout MethodError).
@@ -111,7 +111,7 @@ async fn pcp_attempt_succeeds_against_loopback_gateway() {
     m.timeout = Duration::from_secs(2);
     let out = m.attempt(&peer("198.51.100.7:4444")).await.unwrap();
     assert_eq!(out.kind, TraversalKind::Pcp);
-    assert_eq!(out.dial_addr, "198.51.100.7:4444".parse().unwrap());
+    assert_eq!(out.dial_addr(), Some("198.51.100.7:4444".parse().unwrap()));
 }
 
 #[tokio::test]

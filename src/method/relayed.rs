@@ -66,10 +66,8 @@ impl<T: RelayedTransport> TraversalMethod for RelayedTransportMethod<T> {
             .open_relayed(&peer.peer_id.to_hex(), &peer.network_id)
             .await
             .map_err(|e| MethodError::failed(TraversalKind::Relayed, e))?;
-        Ok(MethodOutcome {
-            kind: TraversalKind::Relayed,
-            // The "dial address" for the relayed tier is the RELAY — all data flows through it.
-            dial_addr: relay_addr,
-        })
+        // The "dial address" for the relayed tier is the RELAY — all data flows through it (a single
+        // endpoint, not a candidate list).
+        Ok(MethodOutcome::single(TraversalKind::Relayed, relay_addr))
     }
 }

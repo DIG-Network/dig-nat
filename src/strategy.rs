@@ -32,11 +32,12 @@ use crate::error::{MethodError, NatError};
 use crate::method::{MethodOutcome, TraversalKind, TraversalMethod};
 use crate::peer::{PeerConnection, PeerTarget};
 
-/// Establishes the actual mTLS peer connection once a method has produced a reachable address.
+/// Establishes the actual mTLS peer connection once a method has produced reachable address(es).
 ///
-/// For the direct/mapping/hole-punch methods this is a rustls mTLS dial to `outcome.dial_addr`; for
-/// the relayed method it opens the mTLS session tunnelled through the relay. Abstracted so the
-/// strategy is testable and the transport detail lives in one place ([`crate::dialer`]).
+/// For the direct/mapping/hole-punch methods this is a rustls mTLS dial that races
+/// `outcome.dial_addrs` **IPv6-first with IPv4 fallback** (happy eyeballs); for the relayed method it
+/// opens the mTLS session tunnelled through the relay. Abstracted so the strategy is testable and the
+/// transport detail lives in one place ([`crate::dialer`]).
 #[async_trait]
 pub trait Dialer: Send + Sync {
     /// Establish an mTLS connection to `peer` using the reachable address in `outcome`, verifying

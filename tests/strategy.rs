@@ -48,10 +48,10 @@ impl TraversalMethod for MockMethod {
         self.order_log.lock().unwrap().push(self.kind);
         self.counter.fetch_add(1, Ordering::SeqCst);
         if self.succeed {
-            Ok(MethodOutcome {
-                kind: self.kind,
-                dial_addr: "127.0.0.1:1".parse().unwrap(),
-            })
+            Ok(MethodOutcome::single(
+                self.kind,
+                "127.0.0.1:1".parse().unwrap(),
+            ))
         } else {
             Err(MethodError::failed(self.kind, "mock failure"))
         }
@@ -278,7 +278,7 @@ impl Dialer for SucceedingDialer {
         Ok(PeerConnection {
             peer_id: peer.peer_id,
             method: outcome.kind,
-            remote_addr: outcome.dial_addr,
+            remote_addr: outcome.dial_addr().unwrap(),
             session: loopback_client_session(),
         })
     }
@@ -303,7 +303,7 @@ impl Dialer for DialFailsFor {
             return Ok(PeerConnection {
                 peer_id: peer.peer_id,
                 method: outcome.kind,
-                remote_addr: outcome.dial_addr,
+                remote_addr: outcome.dial_addr().unwrap(),
                 session: loopback_client_session(),
             });
         }

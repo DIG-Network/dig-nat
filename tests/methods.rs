@@ -59,8 +59,12 @@ async fn direct_yields_known_address() {
         .unwrap();
     assert_eq!(out.kind, TraversalKind::Direct);
     assert_eq!(
-        out.dial_addr,
-        "203.0.113.5:4444".parse::<SocketAddr>().unwrap()
+        out.dial_addr(),
+        Some("203.0.113.5:4444".parse::<SocketAddr>().unwrap())
+    );
+    assert_eq!(
+        out.dial_addrs,
+        vec!["203.0.113.5:4444".parse::<SocketAddr>().unwrap()]
     );
 }
 
@@ -95,8 +99,8 @@ async fn upnp_maps_then_yields_dial_addr() {
         .unwrap();
     assert_eq!(out.kind, TraversalKind::Upnp);
     assert_eq!(
-        out.dial_addr,
-        "198.51.100.9:4444".parse::<SocketAddr>().unwrap()
+        out.dial_addr(),
+        Some("198.51.100.9:4444".parse::<SocketAddr>().unwrap())
     );
 }
 
@@ -140,7 +144,7 @@ async fn hole_punch_yields_peers_direct_external_address() {
     let out = m.attempt(&peer_no_addr()).await.unwrap();
     assert_eq!(out.kind, TraversalKind::HolePunch);
     // The dial address is the PEER's external address — a DIRECT p2p path, not the relay.
-    assert_eq!(out.dial_addr, peer_ext);
+    assert_eq!(out.dial_addr(), Some(peer_ext));
 }
 
 #[tokio::test]
@@ -176,7 +180,7 @@ async fn relayed_yields_relay_as_data_path() {
     let out = m.attempt(&peer_no_addr()).await.unwrap();
     assert_eq!(out.kind, TraversalKind::Relayed);
     // For the relayed tier the "dial address" is the RELAY — all data flows through it.
-    assert_eq!(out.dial_addr, relay);
+    assert_eq!(out.dial_addr(), Some(relay));
 }
 
 #[tokio::test]

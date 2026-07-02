@@ -3,9 +3,10 @@
 //! rejects a mismatch, and that the resulting PeerConnection's mux passthroughs work end-to-end.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use dig_nat::config::LocalIdentity;
-use dig_nat::dialer::MtlsDialer;
+use dig_nat::dialer::{HappyEyeballsConfig, MtlsDialer};
 use dig_nat::identity::peer_id_from_leaf_cert_der;
 use dig_nat::method::{MethodOutcome, TraversalKind};
 use dig_nat::mux::{
@@ -91,10 +92,7 @@ async fn dial_success_verifies_identity_and_muxes() {
 
     let dialer = MtlsDialer::new(local_identity());
     let peer = PeerTarget::with_addr(server_id, addr, "DIG_MAINNET");
-    let outcome = MethodOutcome {
-        kind: TraversalKind::Direct,
-        dial_addr: addr,
-    };
+    let outcome = MethodOutcome::single(TraversalKind::Direct, addr);
 
     let mut conn = dialer.dial(&peer, &outcome).await.expect("dial succeeds");
     assert_eq!(
@@ -128,10 +126,7 @@ async fn dial_rejects_wrong_peer_id() {
     // Pin to a different id than the server presents.
     let wrong = PeerId::from_bytes([0x7fu8; 32]);
     let peer = PeerTarget::with_addr(wrong, addr, "DIG_MAINNET");
-    let outcome = MethodOutcome {
-        kind: TraversalKind::Direct,
-        dial_addr: addr,
-    };
+    let outcome = MethodOutcome::single(TraversalKind::Direct, addr);
 
     let err = dialer.dial(&peer, &outcome).await.unwrap_err();
     assert_eq!(err.kind, TraversalKind::Direct);
@@ -140,6 +135,46 @@ async fn dial_rejects_wrong_peer_id() {
         "handshake rejected on identity mismatch, got: {}",
         err.reason
     );
+}
+
+/// Happy eyeballs end-to-end over the PRODUCTION dialer: given an unreachable IPv6 candidate FIRST
+/// and a working IPv4 loopback second, the dialer tries IPv6 first, falls back to IPv4, and
+/// establishes the mTLS session — proving the IPv6-first / IPv4-fallback dial path is wired through
+/// the real `MtlsDialer` (not just the pure racing helper).
+#[tokio::test]
+async fn dial_falls_back_from_unreachable_ipv6_to_ipv4() {
+    let (scert, skey, server_id) = gen();
+    let addr = spawn_mtls_server(scert, skey).await; // 127.0.0.1:<port> (IPv4 loopback)
+
+    // A short happy-eyeballs config so the IPv6 attempt fails fast and the fallback is quick.
+    let dialer = MtlsDialer::new(local_identity()).with_happy_eyeballs(HappyEyeballsConfig {
+        per_attempt_timeout: Duration::from_secs(2),
+        stagger: Duration::from_millis(30),
+    });
+
+    // Documentation range 2001:db8::/32 is not routable — the IPv6 attempt fails; IPv4 loopback wins.
+    let unreachable_v6: std::net::SocketAddr = "[2001:db8::1]:9".parse().unwrap();
+    let peer = PeerTarget::with_addrs(server_id, vec![unreachable_v6, addr], "DIG_MAINNET");
+    // The outcome carries the peer's IPv6-first candidate list (IPv6 first, IPv4 fallback).
+    let outcome = MethodOutcome::candidates(TraversalKind::Direct, peer.direct_addrs().to_vec());
+    assert!(
+        outcome.dial_addrs[0].is_ipv6(),
+        "IPv6 candidate is tried first"
+    );
+
+    let conn = dialer
+        .dial(&peer, &outcome)
+        .await
+        .expect("falls back to the reachable IPv4 candidate");
+    assert_eq!(
+        conn.peer_id, server_id,
+        "mTLS identity verified over IPv4 fallback"
+    );
+    assert_eq!(
+        conn.remote_addr, addr,
+        "connected over the IPv4 loopback address"
+    );
+    assert!(conn.remote_addr.is_ipv4());
 }
 
 /// Dialing an address with nothing listening fails cleanly (tcp connect error), no panic/hang.
@@ -151,10 +186,7 @@ async fn dial_tcp_refused_is_clean_error() {
         "127.0.0.1:9".parse().unwrap(),
         "DIG_MAINNET",
     );
-    let outcome = MethodOutcome {
-        kind: TraversalKind::Direct,
-        dial_addr: "127.0.0.1:9".parse().unwrap(),
-    };
+    let outcome = MethodOutcome::single(TraversalKind::Direct, "127.0.0.1:9".parse().unwrap());
     let err = dialer.dial(&peer, &outcome).await.unwrap_err();
     assert_eq!(err.kind, TraversalKind::Direct);
     assert!(err.reason.contains("tcp connect"));

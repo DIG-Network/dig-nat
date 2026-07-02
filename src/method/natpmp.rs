@@ -197,13 +197,15 @@ impl TraversalMethod for NatPmpMethod {
     }
 
     async fn attempt(&self, peer: &PeerTarget) -> Result<MethodOutcome, MethodError> {
-        // NAT-PMP opens OUR pinhole; we still need the peer's address to dial afterwards.
-        let dial_addr = peer.direct_addr.ok_or_else(|| {
-            MethodError::failed(
+        // NAT-PMP opens OUR pinhole; we still need the peer's address(es) to dial afterwards. Carry
+        // the peer's whole IPv6-first candidate list so the post-mapping dial keeps the fallback.
+        let dial_addrs = peer.direct_addrs();
+        if dial_addrs.is_empty() {
+            return Err(MethodError::failed(
                 TraversalKind::NatPmp,
                 "peer has no address to dial after mapping",
-            )
-        })?;
+            ));
+        }
 
         // 1) Confirm a NAT-PMP gateway exists (external-address request).
         let resp = self
@@ -217,10 +219,10 @@ impl TraversalMethod for NatPmpMethod {
         let resp = self.transact(&map).await.map_err(|e| to_method_error(&e))?;
         parse_map_response(&resp, false).map_err(|e| to_method_error(&e))?;
 
-        Ok(MethodOutcome {
-            kind: TraversalKind::NatPmp,
-            dial_addr,
-        })
+        Ok(MethodOutcome::candidates(
+            TraversalKind::NatPmp,
+            dial_addrs.to_vec(),
+        ))
     }
 }
 
