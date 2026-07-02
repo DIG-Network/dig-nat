@@ -3,8 +3,8 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use dig_nat::method::pcp::{
-    encode_map_request, parse_map_response, MapNonce, PcpError, OP_MAP, PCP_VERSION, PROTO_UDP,
-    RESPONSE_BIT,
+    encode_map_request, new_nonce, parse_map_response, MapNonce, PcpError, OP_MAP, PCP_VERSION,
+    PROTO_UDP, RESPONSE_BIT,
 };
 
 const NONCE: MapNonce = [7, 6, 5, 4, 3, 2, 1, 0, 9, 8, 7, 6];
@@ -86,6 +86,51 @@ fn rejects_truncated() {
     assert_eq!(
         parse_map_response(&[0u8; 10], &NONCE),
         Err(PcpError::Truncated)
+    );
+}
+
+// ---- #179 MEDIUM: PCP MAP nonce must come from a CSPRNG, not wall-clock time ----
+//
+// Regression for SECURITY_AUDIT_P2P.md `## dig-nat` finding 3: `new_nonce` used to copy
+// `SystemTime::now()` nanoseconds (little-endian) into all 12 bytes of the MAP nonce, the identical
+// predictable pattern as the STUN transaction id (finding 1). `parse_map_response`'s nonce check is
+// the sole anti-spoof validator for a MAP response, so a predictable nonce lets an attacker on the
+// gateway path forge a MAP success with a guessed nonce and misdirect the assigned external
+// port/IP. RFC 6887 SS11.1 requires the nonce be unpredictable.
+
+#[test]
+fn nonces_are_not_sequential_wall_clock_samples() {
+    let nonces: Vec<MapNonce> = (0..64).map(|_| new_nonce()).collect();
+
+    for i in 0..nonces.len() {
+        for j in (i + 1)..nonces.len() {
+            assert_ne!(
+                nonces[i], nonces[j],
+                "nonces must not collide across samples"
+            );
+        }
+    }
+
+    // The old implementation packed nanoseconds-since-epoch little-endian into 12 bytes, leaving
+    // bytes 8..12 (the high-order 32 bits of the 96-bit field) zero for centuries. A CSPRNG must
+    // vary those bytes.
+    assert!(
+        nonces.iter().any(|n| n[8..12] != [0u8, 0, 0, 0]),
+        "high-order bytes must vary — a wall-clock-nanosecond source leaves them zero"
+    );
+}
+
+#[test]
+fn nonce_is_not_derived_from_current_time() {
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let nonce = new_nonce();
+    let low8 = u64::from_le_bytes(nonce[0..8].try_into().unwrap());
+    assert_ne!(
+        low8, now_nanos as u64,
+        "MAP nonce must not equal the wall-clock nanosecond timestamp"
     );
 }
 
