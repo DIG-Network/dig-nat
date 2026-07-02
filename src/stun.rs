@@ -193,6 +193,17 @@ fn decode_mapped_address(
 ///
 /// The `socket` should be the very UDP socket whose external mapping the caller wants to learn —
 /// the reflexive address is specific to the NAT binding created by *that* socket.
+///
+/// ## Anti-spoof: source address validation (#179 finding 2)
+///
+/// A UDP reply's source address is easy to check and hard for an off-path attacker to spoof
+/// (spoofing the source AND getting the reply routed back requires being on-path or the same
+/// network). This function therefore accepts a datagram only when it actually originates from
+/// `server`; anything else (a stray reply, a scan, an attacker racing a forged response) is
+/// discarded and the receive loop continues within the overall `timeout` deadline — a single
+/// mismatched-source datagram must not fail the whole transaction, since the real reply may still be
+/// in flight. This is independent, defense-in-depth hygiene alongside the transaction-id check
+/// ([`new_transaction_id`]); neither replaces the other.
 pub async fn query_reflexive_address(
     socket: &UdpSocket,
     server: SocketAddr,
@@ -206,13 +217,23 @@ pub async fn query_reflexive_address(
         .map_err(|e| StunError::Io(e.to_string()))?;
 
     let mut buf = [0u8; 512];
-    let recv = tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await;
-    let (n, _from) = match recv {
-        Ok(Ok(x)) => x,
-        Ok(Err(e)) => return Err(StunError::Io(e.to_string())),
-        Err(_) => return Err(StunError::Timeout),
-    };
-    parse_binding_response(&buf[..n], Some(&txid))
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(StunError::Timeout);
+        }
+        let (n, from) = match tokio::time::timeout(remaining, socket.recv_from(&mut buf)).await {
+            Ok(Ok(x)) => x,
+            Ok(Err(e)) => return Err(StunError::Io(e.to_string())),
+            Err(_) => return Err(StunError::Timeout),
+        };
+        if from != server {
+            // Not from the queried server — ignore and keep waiting for the genuine reply.
+            continue;
+        }
+        return parse_binding_response(&buf[..n], Some(&txid));
+    }
 }
 
 /// Generate a 96-bit STUN transaction id from a CSPRNG (RFC 5389 §10.1: "It primarily serves to
