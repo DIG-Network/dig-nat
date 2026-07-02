@@ -114,6 +114,68 @@ async fn pcp_attempt_succeeds_against_loopback_gateway() {
     assert_eq!(out.dial_addr(), Some("198.51.100.7:4444".parse().unwrap()));
 }
 
+/// #179 MEDIUM regression: PCP's `transact()` previously discarded the response datagram's source
+/// (`Ok(Ok((n, _)))`) and accepted any reply echoing the right nonce, regardless of which host sent
+/// it. Here an "attacker" socket (NOT the real gateway) sends a well-formed MAP success echoing the
+/// (sniffed) nonce but assigning a poisoned external port/IP, racing ahead of the genuine gateway
+/// reply. The genuine reply — from the actual gateway address — must be the one `attempt` returns.
+#[tokio::test]
+async fn pcp_ignores_response_from_non_gateway_source() {
+    let gw = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let gw_addr = gw.local_addr().unwrap();
+    let attacker = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+
+    tokio::spawn(async move {
+        let mut buf = [0u8; 128];
+        let (n, from) = gw.recv_from(&mut buf).await.unwrap();
+        assert!(n >= 60, "a PCP MAP request is 60 bytes");
+        let nonce: MapNonce = buf[24..36].try_into().unwrap();
+
+        // Attacker sends a spoofed MAP success first, from a different socket/address, echoing the
+        // sniffed nonce and assigning a poisoned external port/IP.
+        let mut spoofed = vec![0u8; 60];
+        spoofed[0] = PCP_VERSION;
+        spoofed[1] = OP_MAP | RESPONSE_BIT;
+        spoofed[3] = 0;
+        spoofed[4..8].copy_from_slice(&7200u32.to_be_bytes());
+        spoofed[24..36].copy_from_slice(&nonce);
+        spoofed[36] = PROTO_UDP;
+        spoofed[42..44].copy_from_slice(&6666u16.to_be_bytes());
+        let poisoned = Ipv4Addr::new(198, 51, 100, 66).to_ipv6_mapped().octets();
+        spoofed[44..60].copy_from_slice(&poisoned);
+        attacker.send_to(&spoofed, from).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The genuine gateway reply follows.
+        let mut resp = vec![0u8; 60];
+        resp[0] = PCP_VERSION;
+        resp[1] = OP_MAP | RESPONSE_BIT;
+        resp[3] = 0;
+        resp[4..8].copy_from_slice(&7200u32.to_be_bytes());
+        resp[24..36].copy_from_slice(&nonce);
+        resp[36] = PROTO_UDP;
+        resp[42..44].copy_from_slice(&5555u16.to_be_bytes());
+        let mapped = Ipv4Addr::new(203, 0, 113, 9).to_ipv6_mapped().octets();
+        resp[44..60].copy_from_slice(&mapped);
+        gw.send_to(&resp, from).await.unwrap();
+    });
+
+    let mut m = PcpMethod::new(
+        *ipv4(gw_addr),
+        4444,
+        IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
+    );
+    m.gateway = to_v4(gw_addr);
+    m.timeout = Duration::from_secs(2);
+    let out = m
+        .attempt(&peer("198.51.100.7:4444"))
+        .await
+        .expect("keeps waiting past the spoofed datagram and accepts the genuine reply");
+    assert_eq!(out.kind, TraversalKind::Pcp);
+    assert_eq!(out.dial_addr(), Some("198.51.100.7:4444".parse().unwrap()));
+}
+
 #[tokio::test]
 async fn pcp_times_out_when_no_gateway() {
     let mut m = PcpMethod::new(Ipv4Addr::LOCALHOST, 4444, IpAddr::V4(Ipv4Addr::LOCALHOST));

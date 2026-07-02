@@ -171,6 +171,11 @@ impl PcpMethod {
     }
 
     /// Send a PCP request and read one response datagram, bounded by [`Self::timeout`].
+    ///
+    /// Validates the response source == [`Self::gateway`] (#179 finding 3, defense-in-depth
+    /// alongside the CSPRNG MAP nonce): a datagram from any other address is discarded and the
+    /// receive loop continues within the deadline, so a single spoofed reply from an attacker on the
+    /// gateway path cannot defeat a transaction whose genuine reply is still in flight.
     async fn transact(&self, payload: &[u8]) -> Result<Vec<u8>, PcpError> {
         let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
             .await
@@ -180,10 +185,23 @@ impl PcpMethod {
             .await
             .map_err(|e| PcpError::Io(e.to_string()))?;
         let mut buf = [0u8; 128];
-        match tokio::time::timeout(self.timeout, socket.recv_from(&mut buf)).await {
-            Ok(Ok((n, _))) => Ok(buf[..n].to_vec()),
-            Ok(Err(e)) => Err(PcpError::Io(e.to_string())),
-            Err(_) => Err(PcpError::Timeout),
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(PcpError::Timeout);
+            }
+            let (n, from) = match tokio::time::timeout(remaining, socket.recv_from(&mut buf)).await
+            {
+                Ok(Ok(x)) => x,
+                Ok(Err(e)) => return Err(PcpError::Io(e.to_string())),
+                Err(_) => return Err(PcpError::Timeout),
+            };
+            if from != SocketAddr::V4(self.gateway) {
+                // Not from the gateway we queried — ignore and keep waiting for the genuine reply.
+                continue;
+            }
+            return Ok(buf[..n].to_vec());
         }
     }
 }
@@ -247,14 +265,23 @@ fn ip_from_16(bytes: [u8; 16]) -> IpAddr {
     }
 }
 
-/// Generate a MAP nonce (RFC 6887 only needs it unpredictable enough to match req↔resp).
-fn new_nonce() -> MapNonce {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+/// Generate a 96-bit PCP MAP nonce from a CSPRNG (RFC 6887 §11.1 requires the nonce be
+/// unpredictable so a peer/attacker cannot forge or overwrite another client's mapping).
+///
+/// `parse_map_response`'s echoed-nonce check is the sole anti-spoof validator for a MAP response
+/// (see [`transact`](PcpMethod::transact) for the independent source-address check), so — exactly
+/// like the STUN transaction id ([`crate::stun::new_transaction_id`]) — the nonce MUST NOT be
+/// derived from wall-clock time or any other predictable input.
+///
+/// `pub` so tests can assert directly on the nonce's statistical properties (see `tests/pcp.rs`)
+/// without re-running a full network transaction.
+pub fn new_nonce() -> MapNonce {
+    use ring::rand::{SecureRandom, SystemRandom};
+
     let mut n = [0u8; 12];
-    n.copy_from_slice(&now.to_le_bytes()[..12]);
+    SystemRandom::new()
+        .fill(&mut n)
+        .expect("OS CSPRNG must be available to generate a PCP MAP nonce");
     n
 }
 
