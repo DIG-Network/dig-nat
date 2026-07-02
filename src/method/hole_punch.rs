@@ -71,9 +71,8 @@ impl<C: HolePunchCoordinator> TraversalMethod for HolePunchMethod<C> {
             )
             .await
             .map_err(|e| MethodError::failed(TraversalKind::HolePunch, e))?;
-        Ok(MethodOutcome {
-            kind: TraversalKind::HolePunch,
-            dial_addr: peer_addr,
-        })
+        // The coordinator returns the single peer address to simultaneously-open against (its family
+        // is whatever the peers exchanged via STUN — IPv6 when both have it).
+        Ok(MethodOutcome::single(TraversalKind::HolePunch, peer_addr))
     }
 }

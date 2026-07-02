@@ -72,16 +72,46 @@ impl TraversalKind {
     }
 }
 
-/// What a traversal method yields on success: a dialable address for the peer, plus which technique
-/// produced it. The [`crate::strategy`] then performs the mTLS dial to that address (except the
-/// relayed method, which returns an already-open tunnel — see [`crate::strategy`]).
+/// What a traversal method yields on success: the dialable candidate addresses for the peer
+/// (ordered **IPv6-first**), plus which technique produced them. The [`crate::strategy`] then
+/// performs the mTLS dial, trying the candidates IPv6-first with IPv4 fallback (happy-eyeballs, see
+/// [`crate::dialer`]) — except the relayed method, which returns the already-open relay tunnel.
+///
+/// The direct/mapping methods carry the peer's whole IPv6-first candidate list so the dial can fall
+/// back across families; the hole-punch/relayed methods yield a single coordinated/relay address
+/// ([`MethodOutcome::single`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MethodOutcome {
-    /// Which technique produced this reachable address.
+    /// Which technique produced these reachable addresses.
     pub kind: TraversalKind,
-    /// The address the strategy should dial (peer's public endpoint, a hole-punched local socket's
-    /// peer address, or — mapping methods — the peer address to try after opening the local pinhole).
-    pub dial_addr: SocketAddr,
+    /// The candidate addresses the strategy should dial, ordered **IPv6-first** (peer public
+    /// endpoints, a hole-punched peer address, the relay endpoint, or — mapping methods — the peer
+    /// candidates to try after opening the local pinhole). The dialer tries them IPv6-first and
+    /// falls back to IPv4. Never empty on success.
+    pub dial_addrs: Vec<SocketAddr>,
+}
+
+impl MethodOutcome {
+    /// An outcome carrying a SINGLE dial address (hole-punch / relayed tiers, which yield one
+    /// coordinated peer address or the relay endpoint).
+    pub fn single(kind: TraversalKind, dial_addr: SocketAddr) -> Self {
+        MethodOutcome {
+            kind,
+            dial_addrs: vec![dial_addr],
+        }
+    }
+
+    /// An outcome carrying the peer's ordered candidate list (direct / mapping tiers). The addresses
+    /// are (re-)sorted IPv6-first so the dial honours the fallback order regardless of input order.
+    pub fn candidates(kind: TraversalKind, mut dial_addrs: Vec<SocketAddr>) -> Self {
+        crate::peer::sort_ipv6_first(&mut dial_addrs);
+        MethodOutcome { kind, dial_addrs }
+    }
+
+    /// The single best (IPv6-preferred) dial address — the first candidate — or `None` if empty.
+    pub fn dial_addr(&self) -> Option<SocketAddr> {
+        self.dial_addrs.first().copied()
+    }
 }
 
 /// A single NAT-traversal technique. Implementors are small + single-purpose and MUST honour the

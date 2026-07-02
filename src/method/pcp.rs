@@ -195,12 +195,15 @@ impl TraversalMethod for PcpMethod {
     }
 
     async fn attempt(&self, peer: &PeerTarget) -> Result<MethodOutcome, MethodError> {
-        let dial_addr = peer.direct_addr.ok_or_else(|| {
-            MethodError::failed(
+        // Carry the peer's whole IPv6-first candidate list so the post-mapping dial keeps the
+        // fallback across families.
+        let dial_addrs = peer.direct_addrs();
+        if dial_addrs.is_empty() {
+            return Err(MethodError::failed(
                 TraversalKind::Pcp,
                 "peer has no address to dial after mapping",
-            )
-        })?;
+            ));
+        }
         let nonce = new_nonce();
         let req = encode_map_request(
             &nonce,
@@ -212,10 +215,10 @@ impl TraversalMethod for PcpMethod {
         );
         let resp = self.transact(&req).await.map_err(|e| to_method_error(&e))?;
         parse_map_response(&resp, &nonce).map_err(|e| to_method_error(&e))?;
-        Ok(MethodOutcome {
-            kind: TraversalKind::Pcp,
-            dial_addr,
-        })
+        Ok(MethodOutcome::candidates(
+            TraversalKind::Pcp,
+            dial_addrs.to_vec(),
+        ))
     }
 }
 
