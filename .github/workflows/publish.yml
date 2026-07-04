@@ -7,10 +7,8 @@ name: Publish to crates.io
 # introduced DIG_RELAY_URL); dig-constants 0.2.x must be published BEFORE dig-nat, or the publish
 # step (correctly) fails on the unresolved dependency. The orchestrator sequences the release tags.
 
+# crates.io publish is MANUAL (workflow_dispatch only) pending the crates.io-publishing decision (#230).
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       version:
