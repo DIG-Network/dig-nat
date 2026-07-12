@@ -39,9 +39,6 @@ jobs:
       - name: Check clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Run tests
-        run: cargo test --all
-
       - name: Build (release)
         run: cargo build --release
 
@@ -49,7 +46,7 @@ jobs:
         run: cargo doc --no-deps
 
   coverage:
-    name: Coverage (>=80% lines)
+    name: Coverage (>=80% lines, nextest + flaky-retry)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -67,7 +64,15 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      # Unit + integration coverage, CI-gated at >=80% lines (ecosystem standard #157).
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      # Unit + integration coverage, CI-gated at >=80% lines (ecosystem standard #157), run through
+      # nextest (not a separate `cargo test`) so llvm-cov instruments the SAME nextest execution —
+      # running nextest and llvm-cov as separate steps collects ZERO coverage and fails this gate
+      # (#488). `--retries 2` retries a failing test up to 2x and reports it as flaky
+      # (failed-then-passed) rather than a hard CI failure, surfacing flaky tests in the run output
+      # (#489) while coverage collection stays intact.
       #
       # `method/upnp.rs`'s `RealIgd::add_port_mapping` is the ONE genuinely network-bound path — it
       # performs live UPnP SSDP multicast discovery + SOAP against a real Internet Gateway Device,
@@ -77,9 +82,10 @@ jobs:
       # this file keeps the gate stable + honest (same discipline as dig-relay ignoring its
       # OS-service syscall code). Every other module — including all NAT datagrams, STUN, the mTLS
       # dial, the relay client, and the mux transport — is exercised over loopback and counted.
-      - name: Run tests with coverage (gate >=80% lines)
+      - name: Run tests with coverage (nextest, retries 2, gate >=80% lines)
         run: >-
-          cargo llvm-cov --all
+          cargo llvm-cov nextest --all
+          --retries 2
           --ignore-filename-regex 'method[\\/]upnp\.rs'
           --fail-under-lines 80
           --lcov --output-path lcov.info

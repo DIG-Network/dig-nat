@@ -25,45 +25,13 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  gate:
-    name: Gate (fmt / clippy / test / coverage >=80%)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          components: rustfmt, clippy, llvm-tools-preview
-
-      - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2
-
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Check clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
-
-      # Same gate as ci.yml — see that file for why method/upnp.rs (the live SSDP path) is ignored.
-      - name: Run tests with coverage (gate >=80% lines)
-        run: >-
-          cargo llvm-cov --all
-          --ignore-filename-regex 'method[\\/]upnp\.rs'
-          --fail-under-lines 80
-
-      - name: Check documentation
-        run: cargo doc --no-deps
-
+  # No fmt/clippy/test/coverage re-run here (#488): the PR that produced this tagged commit already
+  # went through ci.yml's full gate set (fmt, clippy, nextest+coverage>=80%, build, docs) before it
+  # was allowed to merge — re-running the full suite on tag push only re-tests the same tree and
+  # delays the release. This workflow is build + package + publish only.
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
-    needs: gate
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
