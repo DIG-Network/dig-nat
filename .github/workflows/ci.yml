@@ -46,7 +46,7 @@ jobs:
         run: cargo doc --no-deps
 
   coverage:
-    name: Coverage (>=80% lines, nextest + flaky-retry)
+    name: Coverage (>=80% lines)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
