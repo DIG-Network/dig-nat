@@ -24,7 +24,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::wire::RelayMessage;
+use crate::wire::{RelayMessage, RelayPeerInfo};
 
 /// Default network id a node registers under (matches dig-gossip `DEFAULT_INTRODUCER_NETWORK_ID`
 /// and dig-node's `DEFAULT_NETWORK_ID`).
@@ -39,6 +39,10 @@ const BASE_BACKOFF_SECS: u64 = 5;
 const MAX_BACKOFF_SECS: u64 = 300;
 /// Keepalive ping period (RLY-006; dig-gossip `PING_INTERVAL_SECS` = 30).
 const PING_INTERVAL_SECS: u64 = 30;
+/// How often the held reservation re-pulls the relay peer list (RLY-005 `GetPeers`) over the SAME
+/// persistent socket, so a peer that registers AFTER this node — or one missed on the first pull —
+/// is still discovered without ever reopening the connection (the connect-leg fix).
+const DISCOVERY_INTERVAL_SECS: u64 = 60;
 
 /// Compute the next reconnect backoff: capped exponential in the number of consecutive failures.
 /// `failures == 0` → base; doubles each failure up to [`MAX_BACKOFF_SECS`]. Pure → unit-tested.
@@ -129,6 +133,12 @@ pub struct RelayStatus {
     reconnect_attempts: AtomicU32,
     connected_peers: AtomicU64,
     last_error: Mutex<Option<String>>,
+    /// Peers learned over the LIVE reservation socket — the relay's `GetPeers` response (RLY-005)
+    /// plus `PeerConnected`/`PeerDisconnected` pushes. This is the discovery output of the persistent
+    /// reservation: a consumer (dig-gossip's pool/address book) reads it instead of reopening an
+    /// ephemeral socket per pass. Keyed by `peer_id` (deduped); cleared on every reconnect so a stale
+    /// list is never served across a drop.
+    known_peers: Mutex<Vec<RelayPeerInfo>>,
 }
 
 impl Default for RelayStatus {
@@ -138,6 +148,7 @@ impl Default for RelayStatus {
             reconnect_attempts: AtomicU32::new(0),
             connected_peers: AtomicU64::new(0),
             last_error: Mutex::new(None),
+            known_peers: Mutex::new(Vec::new()),
         }
     }
 }
@@ -213,6 +224,44 @@ impl RelayStatus {
     /// The current reconnect-attempt count (for tests / RPC).
     pub fn reconnect_attempts(&self) -> u32 {
         self.reconnect_attempts.load(Ordering::Relaxed)
+    }
+
+    /// Snapshot of the peers discovered over the live reservation socket (RLY-005 `Peers` +
+    /// `PeerConnected` pushes, minus `PeerDisconnected`). The consumer folds these into its address
+    /// book / pool. Returns a clone so the caller holds no lock.
+    pub fn known_peers(&self) -> Vec<RelayPeerInfo> {
+        self.known_peers.lock().unwrap().clone()
+    }
+
+    /// Count of peers currently discovered over the live reservation socket.
+    pub fn known_peer_count(&self) -> usize {
+        self.known_peers.lock().unwrap().len()
+    }
+
+    /// Replace the discovered-peer set with a `GetPeers` response (RLY-005 `Peers`).
+    fn replace_known_peers(&self, peers: Vec<RelayPeerInfo>) {
+        *self.known_peers.lock().unwrap() = peers;
+    }
+
+    /// Fold in a relay-pushed `PeerConnected` notice, deduped by `peer_id`.
+    fn add_known_peer(&self, peer: RelayPeerInfo) {
+        let mut guard = self.known_peers.lock().unwrap();
+        if !guard.iter().any(|p| p.peer_id == peer.peer_id) {
+            guard.push(peer);
+        }
+    }
+
+    /// Drop a peer on a relay-pushed `PeerDisconnected` notice.
+    fn remove_known_peer(&self, peer_id: &str) {
+        self.known_peers
+            .lock()
+            .unwrap()
+            .retain(|p| p.peer_id != peer_id);
+    }
+
+    /// Clear the discovered-peer set (on every reconnect — the list is per-session).
+    fn clear_known_peers(&self) {
+        self.known_peers.lock().unwrap().clear();
     }
 
     /// A JSON snapshot for a `control.relayStatus`-style RPC. `state` is the canonical truth;
@@ -311,6 +360,9 @@ async fn connect_once(
     network_id: &str,
     status: &Arc<RelayStatus>,
 ) -> Result<(), String> {
+    // Each session's discovered-peer set is independent — never serve a stale list across a drop.
+    status.clear_known_peers();
+
     let (ws, _resp) = tokio_tungstenite::connect_async(endpoint)
         .await
         .map_err(|e| format!("connect: {e}"))?;
@@ -324,14 +376,30 @@ async fn connect_once(
     };
     send(&mut write, &register).await?;
 
+    // RLY-005: pull the current peer list right away, then again periodically — all over THIS
+    // persistent socket, so discovery never requires reopening a connection.
+    let get_peers = RelayMessage::GetPeers {
+        network_id: Some(network_id.to_string()),
+    };
+    send(&mut write, &get_peers).await?;
+
     let mut ping = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping.tick().await; // skip the immediate first tick
+
+    let mut discovery = tokio::time::interval(Duration::from_secs(DISCOVERY_INTERVAL_SECS));
+    discovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    discovery.tick().await; // skip the immediate first tick (we already pulled once above)
 
     loop {
         tokio::select! {
             _ = ping.tick() => {
                 send(&mut write, &RelayMessage::Ping { timestamp: now_secs() }).await?;
+            }
+            _ = discovery.tick() => {
+                send(&mut write, &RelayMessage::GetPeers {
+                    network_id: Some(network_id.to_string()),
+                }).await?;
             }
             frame = read.next() => {
                 match frame {
@@ -382,6 +450,11 @@ where
         RelayMessage::Ping { timestamp } => {
             send(write, &RelayMessage::Pong { timestamp }).await?;
         }
+        // RLY-005 + push notices: fold peers discovered over the live socket into the status so the
+        // consumer's pool/address book sees them without opening an ephemeral discovery connection.
+        RelayMessage::Peers { peers } => status.replace_known_peers(peers),
+        RelayMessage::PeerConnected { peer } => status.add_known_peer(peer),
+        RelayMessage::PeerDisconnected { peer_id } => status.remove_known_peer(&peer_id),
         RelayMessage::Error { code, message } => {
             return Err(format!("relay error {code}: {message}"));
         }

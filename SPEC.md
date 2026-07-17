@@ -127,6 +127,23 @@ winning stream.
   `dig.fetchRange`), and availability pre-checks (`PeerConnection::query_availability`,
   `dig.getAvailability`). Field names + wire shapes conform to the L7 peer-network spec.
 
+## 5a. Persistent relay reservation + discovery (NORMATIVE)
+
+A node behind NAT holds a CONSTANT registered connection to the relay (`run_relay_connection`) — its
+reachability channel and the rendezvous for relay-coordinated hole-punch. This ONE long-lived
+WebSocket is ALSO the relay-introducer discovery channel; discovery **MUST NOT** open a fresh
+ephemeral socket per pass (two nodes whose sub-second register-then-close windows never overlap would
+never see each other).
+
+- The reservation **MUST** register exactly once per session (RLY-001) and keep the socket open,
+  sending RLY-006 keepalives, and reconnect with capped-exponential backoff on any drop.
+- Over the SAME socket the reservation **MUST** send RLY-005 `GetPeers` immediately after registering
+  and periodically thereafter (`DISCOVERY_INTERVAL_SECS`), and **MUST** fold the `Peers` response plus
+  relay-pushed `PeerConnected` / `PeerDisconnected` notices into the discovered-peer set.
+- The discovered-peer set is exposed via `RelayStatus::known_peers` / `known_peer_count` for the
+  consumer (dig-gossip's pool/address book) to read. It is per-session — cleared on every reconnect so
+  a stale list is never served across a drop.
+
 ## 6. STUN/PCP anti-spoof requirements (NORMATIVE)
 
 STUN Binding responses (RFC 5389) and PCP MAP responses (RFC 6887) travel over unauthenticated UDP.

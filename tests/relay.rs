@@ -11,6 +11,7 @@ use dig_nat::relay::{
     RelayState, RelayStatus,
 };
 use dig_nat::wire::RelayMessage;
+use dig_nat::wire::RelayPeerInfo;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
@@ -320,3 +321,108 @@ async fn client_handles_frames_and_error_drops_session() {
 }
 
 use dig_nat::relay::run_relay_connection;
+
+/// The persistent reservation is ALSO the discovery channel (the connect-leg fix): over the SAME
+/// long-lived socket the client (1) sends RLY-005 `GetPeers` right after registering, folds the
+/// `Peers` response into `RelayStatus`, and (2) folds relay-pushed `PeerConnected` notices — so a
+/// peer that registers is discovered WITHOUT reopening the socket. Also proves the reservation is
+/// PERSISTENT: exactly ONE `Register` is sent for the whole session (never re-registered per pass),
+/// which is the regression the old ephemeral open-register-getpeers-close discovery caused.
+#[tokio::test]
+async fn persistent_reservation_discovers_peers_over_live_socket() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let registers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_registers = Arc::clone(&registers);
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let (mut write, mut read) = ws.split();
+        // Drive the session: ack the (single) Register, answer GetPeers with one peer, then push a
+        // second peer as a live `peer_connected` — all over the ONE persistent socket.
+        while let Some(Ok(msg)) = read.next().await {
+            let Message::Text(t) = msg else { continue };
+            let parsed: RelayMessage = serde_json::from_str(&t).unwrap();
+            match parsed {
+                RelayMessage::Register { .. } => {
+                    server_registers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let ack = RelayMessage::RegisterAck {
+                        success: true,
+                        message: "ok".into(),
+                        connected_peers: 1,
+                    };
+                    write
+                        .send(Message::Text(serde_json::to_string(&ack).unwrap()))
+                        .await
+                        .unwrap();
+                }
+                RelayMessage::GetPeers { .. } => {
+                    let peers = RelayMessage::Peers {
+                        peers: vec![RelayPeerInfo::new("peerA".into(), "DIG_MAINNET".into(), 1)],
+                    };
+                    write
+                        .send(Message::Text(serde_json::to_string(&peers).unwrap()))
+                        .await
+                        .unwrap();
+                    let joined = RelayMessage::PeerConnected {
+                        peer: RelayPeerInfo::new("peerB".into(), "DIG_MAINNET".into(), 1),
+                    };
+                    write
+                        .send(Message::Text(serde_json::to_string(&joined).unwrap()))
+                        .await
+                        .unwrap();
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let status = RelayStatus::new();
+    let endpoint = format!("ws://{addr}");
+    let task_status = Arc::clone(&status);
+    let client = tokio::spawn(async move {
+        run_relay_connection_with(
+            endpoint,
+            "self".into(),
+            "DIG_MAINNET".into(),
+            task_status,
+            Backoff {
+                base_secs: 0,
+                cap_secs: 0,
+            },
+        )
+        .await;
+    });
+
+    // Poll until both the GetPeers response (peerA) and the pushed notice (peerB) are folded in.
+    let mut discovered = false;
+    for _ in 0..100 {
+        if status.known_peer_count() >= 2 {
+            discovered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        discovered,
+        "discovered both peerA (get_peers) and peerB (peer_connected) over the live socket"
+    );
+    let ids: Vec<String> = status
+        .known_peers()
+        .into_iter()
+        .map(|p| p.peer_id)
+        .collect();
+    assert!(ids.contains(&"peerA".to_string()) && ids.contains(&"peerB".to_string()));
+
+    // The reservation is PERSISTENT: exactly one Register for the whole session.
+    assert_eq!(
+        registers.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "registered exactly once (persistent socket, not re-registered per discovery pass)"
+    );
+
+    client.abort();
+    server.abort();
+    let _ = server.await;
+}
