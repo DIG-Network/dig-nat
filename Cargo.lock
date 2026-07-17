@@ -482,10 +482,9 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
 name = "dig-constants"
-version = "0.2.1"
-source = "git+https://github.com/DIG-Network/dig-constants#8a4c1670a7005b991611a796e17eccf8aff00e21"
+version = "0.3.0"
+source = "git+https://github.com/DIG-Network/dig-constants#438ac8caf9ffb80cadd10362deacd63763a7f141"
 dependencies = [
- "chia-bls 0.26.0",
  "chia-consensus",
  "chia-protocol",
  "hex-literal",
@@ -493,7 +492,7 @@ dependencies = [
 
 [[package]]
 name = "dig-nat"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "dig-constants",
