@@ -143,6 +143,12 @@ never see each other).
 - The discovered-peer set is exposed via `RelayStatus::known_peers` / `known_peer_count` for the
   consumer (dig-gossip's pool/address book) to read. It is per-session — cleared on every reconnect so
   a stale list is never served across a drop.
+- The relay is an UNTRUSTED intermediary. The discovered-peer set **MUST** be bounded to a fixed cap
+  (`MAX_KNOWN_PEERS`, 1024) and deduped by `peer_id`: a hostile/compromised relay can stream an
+  unbounded flood of `PeerConnected` frames — or a single oversized `Peers` frame — with distinct
+  fabricated `peer_id`s. Once the set is full, further distinct peers **MUST** be dropped (the set
+  never grows past the cap), and both the per-push fold and the `Peers`-frame replace **MUST** enforce
+  it. Membership/dedup **MUST** be O(1) so the flood cannot impose an O(n²) insert cost.
 
 ## 6. STUN/PCP anti-spoof requirements (NORMATIVE)
 

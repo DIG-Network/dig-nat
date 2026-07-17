@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use dig_nat::relay::{
     backoff_secs, relay_enabled, relay_url_from_env, run_relay_connection_with, Backoff,
-    RelayState, RelayStatus,
+    RelayState, RelayStatus, MAX_KNOWN_PEERS,
 };
 use dig_nat::wire::RelayMessage;
 use dig_nat::wire::RelayPeerInfo;
@@ -420,6 +420,101 @@ async fn persistent_reservation_discovers_peers_over_live_socket() {
         registers.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "registered exactly once (persistent socket, not re-registered per discovery pass)"
+    );
+
+    client.abort();
+    server.abort();
+    let _ = server.await;
+}
+
+/// SECURITY (§5a): the relay is an UNTRUSTED intermediary — a hostile/compromised relay can stream
+/// an unbounded flood of `PeerConnected` frames with distinct fabricated `peer_id`s to exhaust the
+/// node's memory. The discovered set MUST be bounded to [`MAX_KNOWN_PEERS`]: once full, further
+/// distinct peers are dropped and the set never grows past the cap.
+#[tokio::test]
+async fn known_peers_set_is_bounded_under_a_peer_connected_flood() {
+    let flood = MAX_KNOWN_PEERS + 100;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let (mut write, mut read) = ws.split();
+        while let Some(Ok(msg)) = read.next().await {
+            let Message::Text(t) = msg else { continue };
+            let parsed: RelayMessage = serde_json::from_str(&t).unwrap();
+            match parsed {
+                RelayMessage::Register { .. } => {
+                    let ack = RelayMessage::RegisterAck {
+                        success: true,
+                        message: "ok".into(),
+                        connected_peers: 1,
+                    };
+                    write
+                        .send(Message::Text(serde_json::to_string(&ack).unwrap()))
+                        .await
+                        .unwrap();
+                }
+                RelayMessage::GetPeers { .. } => {
+                    // Flood the client with MAX_KNOWN_PEERS + 100 distinct fabricated peers.
+                    for i in 0..flood {
+                        let joined = RelayMessage::PeerConnected {
+                            peer: RelayPeerInfo::new(format!("peer{i}"), "DIG_MAINNET".into(), 1),
+                        };
+                        write
+                            .send(Message::Text(serde_json::to_string(&joined).unwrap()))
+                            .await
+                            .unwrap();
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let status = RelayStatus::new();
+    let endpoint = format!("ws://{addr}");
+    let task_status = Arc::clone(&status);
+    let client = tokio::spawn(async move {
+        run_relay_connection_with(
+            endpoint,
+            "self".into(),
+            "DIG_MAINNET".into(),
+            task_status,
+            Backoff {
+                base_secs: 0,
+                cap_secs: 0,
+            },
+        )
+        .await;
+    });
+
+    // Poll until the set fills to the cap; it must NEVER exceed it however long the flood runs.
+    let mut reached_cap = false;
+    for _ in 0..200 {
+        let count = status.known_peer_count();
+        assert!(
+            count <= MAX_KNOWN_PEERS,
+            "discovered set grew past the cap: {count} > {MAX_KNOWN_PEERS}"
+        );
+        if count == MAX_KNOWN_PEERS {
+            reached_cap = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        reached_cap,
+        "the flood should fill the discovered set up to MAX_KNOWN_PEERS"
+    );
+
+    // Give the flood a moment more, then re-assert it is still capped (not merely mid-fill).
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        status.known_peer_count(),
+        MAX_KNOWN_PEERS,
+        "the discovered set stays pinned at the cap under a continuing flood"
     );
 
     client.abort();

@@ -17,6 +17,7 @@
 //! background. State is published through [`RelayStatus`] (a cheap atomic snapshot) as one of four
 //! [`RelayState`]s and surfaced verbatim to a `control.relayStatus`-style RPC / `/health`.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -43,6 +44,16 @@ const PING_INTERVAL_SECS: u64 = 30;
 /// persistent socket, so a peer that registers AFTER this node — or one missed on the first pull —
 /// is still discovered without ever reopening the connection (the connect-leg fix).
 const DISCOVERY_INTERVAL_SECS: u64 = 60;
+
+/// Hard cap on the peers retained in the discovered set ([`RelayStatus::known_peers`]).
+///
+/// SECURITY: the relay is an UNTRUSTED intermediary. A hostile/compromised relay can stream an
+/// unbounded flood of `PeerConnected` frames — or a single oversized `Peers` frame — with distinct
+/// fabricated `peer_id`s, so an uncapped set is a memory-exhaustion DoS. 1024 is far more than any
+/// honest relay reports for one network's live reservations (the set is folded into a peer pool that
+/// itself selects a small working subset), yet small enough that the worst case is bounded, cheap
+/// memory. Beyond the cap, further distinct peers are DROPPED rather than grown.
+pub const MAX_KNOWN_PEERS: usize = 1024;
 
 /// Compute the next reconnect backoff: capped exponential in the number of consecutive failures.
 /// `failures == 0` → base; doubles each failure up to [`MAX_BACKOFF_SECS`]. Pure → unit-tested.
@@ -124,6 +135,53 @@ impl RelayState {
     }
 }
 
+/// The peers discovered over the live reservation socket, in insertion order with O(1) dedup +
+/// membership by `peer_id`, bounded to [`MAX_KNOWN_PEERS`].
+///
+/// `order` preserves discovery order so [`RelayStatus::known_peers`] returns a stable sequence;
+/// `ids` mirrors `order`'s `peer_id`s so dedup and removal are O(1) instead of a linear scan (the
+/// old `iter().any(...)` was O(n²) over a flood). The two are kept in lockstep — every mutation
+/// touches both.
+#[derive(Debug, Default)]
+struct DiscoveredPeers {
+    order: Vec<RelayPeerInfo>,
+    ids: HashSet<String>,
+}
+
+impl DiscoveredPeers {
+    /// Insert `peer` unless already present or the set is full. Returns nothing — a full set simply
+    /// drops the newcomer (the untrusted-relay flood defense).
+    fn insert(&mut self, peer: RelayPeerInfo) {
+        if self.order.len() >= MAX_KNOWN_PEERS {
+            return;
+        }
+        if self.ids.insert(peer.peer_id.clone()) {
+            self.order.push(peer);
+        }
+    }
+
+    /// Remove the peer with this `peer_id`, if present.
+    fn remove(&mut self, peer_id: &str) {
+        if self.ids.remove(peer_id) {
+            self.order.retain(|p| p.peer_id != peer_id);
+        }
+    }
+
+    /// Replace the whole set from a `Peers` frame, deduped + truncated to the cap.
+    fn replace(&mut self, peers: Vec<RelayPeerInfo>) {
+        self.order.clear();
+        self.ids.clear();
+        for peer in peers {
+            self.insert(peer);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.order.clear();
+        self.ids.clear();
+    }
+}
+
 /// Live relay-connection status, shared (via `Arc`) between the connection task and an RPC handler.
 /// Cheap atomic reads. State setters do STATE-CHANGE-ONLY logging so a long outage never hot-loops
 /// identical error lines.
@@ -136,9 +194,10 @@ pub struct RelayStatus {
     /// Peers learned over the LIVE reservation socket — the relay's `GetPeers` response (RLY-005)
     /// plus `PeerConnected`/`PeerDisconnected` pushes. This is the discovery output of the persistent
     /// reservation: a consumer (dig-gossip's pool/address book) reads it instead of reopening an
-    /// ephemeral socket per pass. Keyed by `peer_id` (deduped); cleared on every reconnect so a stale
-    /// list is never served across a drop.
-    known_peers: Mutex<Vec<RelayPeerInfo>>,
+    /// ephemeral socket per pass. Keyed by `peer_id` (deduped); bounded to [`MAX_KNOWN_PEERS`] so an
+    /// untrusted relay can't exhaust memory; cleared on every reconnect so a stale list is never
+    /// served across a drop.
+    known_peers: Mutex<DiscoveredPeers>,
 }
 
 impl Default for RelayStatus {
@@ -148,7 +207,7 @@ impl Default for RelayStatus {
             reconnect_attempts: AtomicU32::new(0),
             connected_peers: AtomicU64::new(0),
             last_error: Mutex::new(None),
-            known_peers: Mutex::new(Vec::new()),
+            known_peers: Mutex::new(DiscoveredPeers::default()),
         }
     }
 }
@@ -230,33 +289,29 @@ impl RelayStatus {
     /// `PeerConnected` pushes, minus `PeerDisconnected`). The consumer folds these into its address
     /// book / pool. Returns a clone so the caller holds no lock.
     pub fn known_peers(&self) -> Vec<RelayPeerInfo> {
-        self.known_peers.lock().unwrap().clone()
+        self.known_peers.lock().unwrap().order.clone()
     }
 
     /// Count of peers currently discovered over the live reservation socket.
     pub fn known_peer_count(&self) -> usize {
-        self.known_peers.lock().unwrap().len()
+        self.known_peers.lock().unwrap().order.len()
     }
 
-    /// Replace the discovered-peer set with a `GetPeers` response (RLY-005 `Peers`).
+    /// Replace the discovered-peer set with a `GetPeers` response (RLY-005 `Peers`), deduped and
+    /// truncated to [`MAX_KNOWN_PEERS`] (an untrusted relay could send an oversized frame).
     fn replace_known_peers(&self, peers: Vec<RelayPeerInfo>) {
-        *self.known_peers.lock().unwrap() = peers;
+        self.known_peers.lock().unwrap().replace(peers);
     }
 
-    /// Fold in a relay-pushed `PeerConnected` notice, deduped by `peer_id`.
+    /// Fold in a relay-pushed `PeerConnected` notice, deduped by `peer_id`; dropped once the set is
+    /// full ([`MAX_KNOWN_PEERS`]) so a flood can't exhaust memory.
     fn add_known_peer(&self, peer: RelayPeerInfo) {
-        let mut guard = self.known_peers.lock().unwrap();
-        if !guard.iter().any(|p| p.peer_id == peer.peer_id) {
-            guard.push(peer);
-        }
+        self.known_peers.lock().unwrap().insert(peer);
     }
 
     /// Drop a peer on a relay-pushed `PeerDisconnected` notice.
     fn remove_known_peer(&self, peer_id: &str) {
-        self.known_peers
-            .lock()
-            .unwrap()
-            .retain(|p| p.peer_id != peer_id);
+        self.known_peers.lock().unwrap().remove(peer_id);
     }
 
     /// Clear the discovered-peer set (on every reconnect — the list is per-session).
