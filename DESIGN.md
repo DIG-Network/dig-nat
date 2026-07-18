@@ -78,27 +78,30 @@ touched); the relayed transport is only reached when the punch is unavailable/fa
 ## Address-family policy — IPv6-first, IPv4-fallback
 
 All peer address handling in dig-nat is **IPv6-first, with IPv4 as a fallback** (the ecosystem-wide
-IPv6-first rule). This shows up in three places, kept consistent:
+IPv6-first rule). Family discovery, the local∩peer intersection, and the happy-eyeballs racer are the
+canonical **`dig-ip` crate**'s job (CLAUDE.md §5.2) — dig-nat is its FIRST consumer. This shows up in
+three places, kept consistent:
 
-- **Candidate model.** A `PeerTarget` carries an **ordered candidate list** (`direct_addrs`), not a
-  single address, so a peer with both an IPv6 and an IPv4 address can advertise both. The list is
-  sorted **IPv6-first** (every IPv6 before every IPv4, order-preserving within each family) by
-  `peer::sort_ipv6_first`, which decides family by `SocketAddr::is_ipv6` — never a `contains(':')`
-  string heuristic (a bracketed `[v6]:port` and an `v4:port` both contain `:`). `with_addr` /
-  `with_addrs` / `set_direct_addrs` all enforce the ordering; `direct_addr()` returns the first
-  (IPv6-preferred) candidate for callers that want one.
-- **Outcome model.** A `MethodOutcome` carries `dial_addrs` (IPv6-first). The direct/mapping methods
-  (Direct, UPnP, NAT-PMP, PCP) carry the peer's whole candidate list (`MethodOutcome::candidates`) so
-  the dial can fall back across families; the hole-punch/relayed methods yield one address
-  (`MethodOutcome::single`).
-- **Dial path — happy eyeballs (RFC 8305-style).** The dialer (`dialer::happy_eyeballs_connect`) races
-  the TCP connect across the candidates IPv6-first: IPv6 starts first, an IPv4 hedge is only launched
-  once the preferred candidate stalls past a configurable `stagger`, and — crucially — IPv6 is the
-  *preference*, so a lower-priority (IPv4) success is only returned once every higher-priority (IPv6)
-  attempt has concluded. A viable IPv6 wins even if a hedged IPv4 connects sooner; IPv4 wins only when
-  IPv6 genuinely fails. Each attempt is bounded by a per-attempt timeout. The stagger + timeout are
-  injectable (`HappyEyeballsConfig`) so the racing logic is unit-tested with no real sockets. The
-  winning stream's family is reflected in `PeerConnection::remote_addr`.
+- **Candidate model.** A `PeerTarget` carries a **candidate list** (`direct_addrs`), not a single
+  address, so a peer with both an IPv6 and an IPv4 address can advertise both. The list is kept in
+  **discovery order** — dig-nat no longer sorts it; `dig-ip` derives each family (`dig_ip::Family::of`,
+  which correctly treats an IPv4-mapped IPv6 address as IPv4) and orders IPv6-first at dial time.
+  `with_addr` / `with_addrs` / `set_direct_addrs` preserve the supplied order; `direct_addr()` returns
+  the first candidate for callers that want one.
+- **Outcome model.** A `MethodOutcome` carries `dial_addrs` (discovery order). The direct/mapping
+  methods (Direct, UPnP, NAT-PMP, PCP) carry the peer's whole candidate list
+  (`MethodOutcome::candidates`) so the dial can fall back across families; the hole-punch/relayed
+  methods yield one address (`MethodOutcome::single`).
+- **Dial path — `dig-ip` (RFC 8305 happy eyeballs + family intersection).** `MtlsDialer::dial`
+  aggregates the outcome into a `dig_ip::PeerCandidates` (`dialer::candidates_from_outcome`), resolves
+  the local host's `dig_ip::LocalStack` (`cached()` in prod, or a pinned stack via `with_local_stack`
+  for tests), and calls `dig_ip::connect` with a raw-TCP dial closure. `dig-ip` guarantees the dial
+  never attempts a family the local host (G1) or the peer (G2) lacks, prefers a viable IPv6 over a
+  hedged IPv4, and fails a disjoint pair immediately with `NoCommonFamily` (no doomed SYN) — behaviour
+  that used to be a hand-rolled racer + sort here. The per-attempt timeout + stagger are injectable
+  (`HappyEyeballsConfig` → `dig_ip::DialConfig`) so the wiring is unit-tested with no real sockets. The
+  winning stream's family is reflected in `PeerConnection::remote_addr`. Once TCP wins, the single mTLS
+  handshake runs over it (unchanged).
 
 Per-method family notes: **STUN** parses both IPv4 and IPv6 XOR-MAPPED-ADDRESS; **PCP** uses 128-bit
 address fields and is IPv6-capable; **UPnP/IGD** and **NAT-PMP** are protocol-inherently IPv4 and
