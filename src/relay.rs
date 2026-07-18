@@ -17,12 +17,14 @@
 //! background. State is published through [`RelayStatus`] (a cheap atomic snapshot) as one of four
 //! [`RelayState`]s and surfaced verbatim to a `control.relayStatus`-style RPC / `/health`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::wire::{RelayMessage, RelayPeerInfo};
@@ -54,6 +56,20 @@ const DISCOVERY_INTERVAL_SECS: u64 = 60;
 /// itself selects a small working subset), yet small enough that the worst case is bounded, cheap
 /// memory. Beyond the cap, further distinct peers are DROPPED rather than grown.
 pub const MAX_KNOWN_PEERS: usize = 1024;
+
+/// Hard cap on the byte length of a single RLY-002 relayed-transport payload (both directions).
+///
+/// SECURITY / backpressure: the relay is UNTRUSTED and a peer reached over relayed transport is the
+/// last-resort TURN path, so an oversized frame is refused rather than buffered — an outbound `send`
+/// larger than this errors, and an inbound frame larger than this is dropped. 1 MiB comfortably
+/// holds a sealed gossip message (NC-1 ciphertext) while bounding the worst-case per-frame memory.
+pub const MAX_RELAY_PAYLOAD: usize = 1 << 20;
+
+/// Bounded inbound capacity for one open [`RelayTunnel`]. A full channel applies backpressure — the
+/// reservation loop `try_send`s inbound relayed bytes and DROPS the frame when the consumer is not
+/// keeping up, so a hostile relay flooding one tunnel cannot exhaust memory (matches the
+/// [`MAX_KNOWN_PEERS`] bounded-set philosophy). The RLY-002 `seq` lets the consumer detect the gap.
+const RELAY_TUNNEL_INBOUND_CAP: usize = 256;
 
 /// Compute the next reconnect backoff: capped exponential in the number of consecutive failures.
 /// `failures == 0` → base; doubles each failure up to [`MAX_BACKOFF_SECS`]. Pure → unit-tested.
@@ -198,6 +214,20 @@ pub struct RelayStatus {
     /// untrusted relay can't exhaust memory; cleared on every reconnect so a stale list is never
     /// served across a drop.
     known_peers: Mutex<DiscoveredPeers>,
+    /// Sink that injects an outbound [`RelayMessage`] into the LIVE reservation socket's write half.
+    /// `Some` only while a session is held (set by `connect_once`, cleared on every drop) — this is
+    /// what lets a [`RelayTunnel`] reuse the ONE persistent reservation socket for RLY-002 relayed
+    /// transport instead of opening a second connection.
+    outbound: Mutex<Option<mpsc::UnboundedSender<RelayMessage>>>,
+    /// This node's own `peer_id` (hex), stamped as `from` on every RLY-002 frame the tunnels send.
+    /// Set when a session registers; needed because a tunnel is opened from the shared status handle.
+    local_peer_id: Mutex<Option<String>>,
+    /// Open relayed-transport tunnels, keyed by the REMOTE peer's `peer_id` (hex). An inbound RLY-002
+    /// `relay_message` from a peer is routed to its tunnel's inbound channel; a frame from a peer with
+    /// no open tunnel is dropped (the untrusted-relay default). Entries are removed on tunnel drop.
+    tunnels: Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>,
+    /// Monotonic per-node sequence number stamped on outbound RLY-002 frames (ordering/dedup).
+    relay_seq: AtomicU64,
 }
 
 impl Default for RelayStatus {
@@ -208,6 +238,10 @@ impl Default for RelayStatus {
             connected_peers: AtomicU64::new(0),
             last_error: Mutex::new(None),
             known_peers: Mutex::new(DiscoveredPeers::default()),
+            outbound: Mutex::new(None),
+            local_peer_id: Mutex::new(None),
+            tunnels: Mutex::new(HashMap::new()),
+            relay_seq: AtomicU64::new(0),
         }
     }
 }
@@ -319,6 +353,83 @@ impl RelayStatus {
         self.known_peers.lock().unwrap().clear();
     }
 
+    // -- RLY-002 relayed transport (the tier-6 TURN fallback) ------------------------------------
+    //
+    // A relayed tunnel reuses the ONE persistent reservation socket: outbound frames go through
+    // `outbound` (drained by the reservation loop's write half), inbound `relay_message` frames are
+    // routed by `from` peer_id to the matching tunnel. Available only while the reservation is held.
+
+    /// Install the live session's outbound sink + this node's `peer_id`. Called by `connect_once`
+    /// once registered; cleared by [`clear_transport`](Self::clear_transport) on every drop.
+    fn set_transport(&self, peer_id: &str, outbound: mpsc::UnboundedSender<RelayMessage>) {
+        *self.local_peer_id.lock().unwrap() = Some(peer_id.to_string());
+        *self.outbound.lock().unwrap() = Some(outbound);
+    }
+
+    /// Tear down the transport on session drop: drop the outbound sink (so tunnel sends fail fast)
+    /// and close every open tunnel's inbound channel (so a blocked `recv` wakes with `None`).
+    fn clear_transport(&self) {
+        *self.outbound.lock().unwrap() = None;
+        self.tunnels.lock().unwrap().clear();
+    }
+
+    /// Whether a relayed tunnel can currently be opened — a reservation is held AND its outbound sink
+    /// is live. The tier-6 [`RelayedTransport`](crate::method::relayed::RelayedTransport) gates on this.
+    pub fn relay_transport_ready(&self) -> bool {
+        self.is_connected() && self.outbound.lock().unwrap().is_some()
+    }
+
+    /// Open an RLY-002 relayed-transport tunnel to `target_peer` (hex `peer_id`) over the held
+    /// reservation socket — the traversal ladder's FINAL tier when a pair can neither direct-dial nor
+    /// hole-punch. The returned [`RelayTunnel`] sends/receives opaque payloads that the relay forwards
+    /// A→relay→B; per NC-1 the payload is END-TO-END SEALED to the recipient so the relay forwards
+    /// ciphertext only. `Err` if no reservation is held. Dropping the tunnel deregisters it.
+    pub fn open_tunnel(
+        self: &Arc<Self>,
+        target_peer: &str,
+        network_id: &str,
+    ) -> Result<RelayTunnel, String> {
+        if !self.relay_transport_ready() {
+            return Err("relay reservation not connected — cannot open relayed tunnel".into());
+        }
+        let (tx, rx) = mpsc::channel(RELAY_TUNNEL_INBOUND_CAP);
+        self.tunnels
+            .lock()
+            .unwrap()
+            .insert(target_peer.to_string(), tx);
+        Ok(RelayTunnel {
+            target: target_peer.to_string(),
+            network_id: network_id.to_string(),
+            status: Arc::clone(self),
+            inbound: rx,
+        })
+    }
+
+    /// Route one inbound RLY-002 `relay_message` to its tunnel by `from` peer_id. Oversized payloads
+    /// are dropped (size cap); a frame from a peer with no open tunnel is dropped; a full inbound
+    /// channel drops the frame (backpressure). Returns silently in every drop case (untrusted relay).
+    fn route_relayed(&self, from: &str, payload: Vec<u8>) {
+        if payload.len() > MAX_RELAY_PAYLOAD {
+            tracing::debug!(
+                from,
+                len = payload.len(),
+                "dropping oversized relayed frame"
+            );
+            return;
+        }
+        let sink = self.tunnels.lock().unwrap().get(from).cloned();
+        if let Some(sink) = sink {
+            if sink.try_send(payload).is_err() {
+                tracing::debug!(from, "relayed tunnel inbound full/closed — frame dropped");
+            }
+        }
+    }
+
+    /// Remove a tunnel's routing entry (called on [`RelayTunnel`] drop).
+    fn close_tunnel(&self, target_peer: &str) {
+        self.tunnels.lock().unwrap().remove(target_peer);
+    }
+
     /// A JSON snapshot for a `control.relayStatus`-style RPC. `state` is the canonical truth;
     /// `connected` is a convenience boolean (== `state == connected`).
     pub fn snapshot_json(&self, endpoint: &str, peer_id: &str) -> serde_json::Value {
@@ -332,6 +443,80 @@ impl RelayStatus {
             "connected_peers": self.connected_peers.load(Ordering::Relaxed),
             "last_error": *self.last_error.lock().unwrap(),
         })
+    }
+}
+
+/// A live RLY-002 relayed-transport tunnel to one peer, multiplexed over the node's persistent relay
+/// reservation socket (the tier-6 TURN fallback). Writes are framed as RLY-002 `relay_message` to the
+/// target and forwarded A→relay→B; reads are the payloads the relay forwards back from that peer.
+///
+/// Per NC-1 the payload MUST be END-TO-END SEALED to the recipient's key by the caller — the relay is
+/// an untrusted forwarder that sees only ciphertext. Dropping the tunnel deregisters its routing.
+pub struct RelayTunnel {
+    /// The remote peer's `peer_id` (hex) — the RLY-002 `to`, and the routing key for inbound frames.
+    target: String,
+    /// The network the tunnel is scoped to (echoed for the consumer; relay routes by peer_id).
+    network_id: String,
+    /// Shared status handle — provides the live outbound sink, this node's `peer_id`, and the seq.
+    status: Arc<RelayStatus>,
+    /// Inbound payloads the relay forwarded from `target`, in arrival order (bounded — see
+    /// [`RELAY_TUNNEL_INBOUND_CAP`]).
+    inbound: mpsc::Receiver<Vec<u8>>,
+}
+
+impl RelayTunnel {
+    /// The remote peer this tunnel forwards to/from (hex `peer_id`).
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    /// The network the tunnel is scoped to.
+    pub fn network_id(&self) -> &str {
+        &self.network_id
+    }
+
+    /// Send `payload` to the target peer through the relay (RLY-002 `relay_message`). `payload` MUST
+    /// already be sealed to the recipient (NC-1). `Err` if the reservation dropped (send after the
+    /// session closed) or `payload` exceeds [`MAX_RELAY_PAYLOAD`].
+    pub fn send(&self, payload: Vec<u8>) -> Result<(), String> {
+        if payload.len() > MAX_RELAY_PAYLOAD {
+            return Err(format!(
+                "relayed payload {} exceeds cap {MAX_RELAY_PAYLOAD}",
+                payload.len()
+            ));
+        }
+        let from = self
+            .status
+            .local_peer_id
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or("relay reservation not connected — no local peer_id")?;
+        let seq = self.status.relay_seq.fetch_add(1, Ordering::Relaxed);
+        let frame = RelayMessage::RelayGossipMessage {
+            from,
+            to: self.target.clone(),
+            payload,
+            seq,
+        };
+        let guard = self.status.outbound.lock().unwrap();
+        let sink = guard
+            .as_ref()
+            .ok_or("relay reservation not connected — cannot send relayed frame")?;
+        sink.send(frame)
+            .map_err(|_| "relay reservation write half closed".to_string())
+    }
+
+    /// Await the next payload the relay forwards from the target peer. `None` once the reservation
+    /// drops (the session closed) — the caller should re-open the tunnel after the relay reconnects.
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        self.inbound.recv().await
+    }
+}
+
+impl Drop for RelayTunnel {
+    fn drop(&mut self) {
+        self.status.close_tunnel(&self.target);
     }
 }
 
@@ -375,9 +560,18 @@ pub async fn run_relay_connection(
     endpoint: String,
     peer_id: String,
     network_id: String,
+    listen_addrs: Vec<SocketAddr>,
     status: Arc<RelayStatus>,
 ) {
-    run_relay_connection_with(endpoint, peer_id, network_id, status, Backoff::default()).await
+    run_relay_connection_with(
+        endpoint,
+        peer_id,
+        network_id,
+        listen_addrs,
+        status,
+        Backoff::default(),
+    )
+    .await
 }
 
 /// [`run_relay_connection`] with an explicit backoff schedule (tests pass tiny values for fast,
@@ -386,13 +580,14 @@ pub async fn run_relay_connection_with(
     endpoint: String,
     peer_id: String,
     network_id: String,
+    listen_addrs: Vec<SocketAddr>,
     status: Arc<RelayStatus>,
     backoff: Backoff,
 ) {
     let mut consecutive_failures: u32 = 0;
     loop {
         status.set_connecting();
-        match connect_once(&endpoint, &peer_id, &network_id, &status).await {
+        match connect_once(&endpoint, &peer_id, &network_id, &listen_addrs, &status).await {
             Ok(()) => {
                 consecutive_failures = 0;
                 status.set_disconnected(None);
@@ -413,23 +608,33 @@ async fn connect_once(
     endpoint: &str,
     peer_id: &str,
     network_id: &str,
+    listen_addrs: &[SocketAddr],
     status: &Arc<RelayStatus>,
 ) -> Result<(), String> {
-    // Each session's discovered-peer set is independent — never serve a stale list across a drop.
+    // Each session's discovered-peer set + transport are independent — never carry state across a
+    // drop. `clear_transport` also runs at the end so a dropped session's tunnels/sink never linger.
     status.clear_known_peers();
+    status.clear_transport();
 
     let (ws, _resp) = tokio_tungstenite::connect_async(endpoint)
         .await
         .map_err(|e| format!("connect: {e}"))?;
     let (mut write, mut read) = ws.split();
 
-    // RLY-001: register immediately so the relay holds our reservation.
+    // RLY-001: register immediately so the relay holds our reservation, advertising the node's gossip
+    // listen candidates (B1) so the relay can hand other peers a dialable candidate (§5.2 IPv6-first).
     let register = RelayMessage::Register {
         peer_id: peer_id.to_string(),
         network_id: network_id.to_string(),
         protocol_version: RELAY_PROTOCOL_VERSION,
+        listen_addrs: listen_addrs.to_vec(),
     };
     send(&mut write, &register).await?;
+
+    // Publish the outbound sink so RLY-002 relayed tunnels can reuse THIS persistent socket. Drained
+    // in the select loop below; cleared when the session ends.
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<RelayMessage>();
+    status.set_transport(peer_id, out_tx);
 
     // RLY-005: pull the current peer list right away, then again periodically — all over THIS
     // persistent socket, so discovery never requires reopening a connection.
@@ -446,15 +651,54 @@ async fn connect_once(
     discovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     discovery.tick().await; // skip the immediate first tick (we already pulled once above)
 
+    // Run the session; whatever the outcome, tear the transport down so a dropped session never
+    // leaves a stale outbound sink or open tunnels behind (they'd send into a closed socket).
+    let result = serve_session(
+        &mut write,
+        &mut read,
+        &mut ping,
+        &mut discovery,
+        &mut out_rx,
+        network_id,
+        status,
+    )
+    .await;
+    status.clear_transport();
+    result
+}
+
+/// The connected-session select loop: keepalive pings, periodic RLY-005 discovery, draining the
+/// outbound relayed-transport sink onto the socket, and handling inbound frames. Returns `Ok` on a
+/// clean close, `Err(reason)` on a failure. Split out of `connect_once` so its caller can always run
+/// transport teardown regardless of how the session ends.
+#[allow(clippy::too_many_arguments)]
+async fn serve_session<W, R>(
+    write: &mut W,
+    read: &mut R,
+    ping: &mut tokio::time::Interval,
+    discovery: &mut tokio::time::Interval,
+    out_rx: &mut mpsc::UnboundedReceiver<RelayMessage>,
+    network_id: &str,
+    status: &Arc<RelayStatus>,
+) -> Result<(), String>
+where
+    W: SinkExt<Message> + Unpin,
+    <W as futures_util::Sink<Message>>::Error: std::fmt::Display,
+    R: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
     loop {
         tokio::select! {
             _ = ping.tick() => {
-                send(&mut write, &RelayMessage::Ping { timestamp: now_secs() }).await?;
+                send(write, &RelayMessage::Ping { timestamp: now_secs() }).await?;
             }
             _ = discovery.tick() => {
-                send(&mut write, &RelayMessage::GetPeers {
+                send(write, &RelayMessage::GetPeers {
                     network_id: Some(network_id.to_string()),
                 }).await?;
+            }
+            // A relayed tunnel queued an RLY-002 frame — forward it over THIS persistent socket.
+            Some(frame) = out_rx.recv() => {
+                send(write, &frame).await?;
             }
             frame = read.next() => {
                 match frame {
@@ -466,10 +710,10 @@ async fn connect_once(
                     }
                     Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
                     Some(Ok(Message::Text(t))) => {
-                        handle_incoming(t.into_bytes(), &mut write, status).await?;
+                        handle_incoming(t.into_bytes(), write, status).await?;
                     }
                     Some(Ok(Message::Binary(b))) => {
-                        handle_incoming(b, &mut write, status).await?;
+                        handle_incoming(b, write, status).await?;
                     }
                 }
             }
@@ -510,6 +754,13 @@ where
         RelayMessage::Peers { peers } => status.replace_known_peers(peers),
         RelayMessage::PeerConnected { peer } => status.add_known_peer(peer),
         RelayMessage::PeerDisconnected { peer_id } => status.remove_known_peer(&peer_id),
+        // RLY-002 relayed transport (tier-6 TURN): route a payload the relay forwarded from `from` to
+        // that peer's open tunnel. Unknown-peer / oversized / full-channel frames are dropped inside
+        // `route_relayed` (untrusted-relay defense). `to`/`seq` are the relay's concern; we key on
+        // `from`. Per NC-1 `payload` is sealed ciphertext the relay could not read.
+        RelayMessage::RelayGossipMessage { from, payload, .. } => {
+            status.route_relayed(&from, payload)
+        }
         RelayMessage::Error { code, message } => {
             return Err(format!("relay error {code}: {message}"));
         }

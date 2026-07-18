@@ -150,6 +150,45 @@ never see each other).
   never grows past the cap), and both the per-push fold and the `Peers`-frame replace **MUST** enforce
   it. Membership/dedup **MUST** be O(1) so the flood cannot impose an O(n²) insert cost.
 
+### 5a.1 Address-carrying introduction (B1, NORMATIVE)
+
+The reservation advertises dialable candidates so a relay-discovered peer can be DIRECT-dialed over
+the existing mTLS path instead of only reached over relayed transport. Both wire fields are additive
+(NC-6 soft-fork) — default-empty, skipped-when-empty, appended last — so a pre-#924 peer/relay omits
+them and falls back to identity-only relayed reachability. They are byte-identical to
+`dig-relay-protocol` 0.2.0.
+
+- On `Register` (RLY-001) the node **MUST** advertise its gossip LISTEN candidate address(es) in
+  `Register.listen_addrs` (IPv6-first, §3). The host is typically the unspecified dual-stack address
+  (`[::]`); the useful part the relay keeps is the port.
+- When folding discovered peers, the reservation **MUST** parse `RelayPeerInfo.addresses` (the
+  relay-resolved dialable candidates) and expose them via `RelayStatus::known_peers`, so the consumer
+  (dig-gossip's pool/address book) can direct-dial them. A peer with empty `addresses` remains
+  identity-only (today's relayed reachability).
+
+## 5b. Relayed transport — the tier-6 TURN fallback (B2, NORMATIVE)
+
+When no more-direct method (Direct/UPnP/PMP/hole-punch) can reach a peer, the connection is carried
+THROUGH the relay by RLY-002 `relay_message` forwarding — the genuine last resort.
+
+- The relayed transport **MUST** reuse the node's ONE persistent reservation socket (§5a) — it
+  **MUST NOT** open a second connection to the relay. Outbound frames are injected into the live
+  reservation write half; inbound `relay_message` frames are routed to the matching tunnel by the
+  sender's `peer_id` (`from`).
+- `RelayStatus::open_tunnel(target_peer, network_id)` yields a `RelayTunnel` — a bidirectional payload
+  channel forwarded A→relay→B. `open_tunnel` **MUST** fail when no reservation is held
+  (`relay_transport_ready` is false). Dropping the tunnel deregisters its routing.
+- Per NC-1 / §5.4 the tunnel payload **MUST** be END-TO-END SEALED to the recipient's key by the
+  caller: the relay is an untrusted forwarder that sees only ciphertext. This crate carries opaque
+  bytes and does not itself seal — the consumer (dig-gossip) seals.
+- Backpressure + flood defense: a single payload **MUST NOT** exceed `MAX_RELAY_PAYLOAD` (1 MiB) — an
+  oversized `send` errors and an oversized inbound frame is dropped; each tunnel's inbound buffer is
+  bounded (`RELAY_TUNNEL_INBOUND_CAP`) and a full buffer drops the frame (the RLY-002 `seq` lets the
+  consumer detect the gap).
+- The production `RelayedTransport` (the strategy's tier-6 seam) is `ReservationRelayedTransport`; it
+  gates on a live reservation and reports the relay endpoint for observability, while the byte stream
+  is taken via `open_tunnel`.
+
 ## 6. STUN/PCP anti-spoof requirements (NORMATIVE)
 
 STUN Binding responses (RFC 5389) and PCP MAP responses (RFC 6887) travel over unauthenticated UDP.
