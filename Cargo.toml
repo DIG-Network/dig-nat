@@ -13,7 +13,7 @@
 # the others so the ordering/fallback strategy is tested with mock methods regardless.
 [package]
 name = "dig-nat"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -29,16 +29,16 @@ categories = ["network-programming"]
 # Sourcing: `DIG_RELAY_URL` was added in dig-constants 0.2.x, which is NOT yet on crates.io (only
 # 0.1.0 is). Until it is published we resolve from the DIG-Network git repo so both the standalone
 # CI checkout and the superproject build compile against the real constant.
-# VERSION REQ: `>=0.2, <0.4` deliberately spans 0.2.x AND 0.3.x. dig-constants `main` advanced to
-# 0.3.0, an ADDITIVE release (adds `DIG_NODE_PORT`, breaks nothing dig-nat uses); a bare `^0.2` req
-# could not be satisfied by the 0.3.0 default branch, failing every fresh resolve. `<0.4` keeps us
-# guarded against a future breaking 0.4. This is what `cargo publish` records, so the PUBLISHED
-# dig-nat depends on crates.io `dig-constants` in the same `>=0.2, <0.4` range.
+# VERSION REQ: `>=0.2, <0.5` deliberately spans 0.2.x, 0.3.x AND 0.4.x — all ADDITIVE releases that
+# break nothing dig-nat uses (0.3.0 added `DIG_NODE_PORT`; 0.4.0 is the genesis cascade). A bare
+# `^0.2` req could not be satisfied by the 0.3.0/0.4.0 default branch, failing every fresh resolve;
+# `<0.5` keeps us guarded against a future breaking 0.5. This is what `cargo publish` records, so the
+# PUBLISHED dig-nat depends on crates.io `dig-constants` in the same `>=0.2, <0.5` range.
 # RELEASE ORDERING (ecosystem rule: release-first for shared contracts): dig-constants must be
 # published to crates.io, and this `git` source swapped for the plain crates.io version, BEFORE
 # dig-nat is published — `cargo publish` rejects a git dependency, so the publish workflow enforces
 # this. The orchestrator sequences the tags.
-dig-constants = { version = ">=0.2, <0.4", git = "https://github.com/DIG-Network/dig-constants" }
+dig-constants = { version = ">=0.2, <0.5", git = "https://github.com/DIG-Network/dig-constants" }
 
 # Async runtime + networking (UDP for NAT-PMP/PCP/STUN, TCP for direct/mTLS).
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }

@@ -140,6 +140,7 @@ async fn client_registers_with_loopback_relay() {
             endpoint,
             "peerhex".into(),
             "DIG_MAINNET".into(),
+            Vec::new(),
             task_status,
             // Fast backoff so the test never waits the production 5s.
             Backoff {
@@ -178,6 +179,7 @@ async fn dead_relay_degrades_gracefully_without_crashing() {
             "ws://127.0.0.1:1".into(),
             "peerhex".into(),
             "DIG_MAINNET".into(),
+            Vec::new(),
             task_status,
             Backoff {
                 base_secs: 0,
@@ -281,6 +283,7 @@ async fn client_handles_frames_and_error_drops_session() {
             endpoint_for_task,
             "peerhex".into(),
             "DIG_MAINNET".into(),
+            Vec::new(),
             task_status,
         )
         .await
@@ -386,6 +389,7 @@ async fn persistent_reservation_discovers_peers_over_live_socket() {
             endpoint,
             "self".into(),
             "DIG_MAINNET".into(),
+            Vec::new(),
             task_status,
             Backoff {
                 base_secs: 0,
@@ -481,6 +485,7 @@ async fn known_peers_set_is_bounded_under_a_peer_connected_flood() {
             endpoint,
             "self".into(),
             "DIG_MAINNET".into(),
+            Vec::new(),
             task_status,
             Backoff {
                 base_secs: 0,

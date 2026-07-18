@@ -34,6 +34,11 @@ pub enum RelayMessage {
         peer_id: String,
         network_id: String,
         protocol_version: u32,
+        // The node's advertised gossip LISTEN candidate address(es), IPv6-first (§5.2). Additive
+        // since protocol v1 (NC-6 soft-fork): appended LAST, default-empty + skip-when-empty so the
+        // wire stays byte-identical for pre-#924 peers. Byte-identical to dig-relay-protocol 0.2.0.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        listen_addrs: Vec<SocketAddr>,
     },
 
     /// Relay → Client: registration acknowledgement.
@@ -130,6 +135,12 @@ pub struct RelayPeerInfo {
     pub protocol_version: u32,
     pub connected_at: u64,
     pub last_seen: u64,
+    // Relay-resolved dialable candidate address(es) for this peer, IPv6-first (§5.2) — the relay
+    // substitutes the observed reflexive IP for any unspecified/loopback/private advertised
+    // `listen_addr` host (keeping the port). Additive since protocol v1 (NC-6 soft-fork): appended
+    // LAST, default-empty + skip-when-empty. Byte-identical to dig-relay-protocol 0.2.0.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<SocketAddr>,
 }
 
 impl RelayPeerInfo {
@@ -142,6 +153,7 @@ impl RelayPeerInfo {
             protocol_version,
             connected_at: now,
             last_seen: now,
+            addresses: Vec::new(),
         }
     }
 }
