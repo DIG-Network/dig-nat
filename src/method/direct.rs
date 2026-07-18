@@ -11,9 +11,10 @@ use crate::error::MethodError;
 use crate::method::{MethodOutcome, TraversalKind, TraversalMethod};
 use crate::peer::PeerTarget;
 
-/// The direct-dial method: yields the peer's whole IPv6-first candidate list
-/// ([`PeerTarget::direct_addrs`]) so the dialer tries IPv6 first and falls back to IPv4, or fails if
-/// the peer has no known direct address (then the strategy moves on to the mapping/relay methods).
+/// The direct-dial method: yields the peer's whole candidate list ([`PeerTarget::direct_addrs`]) so
+/// the dialer (`dig-ip`) tries IPv6 first over the local∩peer intersection and falls back to IPv4, or
+/// fails if the peer has no known direct address (then the strategy moves on to the mapping/relay
+/// methods).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DirectMethod;
 
@@ -31,7 +32,8 @@ impl TraversalMethod for DirectMethod {
                 "peer has no known direct address",
             ));
         }
-        // The peer's candidate list is already IPv6-first; carry all of it so the dial can fall back.
+        // Carry the peer's whole candidate list; dig-ip orders it (IPv6-first, family-intersected)
+        // at dial time so the dial can fall back across families.
         Ok(MethodOutcome::candidates(
             TraversalKind::Direct,
             addrs.to_vec(),

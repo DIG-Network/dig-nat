@@ -198,7 +198,7 @@ impl TraversalMethod for NatPmpMethod {
 
     async fn attempt(&self, peer: &PeerTarget) -> Result<MethodOutcome, MethodError> {
         // NAT-PMP opens OUR pinhole; we still need the peer's address(es) to dial afterwards. Carry
-        // the peer's whole IPv6-first candidate list so the post-mapping dial keeps the fallback.
+        // the peer's whole candidate list so the post-mapping dial (dig-ip) keeps the family fallback.
         let dial_addrs = peer.direct_addrs();
         if dial_addrs.is_empty() {
             return Err(MethodError::failed(

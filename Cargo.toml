@@ -13,7 +13,7 @@
 # the others so the ordering/fallback strategy is tested with mock methods regardless.
 [package]
 name = "dig-nat"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -39,6 +39,12 @@ categories = ["network-programming"]
 # dig-nat is published — `cargo publish` rejects a git dependency, so the publish workflow enforces
 # this. The orchestrator sequences the tags.
 dig-constants = { version = ">=0.2, <0.5", git = "https://github.com/DIG-Network/dig-constants" }
+
+# The ecosystem's single, canonical address-family discovery + IPv6-first happy-eyeballs dial
+# (CLAUDE.md §5.2). dig-nat is the FIRST consumer: `MtlsDialer::dial` builds a `dig_ip::PeerCandidates`
+# from the traversal outcome and calls `dig_ip::connect`, so the local∩peer family INTERSECTION and
+# the RFC-8305 racer live in ONE place instead of being hand-rolled here. See `dig-ip`'s `SPEC.md`.
+dig-ip = "0.1"
 
 # Async runtime + networking (UDP for NAT-PMP/PCP/STUN, TCP for direct/mTLS).
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
