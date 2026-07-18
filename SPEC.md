@@ -31,64 +31,64 @@ connection.
 
 ## 3. Address-family policy — IPv6-first, IPv4-fallback (NORMATIVE)
 
-All peer-to-peer address handling in `dig-nat` is **IPv6-first with IPv4 as a fallback**. This
-applies to the candidate model, the outcome model, and the dial path.
+All peer-to-peer address handling in `dig-nat` is **IPv6-first with IPv4 as a fallback**. The
+authority for address-family discovery, the local∩peer family intersection, and the happy-eyeballs
+dial is the canonical **`dig-ip` crate** (CLAUDE.md §5.2) — see its `SPEC.md`. `dig-nat` MUST use
+`dig_ip::connect` / `dig_ip::dial_order` rather than hand-rolling candidate ordering or a racer; it is
+the FIRST consumer of that crate. This section states how `dig-nat` wires into it.
 
 ### 3.1 Candidate model
 
-- A peer's directly-dialable addresses are carried as an **ordered candidate list**
+- A peer's directly-dialable addresses are carried as a **candidate list**
   (`PeerTarget::direct_addrs`), NOT a single address.
-- The list **MUST** be ordered **IPv6-first**: every IPv6 candidate precedes every IPv4 candidate.
-  The relative order **WITHIN** each family **MUST** be preserved (a stable ordering), so a caller can
-  express a preference among same-family candidates.
-- Ordering **MUST** be decided by the address family (`SocketAddr::is_ipv6`). Implementations **MUST
-  NOT** decide family by inspecting the string form (a bracketed `[v6]:port` and an `v4:port` both
-  contain `:`).
-- The constructors `PeerTarget::with_addr` (one address) and `PeerTarget::with_addrs` (many) and the
-  mutator `PeerTarget::set_direct_addrs` **MUST** apply this ordering regardless of input order.
-- `PeerTarget::direct_addrs()` returns the ordered list. `PeerTarget::direct_addr()` returns the
-  single best (first, i.e. IPv6-preferred) candidate, or `None` for a relay-only target. A relay-only
-  target (`PeerTarget::relay_only`) has an empty candidate list.
+- The list is stored in **discovery order** — the caller supplies candidates in whatever order it
+  learned them; `dig-nat` **MUST NOT** re-order them. The IPv6-first preference + the family
+  intersection are applied at DIAL time by `dig-ip` (§3.3), which derives each address's family via
+  `dig_ip::Family::of` (never a string heuristic; an IPv4-mapped IPv6 address is treated as IPv4).
+- The constructors `PeerTarget::with_addr` / `PeerTarget::with_addrs` and the mutator
+  `PeerTarget::set_direct_addrs` preserve the supplied order.
+- `PeerTarget::direct_addrs()` returns the candidate list in discovery order. `PeerTarget::direct_addr()`
+  returns the first candidate, or `None` for a relay-only target. A relay-only target
+  (`PeerTarget::relay_only`) has an empty candidate list.
 
 ### 3.2 Outcome model
 
 - A traversal method yields a `MethodOutcome` carrying the candidate addresses to dial
-  (`MethodOutcome::dial_addrs`), ordered IPv6-first, never empty on success.
+  (`MethodOutcome::dial_addrs`), in discovery order, never empty on success.
 - The direct and mapping methods (Direct, UPnP, NAT-PMP, PCP) **MUST** carry the peer's whole
-  IPv6-first candidate list so the dial can fall back across families. They construct the outcome via
-  `MethodOutcome::candidates`, which re-applies the IPv6-first ordering.
+  candidate list so the dial can fall back across families. They construct the outcome via
+  `MethodOutcome::candidates` (which stores the list as-is).
 - The hole-punch and relayed methods yield a single coordinated peer address or the relay endpoint
   respectively, via `MethodOutcome::single`.
-- `MethodOutcome::dial_addr()` returns the first (IPv6-preferred) candidate.
+- `MethodOutcome::dial_addr()` returns the first candidate in discovery order.
 
-### 3.3 Dial path — happy eyeballs (RFC 8305-style)
+### 3.3 Dial path — `dig-ip` (family intersection + happy eyeballs, RFC 8305)
 
-The dialer **MUST** attempt a peer's candidate addresses IPv6-first and **MUST** use IPv4 only as a
-fallback when the IPv6 candidate(s) fail or stall:
+The dialer **MUST** delegate family selection + racing to `dig_ip::connect`. `MtlsDialer::dial`:
 
-- Candidates are attempted in IPv6-first priority order. The implementation **MUST** defensively
-  re-order the candidates IPv6-first before racing (it does not rely on the caller having sorted).
-  An implementation **MAY** skip the re-order step when it can cheaply prove the input is already
-  IPv6-first (e.g. `peer::is_ipv6_first`) — this is a pure performance optimization and **MUST NOT**
-  weaken the guarantee: genuinely unsorted input **MUST** still be corrected.
-- The IPv6 candidate(s) **MUST** be started first. A lower-priority (IPv4) candidate **MAY** be
-  started as a hedge once the preferred candidate has not completed within a configurable stagger
-  (RFC 8305 "Connection Attempt Delay").
-- IPv6 is the **preference**, not merely the first to start: a lower-priority (IPv4) success **MUST**
-  be returned only once every higher-priority (IPv6) attempt has concluded (failed or timed out). A
-  viable IPv6 candidate therefore wins even if a hedged IPv4 attempt happens to connect first; IPv4
-  wins only when IPv6 genuinely fails.
-- Each candidate attempt **MUST** be bounded by a configurable per-attempt timeout. The stagger and
-  per-attempt timeout are configurable (`HappyEyeballsConfig`) so the racing logic is deterministically
-  testable.
-- If every candidate fails, the dial **MUST** return an error enumerating the per-candidate reasons;
-  it **MUST NOT** panic or hang. An empty candidate list is an error.
-- The established connection's reported remote address (`PeerConnection::remote_addr`) **MUST** reflect
-  the candidate (and therefore family) actually used.
+- aggregates the outcome's addresses into a `dig_ip::PeerCandidates` (`dialer::candidates_from_outcome`),
+  tagging each with a `dig_ip::CandidateSource` for observability (provenance MUST NOT influence the
+  intersection rule);
+- resolves the local host's `dig_ip::LocalStack` — `LocalStack::cached()` in production, or a pinned
+  stack via `MtlsDialer::with_local_stack` for deterministic tests;
+- calls `dig_ip::connect(&local, &candidates, config, dial_fn)` where `dial_fn` performs one
+  candidate's raw TCP connect; then runs the single mTLS handshake over the winning stream.
 
-The pure racing function is `dialer::happy_eyeballs_connect`; the production dialer
-(`dialer::MtlsDialer`) uses it to race the TCP connect, then runs the single mTLS handshake over the
-winning stream.
+The behaviour `dig-nat` INHERITS from `dig-ip` (its structural guarantees, tested here in
+`tests/dial_family.rs`):
+
+- **G1** — the dial NEVER attempts an address of a family the LOCAL host lacks (an IPv4-only host
+  never emits an IPv6 SYN).
+- **G2** — the dial NEVER attempts an address of a family the PEER lacks.
+- **IPv6-first preference** — a viable IPv6 candidate wins even if a hedged IPv4 attempt connects
+  sooner; IPv4 wins only when IPv6 genuinely fails/stalls.
+- **Clean disjoint outcome** — when the local host and the peer share no family, the dial fails
+  IMMEDIATELY with `dig_ip::ConnectError::NoCommonFamily` (surfaced as a `MethodError` whose reason
+  contains "no common address family"); NO dial is attempted, so there is no doomed, hanging SYN.
+- The per-attempt timeout + inter-attempt stagger are configurable (`HappyEyeballsConfig`, mapped to
+  `dig_ip::DialConfig`) so the racing is deterministically testable.
+- The established connection's reported remote address (`PeerConnection::remote_addr`) reflects the
+  candidate (and therefore family) actually used.
 
 ### 3.4 Per-method address-family notes
 
@@ -227,33 +227,34 @@ source address. Both properties are REQUIRED, independently of each other:
 
 ```
 PeerTarget::with_addr(peer_id, addr, network_id)            // single candidate
-PeerTarget::with_addrs(peer_id, Vec<SocketAddr>, network_id)// many candidates, sorted IPv6-first
+PeerTarget::with_addrs(peer_id, Vec<SocketAddr>, network_id)// many candidates, discovery order
 PeerTarget::relay_only(peer_id, network_id)                 // no direct candidates
-PeerTarget::direct_addrs() -> &[SocketAddr]                 // ordered IPv6-first
-PeerTarget::direct_addr()  -> Option<SocketAddr>            // first (IPv6-preferred) candidate
-PeerTarget::set_direct_addrs(Vec<SocketAddr>)               // replace, re-sort IPv6-first
-peer::sort_ipv6_first(&mut [SocketAddr])                    // the ordering primitive
-peer::is_ipv6_first(&[SocketAddr]) -> bool                  // cheap "already ordered?" check
+PeerTarget::direct_addrs() -> &[SocketAddr]                 // candidates, discovery order
+PeerTarget::direct_addr()  -> Option<SocketAddr>            // first candidate
+PeerTarget::set_direct_addrs(Vec<SocketAddr>)               // replace (order preserved)
 
 MethodOutcome::single(kind, addr)                           // hole-punch / relayed (one address)
-MethodOutcome::candidates(kind, Vec<SocketAddr>)            // direct / mapping (IPv6-first list)
-MethodOutcome::dial_addr() -> Option<SocketAddr>            // first (IPv6-preferred) candidate
-MethodOutcome.dial_addrs: Vec<SocketAddr>                   // ordered IPv6-first
+MethodOutcome::candidates(kind, Vec<SocketAddr>)            // direct / mapping (discovery order)
+MethodOutcome::dial_addr() -> Option<SocketAddr>            // first candidate
+MethodOutcome.dial_addrs: Vec<SocketAddr>                   // candidates, discovery order
 
-dialer::HappyEyeballsConfig { per_attempt_timeout, stagger }
-dialer::happy_eyeballs_connect(&[SocketAddr], cfg, connect_one) -> Result<T, String>
-dialer::MtlsDialer::new(identity).with_happy_eyeballs(cfg)
+// Family selection + happy-eyeballs racing is dig-ip's job (dial-time); dig-nat wires into it:
+dialer::HappyEyeballsConfig { per_attempt_timeout, stagger } // -> dig_ip::DialConfig
+dialer::candidates_from_outcome(&MethodOutcome) -> dig_ip::PeerCandidates
+dialer::MtlsDialer::new(identity).with_happy_eyeballs(cfg).with_local_stack(dig_ip::LocalStack)
 
 connect(peer, identity, config) -> Result<PeerConnection, NatError>
 ```
 
 ## 9. Conformance
 
-- Candidate ordering: given a mixed list, `direct_addrs()` returns all IPv6 before any IPv4, stable
-  within family; the ordering is by `IpAddr` family, not the string form.
-- Happy eyeballs: given `[unreachable IPv6, reachable IPv4]`, the dial connects over IPv4; given both
-  reachable, IPv6 wins; IPv6 is attempted before IPv4 even when input is IPv4-first; all-fail returns
-  every candidate's reason.
+- Candidate storage: `direct_addrs()` returns candidates in discovery order (no re-sorting); ordering
+  + intersection are dig-ip's job at dial time.
+- Family intersection (via dig-ip, `tests/dial_family.rs` using `LocalStack::from_flags`): dual-stack
+  prefers IPv6; a failed IPv6 falls back to IPv4; a v4-only host dials only IPv4 (G1); a v4-only peer
+  is dialed only over IPv4 (G2); a disjoint local/peer pair fails immediately with `NoCommonFamily` and
+  attempts NO dial. End-to-end over the production `MtlsDialer`: `[unreachable IPv6, reachable IPv4]`
+  connects over IPv4; a v4-only host asked for a v6-only peer returns a clean no-common-family error.
 - IPv6 selection: `select_global_ipv6` returns a global-unicast IPv6 and rejects link-local / ULA /
   loopback / unspecified.
 - Identity: `peer_id = SHA-256(SPKI DER)` matches `dig-gossip` (cross-crate conformance test).

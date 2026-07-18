@@ -117,7 +117,7 @@ impl<G: IgdGateway> TraversalMethod for UpnpMethod<G> {
     }
 
     async fn attempt(&self, peer: &PeerTarget) -> Result<MethodOutcome, MethodError> {
-        // Carry the peer's whole IPv6-first candidate list so the post-mapping dial keeps the
+        // Carry the peer's whole candidate list so the post-mapping dial (dig-ip) keeps the
         // IPv6-first / IPv4-fallback order across families.
         let dial_addrs = peer.direct_addrs();
         if dial_addrs.is_empty() {

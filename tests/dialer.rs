@@ -5,6 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use dig_ip::LocalStack;
 use dig_nat::config::LocalIdentity;
 use dig_nat::dialer::{HappyEyeballsConfig, MtlsDialer};
 use dig_nat::identity::peer_id_from_leaf_cert_der;
@@ -146,21 +147,21 @@ async fn dial_falls_back_from_unreachable_ipv6_to_ipv4() {
     let (scert, skey, server_id) = gen();
     let addr = spawn_mtls_server(scert, skey).await; // 127.0.0.1:<port> (IPv4 loopback)
 
-    // A short happy-eyeballs config so the IPv6 attempt fails fast and the fallback is quick.
-    let dialer = MtlsDialer::new(local_identity()).with_happy_eyeballs(HappyEyeballsConfig {
-        per_attempt_timeout: Duration::from_secs(2),
-        stagger: Duration::from_millis(30),
-    });
+    // A short happy-eyeballs config so the IPv6 attempt fails fast and the fallback is quick. Pin a
+    // dual-stack local stack so the fallback is exercised deterministically regardless of the CI
+    // host's real IPv6 capability (an IPv4-only host would otherwise never attempt the IPv6 leg).
+    let dialer = MtlsDialer::new(local_identity())
+        .with_happy_eyeballs(HappyEyeballsConfig {
+            per_attempt_timeout: Duration::from_secs(2),
+            stagger: Duration::from_millis(30),
+        })
+        .with_local_stack(LocalStack::from_flags(true, true));
 
     // Documentation range 2001:db8::/32 is not routable — the IPv6 attempt fails; IPv4 loopback wins.
     let unreachable_v6: std::net::SocketAddr = "[2001:db8::1]:9".parse().unwrap();
     let peer = PeerTarget::with_addrs(server_id, vec![unreachable_v6, addr], "DIG_MAINNET");
-    // The outcome carries the peer's IPv6-first candidate list (IPv6 first, IPv4 fallback).
+    // The outcome carries both candidates; dig-ip tries the IPv6 leg first (IPv4 fallback).
     let outcome = MethodOutcome::candidates(TraversalKind::Direct, peer.direct_addrs().to_vec());
-    assert!(
-        outcome.dial_addrs[0].is_ipv6(),
-        "IPv6 candidate is tried first"
-    );
 
     let conn = dialer
         .dial(&peer, &outcome)
@@ -175,6 +176,27 @@ async fn dial_falls_back_from_unreachable_ipv6_to_ipv4() {
         "connected over the IPv4 loopback address"
     );
     assert!(conn.remote_addr.is_ipv4());
+}
+
+/// A v4-only local host asked to dial a peer that ONLY advertises an IPv6 candidate fails cleanly and
+/// IMMEDIATELY (dig-ip's `NoCommonFamily`) — it never emits a doomed IPv6 SYN that could only hang.
+#[tokio::test]
+async fn dial_v4_only_host_to_v6_only_peer_is_clean_no_common_family() {
+    let dialer =
+        MtlsDialer::new(local_identity()).with_local_stack(LocalStack::from_flags(false, true));
+    let v6_only: std::net::SocketAddr = "[2001:db8::1]:9".parse().unwrap();
+    let peer = PeerTarget::with_addr(PeerId::from_bytes([1u8; 32]), v6_only, "DIG_MAINNET");
+    let outcome = MethodOutcome::single(TraversalKind::Direct, v6_only);
+
+    let err = dialer.dial(&peer, &outcome).await.unwrap_err();
+    assert_eq!(err.kind, TraversalKind::Direct);
+    assert!(
+        err.reason.contains("no common address family"),
+        "reports a clean no-common-family error, got: {}",
+        err.reason
+    );
+    // Crucially NOT a tcp-connect error — no dial was attempted.
+    assert!(!err.reason.contains("tcp connect"));
 }
 
 /// Dialing an address with nothing listening fails cleanly (tcp connect error), no panic/hang.

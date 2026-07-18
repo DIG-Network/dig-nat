@@ -7,22 +7,21 @@
 //! unless it matches the [`PeerTarget::peer_id`] the caller asked for. On success the caller gets an
 //! authenticated, encrypted [`tokio_rustls::client::TlsStream`].
 //!
-//! ## IPv6-first, IPv4-fallback (happy eyeballs, RFC 8305-style)
+//! ## IPv6-first, IPv4-fallback — delegated to `dig-ip` (CLAUDE.md §5.2)
 //!
-//! A [`MethodOutcome`] carries the peer's candidate addresses ordered **IPv6-first**. The dialer
-//! races the TCP connect across the candidates with [`happy_eyeballs_connect`]: it starts the first
-//! (IPv6) candidate, and after a short [`HappyEyeballsConfig::stagger`] starts the next candidate
-//! too if the first has not yet completed — so a viable IPv6 candidate is preferred and IPv4 is used
-//! only as a fallback when IPv6 fails/stalls. Each attempt is bounded by
-//! [`HappyEyeballsConfig::per_attempt_timeout`]. Once a TCP connection wins, the single mTLS
-//! handshake runs over it. The timeout + stagger are configurable so the racing logic is unit-tested
-//! deterministically with no real sockets.
+//! The family-selection + happy-eyeballs racing that used to live here is now the `dig-ip` crate's
+//! single ecosystem responsibility. [`MtlsDialer::dial`] aggregates a [`MethodOutcome`]'s candidate
+//! addresses into a [`dig_ip::PeerCandidates`] and calls [`dig_ip::connect`], handing it the local
+//! host's [`dig_ip::LocalStack`] and a closure that performs one candidate's raw TCP connect.
+//! `dig-ip` then dials over the **local∩peer family intersection** (never a family the local host or
+//! the peer lacks — its structural guarantee), IPv6-first with graceful IPv4 fallback. Once a TCP
+//! connection wins, the single mTLS handshake runs over it — the identity/cert behaviour below is
+//! unchanged; only the family selection + racing moved out. See `dig-ip`'s `SPEC.md`.
 
-use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
+use dig_ip::{CandidateSource, DialConfig, LocalStack, PeerCandidates};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::ClientConfig;
 use tokio::net::TcpStream;
@@ -36,15 +35,16 @@ use crate::peer::{PeerConnection, PeerTarget};
 use crate::strategy::Dialer;
 
 /// Tuning for the happy-eyeballs candidate race: how long each candidate connect may take, and how
-/// long to wait before ALSO starting the next (lower-priority) candidate.
+/// long to wait before ALSO starting the next (lower-priority) candidate. A thin dig-nat-facing view
+/// of [`dig_ip::DialConfig`] (which the dial converts it into) so the public dialer API stays stable.
 #[derive(Debug, Clone, Copy)]
 pub struct HappyEyeballsConfig {
     /// Hard timeout for a single candidate's connect attempt.
-    pub per_attempt_timeout: Duration,
+    pub per_attempt_timeout: std::time::Duration,
     /// Delay before starting the next candidate while the current one is still in flight (RFC 8305
     /// "Connection Attempt Delay"). A small value (tens of ms) hedges a stalled IPv6 without racing
     /// so hard that IPv4 routinely beats a viable IPv6.
-    pub stagger: Duration,
+    pub stagger: std::time::Duration,
 }
 
 impl Default for HappyEyeballsConfig {
@@ -52,179 +52,77 @@ impl Default for HappyEyeballsConfig {
         // RFC 8305 recommends a ~250ms connection-attempt delay; the per-attempt timeout is kept
         // generous (the strategy's per-method timeout is the real outer bound).
         HappyEyeballsConfig {
-            per_attempt_timeout: Duration::from_secs(10),
-            stagger: Duration::from_millis(250),
+            per_attempt_timeout: std::time::Duration::from_secs(10),
+            stagger: std::time::Duration::from_millis(250),
         }
     }
 }
 
-/// Race a connect across `candidates` IPv6-first, returning the most-preferred (IPv6) success.
+impl From<HappyEyeballsConfig> for DialConfig {
+    fn from(cfg: HappyEyeballsConfig) -> DialConfig {
+        DialConfig {
+            per_attempt_timeout: cfg.per_attempt_timeout,
+            attempt_delay: cfg.stagger,
+        }
+    }
+}
+
+/// Aggregate a traversal [`MethodOutcome`]'s dial addresses into a family-tagged
+/// [`dig_ip::PeerCandidates`] — the input `dig_ip::connect` filters by the local∩peer intersection.
 ///
-/// The candidates are (defensively) ordered **IPv6-first** ([`crate::peer::sort_ipv6_first`]) and
-/// each is assigned a PRIORITY index in that order (0 = most preferred). Attempts are launched with a
-/// [`HappyEyeballsConfig::stagger`] head-start between them — the IPv6 candidate(s) start first, and a
-/// lower-priority (IPv4) candidate is only *launched* once the preferred one has not completed within
-/// the stagger (RFC 8305 hedging). Crucially, IPv6 is the PREFERENCE, not merely the first to start:
-/// a lower-priority success is returned ONLY once every higher-priority attempt has concluded
-/// (failed/timed out). So a viable IPv6 candidate wins even if a hedged IPv4 attempt happens to
-/// connect sooner; IPv4 wins only when IPv6 genuinely fails. Each attempt is bounded by
-/// [`HappyEyeballsConfig::per_attempt_timeout`]. If every candidate fails, returns the collected
-/// per-candidate errors. An empty list is an error.
-///
-/// `connect_one` performs one candidate's connect (in production: a TCP connect; in tests: a canned
-/// closure) — it is `async` and family-aware via the [`SocketAddr`] it is handed.
-pub async fn happy_eyeballs_connect<T, E, F, Fut>(
-    candidates: &[std::net::SocketAddr],
-    config: HappyEyeballsConfig,
-    connect_one: F,
-) -> Result<T, String>
-where
-    E: std::fmt::Display,
-    F: Fn(std::net::SocketAddr) -> Fut + Sync,
-    Fut: Future<Output = Result<T, E>> + Send,
-    T: Send,
-{
-    if candidates.is_empty() {
-        return Err("no candidate addresses to dial".to_string());
-    }
-
-    // Defensive IPv6-first ordering: the priority index is the position in this ordered list, so
-    // index 0 is the most-preferred (IPv6) candidate regardless of the caller's input order.
-    //
-    // #179 finding 5 (optimization): callers (`PeerTarget::direct_addrs`,
-    // `MethodOutcome::candidates`) already hand us an IPv6-first list, so cloning + re-sorting on
-    // EVERY connect attempt is redundant almost always. `is_ipv6_first` is a cheap O(n) check;
-    // only pay for the clone+sort when the input genuinely isn't already ordered — the ordering
-    // GUARANTEE itself is never dropped (a caller that hands in unsorted input still gets it
-    // corrected here).
-    let mut ordered: Vec<std::net::SocketAddr> = candidates.to_vec();
-    if !crate::peer::is_ipv6_first(&ordered) {
-        crate::peer::sort_ipv6_first(&mut ordered);
-    }
-    let total = ordered.len();
-
-    // Each attempt yields (priority, addr, result); FuturesUnordered runs them concurrently. The
-    // attempts are boxed to a common type because the `launch!` macro expands to several distinct
-    // async blocks (one per call site) that must share one FuturesUnordered element type.
-    type Attempt<'f, U> = std::pin::Pin<
-        Box<dyn Future<Output = (usize, std::net::SocketAddr, Result<U, String>)> + Send + 'f>,
-    >;
-    let mut attempts: futures::stream::FuturesUnordered<Attempt<'_, T>> =
-        futures::stream::FuturesUnordered::new();
-    // The priority indices still live (in flight); a held fallback success can only be returned once
-    // no live attempt is more preferred than it.
-    let mut live: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-    let mut errors: Vec<String> = Vec::with_capacity(total);
-    let mut next_prio = 0usize;
-    // The most-preferred success seen so far, held until no more-preferred candidate can beat it.
-    let mut best_success: Option<(usize, T)> = None;
-
-    // A macro-free launcher: push candidate `next_prio` as a bounded attempt.
-    macro_rules! launch {
-        () => {
-            if next_prio < total {
-                let prio = next_prio;
-                let addr = ordered[prio];
-                next_prio += 1;
-                live.insert(prio);
-                let fut = &connect_one;
-                attempts.push(Box::pin(async move {
-                    let res =
-                        match tokio::time::timeout(config.per_attempt_timeout, fut(addr)).await {
-                            Ok(Ok(conn)) => Ok(conn),
-                            Ok(Err(e)) => Err(e.to_string()),
-                            Err(_) => Err("connect timed out".to_string()),
-                        };
-                    (prio, addr, res)
-                }));
-            }
-        };
-    }
-
-    // Prime the first (highest-priority = IPv6) candidate.
-    launch!();
-
-    loop {
-        // Can we settle a held success now? Yes, once no still-live attempt AND no unlaunched
-        // candidate is more preferred than it (so nothing better can still arrive).
-        if let Some((p, _)) = &best_success {
-            let more_preferred_live = live.iter().next().map(|lo| *lo < *p).unwrap_or(false);
-            let more_preferred_unlaunched = next_prio <= *p; // an index <= p not yet launched
-            if !more_preferred_live && !more_preferred_unlaunched {
-                return Ok(best_success.take().unwrap().1);
-            }
-        }
-
-        // Nothing left running and nothing left to launch → done.
-        if live.is_empty() && next_prio >= total {
-            break;
-        }
-
-        let stagger = tokio::time::sleep(config.stagger);
-        tokio::select! {
-            biased;
-            finished = futures::StreamExt::next(&mut attempts), if !live.is_empty() => {
-                match finished {
-                    Some((prio, addr, Ok(conn))) => {
-                        live.remove(&prio);
-                        // Top-priority success (IPv6, index 0) wins outright.
-                        if prio == 0 {
-                            return Ok(conn);
-                        }
-                        // Otherwise hold the most-preferred success; keep racing more-preferred ones.
-                        let keep = best_success.as_ref().map(|(bp, _)| prio < *bp).unwrap_or(true);
-                        if keep {
-                            best_success = Some((prio, conn));
-                        }
-                        let _ = addr;
-                        // Ensure a more-preferred candidate isn't left untried.
-                        launch!();
-                    }
-                    Some((prio, addr, Err(e))) => {
-                        live.remove(&prio);
-                        errors.push(format!("{addr}: {e}"));
-                        // This attempt is out of the race — launch the next candidate.
-                        launch!();
-                    }
-                    None => break,
-                }
-            }
-            _ = stagger, if !live.is_empty() && next_prio < total => {
-                // The preferred candidate is stalling — hedge by ALSO starting the next candidate.
-                launch!();
-            }
-        }
-    }
-
-    // Nothing left in flight: return the most-preferred success we held, else the collected errors.
-    if let Some((_, conn)) = best_success {
-        return Ok(conn);
-    }
-    Err(format!("all candidates failed: [{}]", errors.join("; ")))
+/// The candidate ordering + IPv6-first preference is `dig-ip`'s job, so the addresses are added in
+/// the order the traversal produced them; `dig-ip` derives each family and orders IPv6-first. The
+/// [`CandidateSource`] tag is provenance/observability only (it never influences the intersection
+/// rule): a relay-coordinated or relayed endpoint is tagged [`CandidateSource::RelayIntroduction`],
+/// every direct/port-mapping endpoint the peer's advertised [`CandidateSource::ListenAddr`].
+pub fn candidates_from_outcome(outcome: &MethodOutcome) -> PeerCandidates {
+    let source = match outcome.kind {
+        TraversalKind::HolePunch | TraversalKind::Relayed => CandidateSource::RelayIntroduction,
+        TraversalKind::Direct
+        | TraversalKind::Upnp
+        | TraversalKind::NatPmp
+        | TraversalKind::Pcp => CandidateSource::ListenAddr,
+    };
+    let mut candidates = PeerCandidates::new();
+    candidates.extend(outcome.dial_addrs.iter().copied(), source);
+    candidates
 }
 
 /// The production mTLS dialer. Holds this node's [`LocalIdentity`] (its client certificate for
 /// mutual TLS) and builds a fresh pinning verifier per dial. The candidate race is tuned by
-/// [`MtlsDialer::happy_eyeballs`].
+/// [`MtlsDialer::happy_eyeballs`], and the local stack it dials from by [`MtlsDialer::local_stack`].
 #[derive(Debug, Clone)]
 pub struct MtlsDialer {
     identity: LocalIdentity,
     happy_eyeballs: HappyEyeballsConfig,
+    /// The local host's address-family capability used to filter the dial (`dig-ip`'s G1 gate).
+    /// `None` = probe the real host per dial via [`LocalStack::cached`]; `Some` pins a deterministic
+    /// stack (used by tests to exercise the intersection matrix without a host dependency).
+    local_stack: Option<LocalStack>,
 }
 
 impl MtlsDialer {
     /// Build a dialer that authenticates as `identity` (presents its cert as the mTLS client cert),
-    /// using the default happy-eyeballs tuning.
+    /// using the default happy-eyeballs tuning and the real host's detected address-family stack.
     pub fn new(identity: LocalIdentity) -> Self {
         MtlsDialer {
             identity,
             happy_eyeballs: HappyEyeballsConfig::default(),
+            local_stack: None,
         }
     }
 
     /// Override the happy-eyeballs (IPv6-first candidate race) tuning.
     pub fn with_happy_eyeballs(mut self, config: HappyEyeballsConfig) -> Self {
         self.happy_eyeballs = config;
+        self
+    }
+
+    /// Pin the local address-family stack the dial filters against, instead of probing the real host.
+    /// The dial NEVER attempts a family this stack lacks (`dig-ip`'s G1 guarantee) — this seam lets a
+    /// test drive the intersection deterministically (`LocalStack::from_flags`).
+    pub fn with_local_stack(mut self, stack: LocalStack) -> Self {
+        self.local_stack = Some(stack);
         self
     }
 
@@ -260,21 +158,27 @@ impl Dialer for MtlsDialer {
     ) -> Result<PeerConnection, MethodError> {
         let kind = outcome.kind;
 
-        // Race the TCP connect across the peer's candidate addresses IPv6-first (happy eyeballs);
-        // IPv4 is only used when the IPv6 candidate(s) fail/stall. The winning stream carries its own
-        // peer address so `remote_addr` reflects the family actually used.
-        let (tcp, addr) = happy_eyeballs_connect(
-            &outcome.dial_addrs,
-            self.happy_eyeballs,
+        // Delegate family selection + racing to dig-ip: it dials only the local∩peer family
+        // intersection (never a family the local host or the peer lacks), IPv6-first with graceful
+        // IPv4 fallback. A disjoint pair fails immediately with `NoCommonFamily` — no doomed attempt
+        // that can only time out. The winning stream carries its own peer address, so `remote_addr`
+        // reflects the family actually used.
+        let local = self.local_stack.unwrap_or_else(LocalStack::cached);
+        let candidates = candidates_from_outcome(outcome);
+        let winner = dig_ip::connect(
+            &local,
+            &candidates,
+            self.happy_eyeballs.into(),
             |addr| async move {
                 TcpStream::connect(addr)
                     .await
-                    .map(|s| (s, addr))
                     .map_err(|e| format!("tcp connect {addr}: {e}"))
             },
         )
         .await
-        .map_err(|e| MethodError::failed(kind, e))?;
+        .map_err(|e| MethodError::failed(kind, e.to_string()))?;
+        let tcp = winner.conn;
+        let addr = winner.addr;
 
         let captured = CapturedPeerId::default();
         let config = self

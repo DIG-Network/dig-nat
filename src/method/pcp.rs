@@ -213,8 +213,8 @@ impl TraversalMethod for PcpMethod {
     }
 
     async fn attempt(&self, peer: &PeerTarget) -> Result<MethodOutcome, MethodError> {
-        // Carry the peer's whole IPv6-first candidate list so the post-mapping dial keeps the
-        // fallback across families.
+        // Carry the peer's whole candidate list so the post-mapping dial (dig-ip) keeps the fallback
+        // across families.
         let dial_addrs = peer.direct_addrs();
         if dial_addrs.is_empty() {
             return Err(MethodError::failed(

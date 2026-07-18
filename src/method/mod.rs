@@ -72,22 +72,23 @@ impl TraversalKind {
     }
 }
 
-/// What a traversal method yields on success: the dialable candidate addresses for the peer
-/// (ordered **IPv6-first**), plus which technique produced them. The [`crate::strategy`] then
-/// performs the mTLS dial, trying the candidates IPv6-first with IPv4 fallback (happy-eyeballs, see
-/// [`crate::dialer`]) — except the relayed method, which returns the already-open relay tunnel.
+/// What a traversal method yields on success: the dialable candidate addresses for the peer (in
+/// discovery order), plus which technique produced them. The [`crate::strategy`] then performs the
+/// mTLS dial, `dig-ip` selecting the family-aware order — IPv6-first over the local∩peer family
+/// intersection with IPv4 fallback (see [`crate::dialer`]) — except the relayed method, which
+/// returns the already-open relay tunnel.
 ///
-/// The direct/mapping methods carry the peer's whole IPv6-first candidate list so the dial can fall
-/// back across families; the hole-punch/relayed methods yield a single coordinated/relay address
+/// The direct/mapping methods carry the peer's whole candidate list so the dial can fall back across
+/// families; the hole-punch/relayed methods yield a single coordinated/relay address
 /// ([`MethodOutcome::single`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MethodOutcome {
     /// Which technique produced these reachable addresses.
     pub kind: TraversalKind,
-    /// The candidate addresses the strategy should dial, ordered **IPv6-first** (peer public
-    /// endpoints, a hole-punched peer address, the relay endpoint, or — mapping methods — the peer
-    /// candidates to try after opening the local pinhole). The dialer tries them IPv6-first and
-    /// falls back to IPv4. Never empty on success.
+    /// The candidate addresses the strategy should dial, in discovery order (peer public endpoints,
+    /// a hole-punched peer address, the relay endpoint, or — mapping methods — the peer candidates
+    /// to try after opening the local pinhole). `dig-ip` orders them IPv6-first over the local∩peer
+    /// intersection at dial time. Never empty on success.
     pub dial_addrs: Vec<SocketAddr>,
 }
 
@@ -101,14 +102,14 @@ impl MethodOutcome {
         }
     }
 
-    /// An outcome carrying the peer's ordered candidate list (direct / mapping tiers). The addresses
-    /// are (re-)sorted IPv6-first so the dial honours the fallback order regardless of input order.
-    pub fn candidates(kind: TraversalKind, mut dial_addrs: Vec<SocketAddr>) -> Self {
-        crate::peer::sort_ipv6_first(&mut dial_addrs);
+    /// An outcome carrying the peer's candidate list (direct / mapping tiers), in discovery order.
+    /// The IPv6-first preference + local∩peer family intersection are applied at dial time by
+    /// `dig-ip` ([`crate::dialer`]), so the addresses are stored as the method produced them.
+    pub fn candidates(kind: TraversalKind, dial_addrs: Vec<SocketAddr>) -> Self {
         MethodOutcome { kind, dial_addrs }
     }
 
-    /// The single best (IPv6-preferred) dial address — the first candidate — or `None` if empty.
+    /// The first dial address in discovery order, or `None` if empty.
     pub fn dial_addr(&self) -> Option<SocketAddr> {
         self.dial_addrs.first().copied()
     }
