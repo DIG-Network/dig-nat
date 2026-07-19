@@ -158,7 +158,7 @@ The reservation loop bakes in the resilience guarantees:
   (`disabled | connecting | connected | disconnected`) plus last error + attempt count, surfaced
   verbatim to a `control.relayStatus`-style RPC / `/health`.
 - **Opt-out honored.** `DIG_RELAY_URL=off` (or `disabled`) → `RelayState::Disabled`, no attempts.
-- **Endpoint from `dig-constants`.** Default `wss://relay.dig.net:9450` (single source of truth),
+- **Endpoint from `dig-constants`.** Default `wss://relay.dig.net:443` (single source of truth),
   overridable via `DIG_RELAY_URL`.
 
 ## Testability (no real network / no mainnet)

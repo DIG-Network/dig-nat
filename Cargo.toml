@@ -24,7 +24,7 @@ keywords = ["nat", "traversal", "p2p", "stun", "dig"]
 categories = ["network-programming"]
 
 [dependencies]
-# Canonical relay endpoint: `dig_constants::DIG_RELAY_URL` (wss://relay.dig.net:9450) is the single
+# Canonical relay endpoint: `dig_constants::DIG_RELAY_URL` (wss://relay.dig.net:443) is the single
 # source of truth dig-nat uses to reach `relay.dig.net`. Sourced from the crates.io release.
 # VERSION REQ: `>=0.4, <0.6` spans the additive 0.4.x and 0.5.x lines (nothing dig-nat depends on
 # changed across them) while guarding against a future breaking 0.6; it resolves to the latest

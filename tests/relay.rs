@@ -40,7 +40,7 @@ fn status_transitions_and_snapshot() {
 
     s.set_connected(7);
     assert!(s.is_connected());
-    let v = s.snapshot_json("wss://relay.dig.net:9450", "pk");
+    let v = s.snapshot_json("wss://relay.dig.net:443", "pk");
     assert_eq!(v["state"], "connected");
     assert_eq!(v["connected"], true);
     assert_eq!(v["connected_peers"], 7);
