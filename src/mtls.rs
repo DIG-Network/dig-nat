@@ -25,6 +25,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
 
+use crate::cert_binding::{evaluate, verify_binding_from_leaf_cert, BindingPolicy};
 use crate::identity::{peer_id_from_leaf_cert_der, PeerId};
 
 /// The outcome of verifying a peer's certificate: the `peer_id` it presented, captured for the
@@ -37,6 +38,20 @@ impl CapturedPeerId {
     /// The `peer_id` derived from the certificate the peer presented, if the handshake reached cert
     /// verification.
     pub fn get(&self) -> Option<PeerId> {
+        *self.0.lock().unwrap()
+    }
+}
+
+/// The peer's verified BLS G1 identity pubkey, captured from the cert binding (#1204) when the
+/// handshake carried a valid one. `None` means the peer presented no valid binding (a legacy peer
+/// under [`BindingPolicy::Opportunistic`], or binding verification was [`BindingPolicy::Off`]). The
+/// sealing layer (S2) seals to this key so a misdelivery cannot be opened by the wrong node.
+#[derive(Debug, Default, Clone)]
+pub struct CapturedBlsPub(pub Arc<Mutex<Option<[u8; 48]>>>);
+
+impl CapturedBlsPub {
+    /// The verified BLS G1 pubkey the peer's `peer_id` is bound to, if a valid binding was presented.
+    pub fn get(&self) -> Option<[u8; 48]> {
         *self.0.lock().unwrap()
     }
 }
@@ -54,19 +69,36 @@ pub struct PeerIdPinningVerifier {
     expected: Option<PeerId>,
     /// Where the derived peer_id is written so the caller can read who connected.
     captured: CapturedPeerId,
+    /// The BLS peer_id-binding stance (#1204). [`BindingPolicy::Off`] = do not verify the binding.
+    binding_policy: BindingPolicy,
+    /// Where the verified peer BLS pubkey is written (when a valid binding was presented).
+    captured_bls: CapturedBlsPub,
     /// Supported signature schemes, from the process crypto provider.
     defaults: Vec<SignatureScheme>,
 }
 
 impl PeerIdPinningVerifier {
     /// Build a verifier that pins `expected` (or accepts any peer when `None`) and writes the
-    /// derived id into `captured`.
+    /// derived id into `captured`. The BLS cert binding is NOT verified ([`BindingPolicy::Off`]) —
+    /// use [`PeerIdPinningVerifier::with_binding`] to enable + capture it.
     pub fn new(expected: Option<PeerId>, captured: CapturedPeerId) -> Self {
         PeerIdPinningVerifier {
             expected,
             captured,
+            binding_policy: BindingPolicy::Off,
+            captured_bls: CapturedBlsPub::default(),
             defaults: default_signature_schemes(),
         }
+    }
+
+    /// Enable BLS cert-binding verification (#1204) under `policy`, writing the verified peer BLS
+    /// pubkey into `captured_bls`. Under [`BindingPolicy::Required`] a missing/invalid binding
+    /// REJECTS the handshake (fail-closed, anti-downgrade); under [`BindingPolicy::Opportunistic`] a
+    /// present-but-invalid binding is rejected while an absent one is tolerated (legacy peers).
+    pub fn with_binding(mut self, policy: BindingPolicy, captured_bls: CapturedBlsPub) -> Self {
+        self.binding_policy = policy;
+        self.captured_bls = captured_bls;
+        self
     }
 }
 
@@ -91,6 +123,23 @@ impl ServerCertVerifier for PeerIdPinningVerifier {
                 )));
             }
         }
+
+        // Verify the BLS peer_id↔pubkey binding (#1204) per the configured policy. `Off` short-circuits
+        // (no crypto); otherwise a present-but-invalid binding always rejects, and `Required` also
+        // rejects an absent binding (fail-closed / anti-downgrade). A verified binding's pubkey is
+        // captured for the sealing layer to seal to.
+        if self.binding_policy != BindingPolicy::Off {
+            let outcome = verify_binding_from_leaf_cert(end_entity.as_ref());
+            match evaluate(&outcome, self.binding_policy) {
+                Ok(bls_pub) => *self.captured_bls.0.lock().unwrap() = bls_pub,
+                Err(reason) => {
+                    return Err(TlsError::General(format!(
+                        "peer {derived} rejected by cert BLS binding policy: {reason}"
+                    )))
+                }
+            }
+        }
+
         Ok(ServerCertVerified::assertion())
     }
 

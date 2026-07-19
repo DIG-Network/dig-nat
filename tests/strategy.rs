@@ -279,6 +279,7 @@ impl Dialer for SucceedingDialer {
             peer_id: peer.peer_id,
             method: outcome.kind,
             remote_addr: outcome.dial_addr().unwrap(),
+            peer_bls_pub: None,
             session: loopback_client_session(),
         })
     }
@@ -304,6 +305,7 @@ impl Dialer for DialFailsFor {
                 peer_id: peer.peer_id,
                 method: outcome.kind,
                 remote_addr: outcome.dial_addr().unwrap(),
+                peer_bls_pub: None,
                 session: loopback_client_session(),
             });
         }
