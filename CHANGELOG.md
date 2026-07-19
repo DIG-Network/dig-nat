@@ -4,6 +4,15 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.5.0] - 2026-07-19
+
+### Features
+- **cert-binding:** mTLS cert BLS peer_id binding + relay-descriptor verification — the
+  anti-substitution root of the recipient-seal family (#1204). Embeds the node/relay BLS G1 identity
+  pubkey + a BLS-G2 self-attestation over the leaf SPKI as an X.509 extension; verifies it fail-closed
+  on every handshake under a local Off/Opportunistic/Required policy (Opportunistic default);
+  self-authenticating `RelayDescriptor` verification for pre-dial / store-and-forward discovery.
+
 ## [0.4.0] - 2026-07-18
 
 ### Features

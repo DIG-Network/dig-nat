@@ -27,10 +27,11 @@ use rustls::ClientConfig;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
+use crate::cert_binding::BindingPolicy;
 use crate::config::LocalIdentity;
 use crate::error::MethodError;
 use crate::method::{MethodOutcome, TraversalKind};
-use crate::mtls::{CapturedPeerId, PeerIdPinningVerifier};
+use crate::mtls::{CapturedBlsPub, CapturedPeerId, PeerIdPinningVerifier};
 use crate::peer::{PeerConnection, PeerTarget};
 use crate::strategy::Dialer;
 
@@ -95,6 +96,11 @@ pub fn candidates_from_outcome(outcome: &MethodOutcome) -> PeerCandidates {
 pub struct MtlsDialer {
     identity: LocalIdentity,
     happy_eyeballs: HappyEyeballsConfig,
+    /// The BLS cert-binding verification stance for the peer's cert (#1204). Defaults to
+    /// [`BindingPolicy::Opportunistic`] — the rollout default: verify a binding when the peer
+    /// presents one, tolerate a legacy peer that does not. A node that requires sealing sets
+    /// [`BindingPolicy::Required`] via [`MtlsDialer::with_binding_policy`].
+    binding_policy: BindingPolicy,
     /// The local host's address-family capability used to filter the dial (`dig-ip`'s G1 gate).
     /// `None` = probe the real host per dial via [`LocalStack::cached`]; `Some` pins a deterministic
     /// stack (used by tests to exercise the intersection matrix without a host dependency).
@@ -103,11 +109,13 @@ pub struct MtlsDialer {
 
 impl MtlsDialer {
     /// Build a dialer that authenticates as `identity` (presents its cert as the mTLS client cert),
-    /// using the default happy-eyeballs tuning and the real host's detected address-family stack.
+    /// using the default happy-eyeballs tuning, the real host's detected address-family stack, and
+    /// the default [`BindingPolicy::Opportunistic`] cert-binding stance.
     pub fn new(identity: LocalIdentity) -> Self {
         MtlsDialer {
             identity,
             happy_eyeballs: HappyEyeballsConfig::default(),
+            binding_policy: BindingPolicy::default(),
             local_stack: None,
         }
     }
@@ -115,6 +123,12 @@ impl MtlsDialer {
     /// Override the happy-eyeballs (IPv6-first candidate race) tuning.
     pub fn with_happy_eyeballs(mut self, config: HappyEyeballsConfig) -> Self {
         self.happy_eyeballs = config;
+        self
+    }
+
+    /// Set the BLS cert-binding verification stance (#1204) for peer certs this dialer verifies.
+    pub fn with_binding_policy(mut self, policy: BindingPolicy) -> Self {
+        self.binding_policy = policy;
         self
     }
 
@@ -132,6 +146,7 @@ impl MtlsDialer {
         &self,
         expected: crate::identity::PeerId,
         captured: CapturedPeerId,
+        captured_bls: CapturedBlsPub,
     ) -> Result<ClientConfig, String> {
         let cert = CertificateDer::from(self.identity.cert_der.clone());
         // `key_der` is `Zeroizing<Vec<u8>>` (#179 finding 4); `.to_vec()` copies the bytes out into
@@ -140,7 +155,10 @@ impl MtlsDialer {
         let key = PrivateKeyDer::try_from(self.identity.key_der.to_vec())
             .map_err(|e| format!("invalid private key: {e}"))?;
 
-        let verifier = Arc::new(PeerIdPinningVerifier::new(Some(expected), captured));
+        let verifier = Arc::new(
+            PeerIdPinningVerifier::new(Some(expected), captured)
+                .with_binding(self.binding_policy, captured_bls),
+        );
         ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(verifier)
@@ -181,8 +199,9 @@ impl Dialer for MtlsDialer {
         let addr = winner.addr;
 
         let captured = CapturedPeerId::default();
+        let captured_bls = CapturedBlsPub::default();
         let config = self
-            .client_config(peer.peer_id, captured.clone())
+            .client_config(peer.peer_id, captured.clone(), captured_bls.clone())
             .map_err(|e| MethodError::failed(kind, e))?;
         let connector = TlsConnector::from(Arc::new(config));
 
@@ -211,6 +230,7 @@ impl Dialer for MtlsDialer {
             peer_id: verified,
             method: kind,
             remote_addr: addr,
+            peer_bls_pub: captured_bls.get(),
             session,
         })
     }

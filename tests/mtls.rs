@@ -4,11 +4,14 @@
 
 use std::sync::Arc;
 
+use dig_nat::cert_binding::{build_bound_cert, BindingPolicy};
 use dig_nat::identity::peer_id_from_leaf_cert_der;
-use dig_nat::mtls::{CapturedPeerId, PeerIdPinningVerifier};
+use dig_nat::mtls::{CapturedBlsPub, CapturedPeerId, PeerIdPinningVerifier};
 use dig_nat::PeerId;
+use rcgen::KeyPair;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ServerConfig};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -21,6 +24,27 @@ fn gen_identity() -> (Vec<u8>, Vec<u8>, PeerId) {
     (cert_der, key_der, id)
 }
 
+/// A deterministic node BLS identity key from a label (derived, never a literal secret).
+fn node_bls_sk(label: &str) -> dig_identity::bls::SecretKey {
+    let seed: [u8; 32] = Sha256::digest(label.as_bytes()).into();
+    dig_identity::derive_identity_sk(&dig_identity::master_secret_key_from_seed(&seed))
+}
+
+/// Generate a BLS-bound leaf cert + key (DER), its peer_id, and the bound BLS pubkey.
+fn gen_bound_identity(label: &str) -> (Vec<u8>, Vec<u8>, PeerId, [u8; 48]) {
+    let kp = KeyPair::generate().unwrap();
+    let key_der = kp.serialize_der();
+    let bls_sk = node_bls_sk(label);
+    let cert_der = build_bound_cert(&kp, &bls_sk, vec!["peer.dig".into()]).unwrap();
+    let id = peer_id_from_leaf_cert_der(&cert_der).unwrap();
+    (
+        cert_der,
+        key_der,
+        id,
+        dig_identity::public_key_bytes(&bls_sk),
+    )
+}
+
 /// Run one loopback TLS handshake: server presents `server_cert`; client verifies with a pinning
 /// verifier pinned to `expected`. Returns the captured peer_id + whether the handshake succeeded.
 async fn handshake(
@@ -28,6 +52,19 @@ async fn handshake(
     server_key: Vec<u8>,
     expected: Option<PeerId>,
 ) -> (Option<PeerId>, bool) {
+    let (captured, _bls, ok) =
+        handshake_binding(server_cert, server_key, expected, BindingPolicy::Off).await;
+    (captured, ok)
+}
+
+/// Like [`handshake`] but with an explicit BLS cert-binding policy; also returns the captured peer
+/// BLS pubkey.
+async fn handshake_binding(
+    server_cert: Vec<u8>,
+    server_key: Vec<u8>,
+    expected: Option<PeerId>,
+    policy: BindingPolicy,
+) -> (Option<PeerId>, Option<[u8; 48]>, bool) {
     // Server config (no client-auth required for this identity-of-server test).
     let server_config = ServerConfig::builder()
         .with_no_client_auth()
@@ -39,7 +76,11 @@ async fn handshake(
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
 
     let captured = CapturedPeerId::default();
-    let verifier = Arc::new(PeerIdPinningVerifier::new(expected, captured.clone()));
+    let captured_bls = CapturedBlsPub::default();
+    let verifier = Arc::new(
+        PeerIdPinningVerifier::new(expected, captured.clone())
+            .with_binding(policy, captured_bls.clone()),
+    );
     let client_config = ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(verifier)
@@ -72,7 +113,7 @@ async fn handshake(
         }
     };
     let _ = server.await;
-    (captured.get(), client_ok)
+    (captured.get(), captured_bls.get(), client_ok)
 }
 
 #[tokio::test]
@@ -104,4 +145,53 @@ async fn accepts_any_when_no_pin() {
     let (captured, ok) = handshake(cert, key, None).await;
     assert!(ok, "with no pin, any peer is accepted (record-only)");
     assert_eq!(captured, Some(id));
+}
+
+// --- BLS cert-binding enforcement over a real handshake (#1204) ---
+
+#[tokio::test]
+async fn required_policy_accepts_bound_cert_and_captures_bls_pub() {
+    let (cert, key, id, bls_pub) = gen_bound_identity("mtls/bound-ok");
+    let (captured, captured_bls, ok) =
+        handshake_binding(cert, key, Some(id), BindingPolicy::Required).await;
+    assert!(ok, "a valid BLS-bound cert is accepted under Required");
+    assert_eq!(captured, Some(id));
+    assert_eq!(
+        captured_bls,
+        Some(bls_pub),
+        "the bound BLS pubkey is captured"
+    );
+}
+
+#[tokio::test]
+async fn required_policy_rejects_unbound_cert() {
+    // A legacy cert with no binding extension must be REJECTED under Required (anti-downgrade).
+    let (cert, key, id) = gen_identity();
+    let (_captured, captured_bls, ok) =
+        handshake_binding(cert, key, Some(id), BindingPolicy::Required).await;
+    assert!(
+        !ok,
+        "an un-bound cert is rejected when a binding is Required"
+    );
+    assert_eq!(captured_bls, None);
+}
+
+#[tokio::test]
+async fn opportunistic_policy_accepts_unbound_cert() {
+    // The rollout default tolerates a legacy peer.
+    let (cert, key, id) = gen_identity();
+    let (captured, captured_bls, ok) =
+        handshake_binding(cert, key, Some(id), BindingPolicy::Opportunistic).await;
+    assert!(ok, "an un-bound cert is accepted under Opportunistic");
+    assert_eq!(captured, Some(id));
+    assert_eq!(captured_bls, None, "no binding → no captured pubkey");
+}
+
+#[tokio::test]
+async fn opportunistic_policy_captures_bls_pub_when_present() {
+    let (cert, key, id, bls_pub) = gen_bound_identity("mtls/opp-bound");
+    let (_captured, captured_bls, ok) =
+        handshake_binding(cert, key, Some(id), BindingPolicy::Opportunistic).await;
+    assert!(ok);
+    assert_eq!(captured_bls, Some(bls_pub));
 }

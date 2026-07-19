@@ -58,6 +58,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod cert_binding;
 pub mod config;
 pub mod dialer;
 pub mod error;
@@ -67,12 +68,17 @@ pub mod mtls;
 pub mod mux;
 pub mod peer;
 pub mod relay;
+pub mod relay_descriptor;
 pub mod strategy;
 pub mod stun;
 pub mod wire;
 
 use std::sync::Arc;
 
+pub use cert_binding::{
+    build_bound_cert, verify_binding_from_leaf_cert, BindingOutcome, BindingPolicy,
+    CertBindingError,
+};
 pub use config::{LocalIdentity, NatConfig, NatConfigBuilder};
 pub use error::{MethodError, NatError};
 pub use identity::{peer_id_from_leaf_cert_der, peer_id_from_tls_spki_der, PeerId};
@@ -82,6 +88,7 @@ pub use mux::{
     PeerStream, RangeFrame, RangeRequest,
 };
 pub use peer::{PeerConnection, PeerTarget};
+pub use relay_descriptor::{verify_relay_descriptor, RelayDescriptor, RelayDescriptorError};
 
 use dialer::MtlsDialer;
 use method::direct::DirectMethod;

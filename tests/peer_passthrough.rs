@@ -30,6 +30,7 @@ fn loopback_conn() -> (PeerConnection, tokio::task::JoinHandle<()>) {
         peer_id: PeerId::from_bytes([3u8; 32]),
         method: TraversalKind::Direct,
         remote_addr: "127.0.0.1:1".parse().unwrap(),
+        peer_bls_pub: None,
         session: client,
     };
     (conn, handle)

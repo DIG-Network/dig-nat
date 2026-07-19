@@ -13,7 +13,7 @@
 # the others so the ordering/fallback strategy is tested with mock methods regardless.
 [package]
 name = "dig-nat"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -39,6 +39,16 @@ categories = ["network-programming"]
 # dig-nat is published — `cargo publish` rejects a git dependency, so the publish workflow enforces
 # this. The orchestrator sequences the tags.
 dig-constants = { version = ">=0.2, <0.5", git = "https://github.com/DIG-Network/dig-constants" }
+
+# The node/relay BLS12-381 G1 identity primitives (dig-identity slot 0x0010, EIP-2333 path
+# m/12381'/8444'/9'/0'): `sign_message`/`verify_signature` (BLS G2 over the AugScheme),
+# `g1_subgroup_check` (reject small-subgroup / identity points), `public_key_bytes`. dig-nat uses
+# these to (a) self-attest the peer_id↔BLS-pubkey binding embedded in the mTLS leaf cert and
+# (b) verify that binding + signed relay descriptors on every handshake — the anti-substitution ROOT
+# of the recipient-seal family (#1204/#1075/#1199). Sourced from git until dig-identity publishes to
+# crates.io (like `dig-constants` above); the publish workflow swaps this for the crates.io version
+# BEFORE dig-nat publishes (release-first, §4.1).
+dig-identity = { version = ">=0.4.1, <0.5", git = "https://github.com/DIG-Network/dig-identity" }
 
 # The ecosystem's single, canonical address-family discovery + IPv6-first happy-eyeballs dial
 # (CLAUDE.md §5.2). dig-nat is the FIRST consumer: `MtlsDialer::dial` builds a `dig_ip::PeerCandidates`
@@ -81,6 +91,12 @@ ring = "0.17"
 x509-parser = "0.16"
 sha2 = "0.10"
 
+# Build the self-signed leaf certificate that CARRIES the BLS-binding X.509 extension
+# (`cert_binding::build_bound_cert`). rcgen is the maintained pure-Rust cert builder; it also
+# supports the custom-OID extension the binding needs. Promoted from a dev-dependency to a real one
+# because dig-nat now generates bound certs as part of its public API (dig-node/dig-relay call it).
+rcgen = "0.13"
+
 # UPnP/IGD port mapping — the one large protocol we don't hand-roll. `igd-next` is the maintained
 # fork of `igd`; its live SSDP+SOAP call sits behind the `TraversalMethod` trait.
 igd-next = { version = "0.17", features = ["aio_tokio"] }
@@ -100,8 +116,6 @@ zeroize = "1"
 # Loopback relay + fake IGD + mock methods drive the tests entirely in-process (no real network).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "test-util"] }
 tokio-tungstenite = "0.24"
-# Generate an ephemeral self-signed leaf cert for the mTLS identity + peer_id round-trip tests.
-rcgen = "0.13"
 
 [profile.release]
 overflow-checks = true

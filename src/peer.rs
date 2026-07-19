@@ -119,6 +119,11 @@ pub struct PeerConnection {
     /// The remote address the mTLS session runs over (the peer's endpoint, or the relay for a
     /// relayed transport).
     pub remote_addr: SocketAddr,
+    /// The peer's verified BLS G1 identity pubkey (#1204), captured from the cert binding when the
+    /// handshake carried a valid one. `None` for a legacy peer with no binding (or when binding
+    /// verification was off). The sealing layer (S2) seals directed payloads to this key so a
+    /// misdelivery cannot be opened by the wrong node.
+    pub peer_bls_pub: Option<[u8; 48]>,
     /// The multiplexed session over the authenticated, encrypted byte stream to the peer.
     pub session: PeerSession,
 }
@@ -155,6 +160,10 @@ impl std::fmt::Debug for PeerConnection {
             .field("peer_id", &self.peer_id)
             .field("method", &self.method)
             .field("remote_addr", &self.remote_addr)
+            .field(
+                "peer_bls_pub",
+                &self.peer_bls_pub.map(|_| "<48-byte G1 pubkey>"),
+            )
             .field("session", &"<multiplexed mTLS session>")
             .finish()
     }

@@ -29,6 +29,62 @@ connection.
   and drop — `LocalIdentity` is cloned per dial. Implementations **MUST NOT** hold the private key
   material in a plain, non-zeroizing buffer.
 
+## 2a. Cert BLS-binding — peer_id ↔ BLS G1 identity (NORMATIVE, #1204)
+
+The transport `peer_id` (§2) **MUST** be cryptographically bound to the node/relay **BLS12-381 G1
+identity key** (dig-identity slot `0x0010`, EIP-2333 path `m/12381'/8444'/9'/0'`) so the
+recipient-seal family (#1075 node↔node, #1199 relay) can seal a payload to a peer's BLS key and know a
+misdelivery cannot be opened by the wrong node. This binding is the anti-substitution ROOT: an
+attacker **MUST NOT** be able to present a victim's `peer_id` under a BLS key it controls, nor claim a
+BLS key it does not control for a given `peer_id`.
+
+### 2a.1 The binding (embedded in the leaf certificate)
+
+- The self-signed mTLS leaf certificate **MUST** carry a custom X.509 extension, OID
+  `1.3.6.1.4.1.58968.1.1` (a DIG provisional private-use arc; canonical), whose value is:
+  `version(1 byte = 0x01) || bls_pub(48 bytes, compressed G1) || bls_sig(96 bytes, G2)`.
+- `bls_sig` **MUST** be a BLS G2 signature (Chia AugScheme) by the node/relay BLS secret key over
+  `binding_message = "dig-nat/cert-bls-binding/v1" || SPKI_DER`, where `SPKI_DER` is the leaf's own
+  `SubjectPublicKeyInfo` DER. Because `peer_id = SHA-256(SPKI_DER)`, signing the SPKI commits the BLS
+  key to exactly that `peer_id`.
+- The extension is **additive** (§5.1 spirit): it is non-critical and unknown to old verifiers, which
+  ignore it. New writers **MAY** bump the `version` byte; verifiers **MUST** dispatch on it and keep
+  accepting every version they understand — an unknown version is treated as "no binding this verifier
+  understands", never as tampering.
+
+### 2a.2 Verification (on every handshake)
+
+A verifier that checks the binding **MUST**, for the presented leaf: recompute `binding_message` from
+the leaf's own SPKI; reject unless the embedded `bls_pub` passes the G1 subgroup / non-identity check;
+and reject unless `bls_sig` verifies under `bls_pub` over `binding_message`. A valid binding yields the
+verified `bls_pub`, which **MUST** be reported on the connection (`PeerConnection::peer_bls_pub`) for
+the sealing layer.
+
+### 2a.3 Rollout policy (LOCAL, never wire-negotiated)
+
+Verification is governed by a **local** `BindingPolicy` — it **MUST NOT** be negotiated from a value
+the peer supplies, so a peer cannot request a downgrade:
+
+- **Off** — do not verify the binding (pre-adoption / opt-out).
+- **Opportunistic** (the rollout DEFAULT) — verify a binding when present; **reject** a
+  present-but-INVALID one; **accept** an ABSENT one (tolerates legacy un-bound peers).
+- **Required** — a valid binding is mandatory; **reject** both ABSENT and INVALID.
+
+A downgrade that strips the extension **MUST** be rejected under **Required** (an absent binding fails
+closed), so stripping the extension can never silently disable a required-mode session.
+
+### 2a.4 Relay descriptor (#1199) — self-authenticating discovery record
+
+A relay/peer discovery record (`RelayDescriptor`: `peer_id_spki_hash`, `bls_pub`, `addresses`,
+`network_id`, optional `did`, `signature`) learned BEFORE a direct handshake (PEX/DHT/relay
+registration, or relay store-and-forward) **MUST** be verified before it is trusted as a seal target:
+the `bls_pub` **MUST** pass the G1 subgroup check; the `signature` (BLS G2 over the canonical
+length-prefixed descriptor bytes behind `"dig-nat/relay-descriptor/v1"`) **MUST** verify under
+`bls_pub`; on a live dial the `peer_id_spki_hash` **MUST** equal `SHA-256(presented SPKI)`; and where a
+`did` and a resolver are available, a resolvable `did` **MUST** resolve to the same `bls_pub` (an
+unresolvable DID is tolerated — nodes/relays are normally DID-less). On a direct connection the cert
+binding (§2a.1) is authoritative and **MUST** be re-verified; the descriptor is only a pre-dial hint.
+
 ## 3. Address-family policy — IPv6-first, IPv4-fallback (NORMATIVE)
 
 All peer-to-peer address handling in `dig-nat` is **IPv6-first with IPv4 as a fallback**. The
@@ -242,8 +298,20 @@ MethodOutcome.dial_addrs: Vec<SocketAddr>                   // candidates, disco
 dialer::HappyEyeballsConfig { per_attempt_timeout, stagger } // -> dig_ip::DialConfig
 dialer::candidates_from_outcome(&MethodOutcome) -> dig_ip::PeerCandidates
 dialer::MtlsDialer::new(identity).with_happy_eyeballs(cfg).with_local_stack(dig_ip::LocalStack)
+dialer::MtlsDialer::with_binding_policy(BindingPolicy)      // cert-binding stance (default Opportunistic)
 
 connect(peer, identity, config) -> Result<PeerConnection, NatError>
+PeerConnection.peer_bls_pub: Option<[u8; 48]>              // verified peer BLS G1 key (§2a)
+
+// Cert BLS-binding (§2a, #1204)
+cert_binding::build_bound_cert(&rcgen::KeyPair, &SecretKey, Vec<String>) -> Result<Vec<u8>, CertBindingError>
+cert_binding::verify_binding_from_leaf_cert(cert_der) -> BindingOutcome  // Bound{bls_pub}/Absent/Invalid
+cert_binding::evaluate(&BindingOutcome, BindingPolicy) -> Result<Option<[u8;48]>, &'static str>
+cert_binding::BindingPolicy { Off, Opportunistic (default), Required }
+
+// Relay descriptor (§2a.4, #1199)
+relay_descriptor::RelayDescriptor { peer_id_spki_hash, bls_pub, addresses, network_id, did, signature }
+relay_descriptor::verify_relay_descriptor(&desc, presented_spki_der, did_resolver) -> Result<(), RelayDescriptorError>
 ```
 
 ## 9. Conformance
@@ -258,6 +326,13 @@ connect(peer, identity, config) -> Result<PeerConnection, NatError>
 - IPv6 selection: `select_global_ipv6` returns a global-unicast IPv6 and rejects link-local / ULA /
   loopback / unspecified.
 - Identity: `peer_id = SHA-256(SPKI DER)` matches `dig-gossip` (cross-crate conformance test).
+- Cert BLS-binding (§2a, `cert_binding` tests + `tests/mtls.rs`): a cert built by `build_bound_cert`
+  verifies to `Bound{bls_pub}`; a substituted BLS pubkey, a binding replayed onto a different SPKI, a
+  bad G1 point, and a malformed/unknown-version extension all verify to `Invalid`; an un-bound cert is
+  `Absent`. Over a real handshake: Required accepts a bound cert (capturing `peer_bls_pub`) and rejects
+  an un-bound one (anti-downgrade); Opportunistic accepts an un-bound cert and captures the key when
+  present. Relay descriptors reject a tampered signature, a `peer_id_spki_hash` mismatch, a substituted
+  pubkey, a bad G1 point, and a DID resolving to a different key; an unresolvable DID is tolerated.
 - STUN/PCP anti-spoof: transaction id / MAP nonce samples show CSPRNG-level variation across their
   full byte range (not a wall-clock-derived pattern); `query_reflexive_address` and the PCP
   `transact` accept a response only from the address the request was sent to, looping past a
