@@ -58,6 +58,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod cert_binding;
 pub mod config;
 pub mod dialer;
 pub mod error;
