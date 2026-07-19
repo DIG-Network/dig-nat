@@ -95,7 +95,7 @@ fn env_off_opt_out_and_url_resolution() {
 
 #[test]
 fn default_endpoint_is_canonical() {
-    assert_eq!(dig_constants::DIG_RELAY_URL, "wss://relay.dig.net:9450");
+    assert_eq!(dig_constants::DIG_RELAY_URL, "wss://relay.dig.net:443");
 }
 
 /// End-to-end: a loopback WebSocket relay accepts the client's Register (RLY-001) and replies with
