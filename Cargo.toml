@@ -13,7 +13,7 @@
 # the others so the ordering/fallback strategy is tested with mock methods regardless.
 [package]
 name = "dig-nat"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -24,31 +24,21 @@ keywords = ["nat", "traversal", "p2p", "stun", "dig"]
 categories = ["network-programming"]
 
 [dependencies]
-# Canonical relay endpoint (DIG_RELAY_URL = wss://relay.dig.net:9450) — single source of truth.
-#
-# Sourcing: `DIG_RELAY_URL` was added in dig-constants 0.2.x, which is NOT yet on crates.io (only
-# 0.1.0 is). Until it is published we resolve from the DIG-Network git repo so both the standalone
-# CI checkout and the superproject build compile against the real constant.
-# VERSION REQ: `>=0.2, <0.5` deliberately spans 0.2.x, 0.3.x AND 0.4.x — all ADDITIVE releases that
-# break nothing dig-nat uses (0.3.0 added `DIG_NODE_PORT`; 0.4.0 is the genesis cascade). A bare
-# `^0.2` req could not be satisfied by the 0.3.0/0.4.0 default branch, failing every fresh resolve;
-# `<0.5` keeps us guarded against a future breaking 0.5. This is what `cargo publish` records, so the
-# PUBLISHED dig-nat depends on crates.io `dig-constants` in the same `>=0.2, <0.5` range.
-# RELEASE ORDERING (ecosystem rule: release-first for shared contracts): dig-constants must be
-# published to crates.io, and this `git` source swapped for the plain crates.io version, BEFORE
-# dig-nat is published — `cargo publish` rejects a git dependency, so the publish workflow enforces
-# this. The orchestrator sequences the tags.
-dig-constants = { version = ">=0.2, <0.5", git = "https://github.com/DIG-Network/dig-constants" }
+# Canonical relay endpoint: `dig_constants::DIG_RELAY_URL` (wss://relay.dig.net:443) is the single
+# source of truth dig-nat uses to reach `relay.dig.net`. Sourced from the crates.io release.
+# VERSION REQ: `>=0.4, <0.6` spans the additive 0.4.x and 0.5.x lines (nothing dig-nat depends on
+# changed across them) while guarding against a future breaking 0.6; it resolves to the latest
+# published 0.5.x on crates.io.
+dig-constants = { version = ">=0.4, <0.6" }
 
 # The node/relay BLS12-381 G1 identity primitives (dig-identity slot 0x0010, EIP-2333 path
 # m/12381'/8444'/9'/0'): `sign_message`/`verify_signature` (BLS G2 over the AugScheme),
 # `g1_subgroup_check` (reject small-subgroup / identity points), `public_key_bytes`. dig-nat uses
 # these to (a) self-attest the peer_id↔BLS-pubkey binding embedded in the mTLS leaf cert and
 # (b) verify that binding + signed relay descriptors on every handshake — the anti-substitution ROOT
-# of the recipient-seal family (#1204/#1075/#1199). Sourced from git until dig-identity publishes to
-# crates.io (like `dig-constants` above); the publish workflow swaps this for the crates.io version
-# BEFORE dig-nat publishes (release-first, §4.1).
-dig-identity = { version = ">=0.4.1, <0.5", git = "https://github.com/DIG-Network/dig-identity" }
+# of the recipient-seal family (#1204/#1075/#1199). Sourced from the crates.io release; the `>=0.4.1,
+# <0.5` req resolves to the latest published 0.4.x and guards against a breaking 0.5.
+dig-identity = { version = ">=0.4.1, <0.5" }
 
 # The ecosystem's single, canonical address-family discovery + IPv6-first happy-eyeballs dial
 # (CLAUDE.md §5.2). dig-nat is the FIRST consumer: `MtlsDialer::dial` builds a `dig_ip::PeerCandidates`

@@ -524,8 +524,9 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
 name = "dig-constants"
-version = "0.3.0"
-source = "git+https://github.com/DIG-Network/dig-constants#438ac8caf9ffb80cadd10362deacd63763a7f141"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10260fd1f143402e5c87d36671932c3f3fc7640da00a94fa7ffffd80a9b9a1b2"
 dependencies = [
  "chia-consensus",
  "chia-protocol",
@@ -535,7 +536,8 @@ dependencies = [
 [[package]]
 name = "dig-identity"
 version = "0.4.2"
-source = "git+https://github.com/DIG-Network/dig-identity#531584b36545356eceb0a7ad313794c8cbdf9eb4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b61a73d7c4ecedfb3364e0f265946ef696dcec84ab58472873b097426691b19"
 dependencies = [
  "blst",
  "chia-bls 0.26.0",
@@ -558,7 +560,7 @@ dependencies = [
 
 [[package]]
 name = "dig-nat"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "dig-constants",

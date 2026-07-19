@@ -42,7 +42,7 @@ reported for observability but the caller uses the stream identically.
   state change, exposes a `RelayStatus` snapshot, and honours `DIG_RELAY_URL=off`.
 - **Self-authenticating transport.** Connecting to `peer_id X` provably reaches the holder of X's
   key or fails (rustls verifier pins the peer_id).
-- **Endpoint from `dig-constants`.** Default relay `wss://relay.dig.net:9450`.
+- **Endpoint from `dig-constants`.** Default relay `wss://relay.dig.net:443`.
 
 ## Layout
 
