@@ -29,6 +29,90 @@ use crate::method::{MethodOutcome, TraversalKind, TraversalMethod};
 use crate::peer::PeerTarget;
 use crate::relay::{RelayStatus, RelayTunnel};
 
+/// A relayed transport that opens the DUPLEX BYTE TUNNEL an mTLS session runs over — the transport
+/// half of the tier-6 relayed dial. Distinct from [`RelayedTransport`] (which only reports a probe
+/// endpoint): this yields the actual byte channel, so a relayed connection carries the SAME dig-tls
+/// mTLS + `peer_id` pin + BLS binding as a direct one (the relay forwards ciphertext it cannot read).
+///
+/// [`crate::connect`] composes the relayed tier only when a `RelayedDialer` is supplied via the
+/// runtime carrier; the [`crate::dialer::MtlsDialer`] uses it to open the tunnel for a
+/// [`TraversalKind::Relayed`] outcome, then runs the identical handshake over it.
+#[async_trait]
+pub trait RelayedDialer: Send + Sync {
+    /// The relay endpoint the tunnel forwards through (observability + the relayed dial address).
+    fn relay_endpoint(&self) -> SocketAddr;
+
+    /// Whether a relayed tunnel can currently be opened (a reservation is held). The relayed method's
+    /// [`attempt`](TraversalMethod::attempt) gates on this so an unavailable relay falls through
+    /// cleanly rather than producing a doomed dial.
+    fn is_ready(&self) -> bool;
+
+    /// Open a live duplex tunnel to `target_peer` (hex `peer_id`) on `network_id`. `Err` if the
+    /// reservation is not held. The returned [`RelayTunnel`] is wrapped in a byte-stream adapter and
+    /// the mTLS handshake runs over it.
+    async fn open_dial_tunnel(
+        &self,
+        target_peer: &str,
+        network_id: &str,
+    ) -> Result<RelayTunnel, String>;
+}
+
+#[async_trait]
+impl RelayedDialer for ReservationRelayedTransport {
+    fn relay_endpoint(&self) -> SocketAddr {
+        self.relay_endpoint
+    }
+
+    fn is_ready(&self) -> bool {
+        self.status.relay_transport_ready()
+    }
+
+    async fn open_dial_tunnel(
+        &self,
+        target_peer: &str,
+        network_id: &str,
+    ) -> Result<RelayTunnel, String> {
+        self.status.open_tunnel(target_peer, network_id)
+    }
+}
+
+/// The relayed (tier-6, TURN-last) traversal method built over a [`RelayedDialer`]. Its
+/// [`attempt`](TraversalMethod::attempt) confirms the relay reservation is ready and yields the relay
+/// endpoint as the dial address; the actual byte tunnel + mTLS is opened by the dialer. This is the
+/// method [`crate::connect`] auto-composes for the relayed tier (given a runtime `RelayedDialer`).
+pub struct RelayedDialMethod {
+    dialer: Arc<dyn RelayedDialer>,
+}
+
+impl RelayedDialMethod {
+    /// Build the relayed method over a live [`RelayedDialer`] (the relay data-plane).
+    pub fn new(dialer: Arc<dyn RelayedDialer>) -> Self {
+        RelayedDialMethod { dialer }
+    }
+}
+
+#[async_trait]
+impl TraversalMethod for RelayedDialMethod {
+    fn kind(&self) -> TraversalKind {
+        TraversalKind::Relayed
+    }
+
+    async fn attempt(&self, _peer: &PeerTarget) -> Result<MethodOutcome, MethodError> {
+        if !self.dialer.is_ready() {
+            return Err(MethodError::failed(
+                TraversalKind::Relayed,
+                "relay reservation not connected — relayed transport unavailable",
+            ));
+        }
+        // The dial address is the relay endpoint (observability); the dialer opens the real tunnel to
+        // the peer over the held reservation.
+        Ok(MethodOutcome::single(
+            TraversalKind::Relayed,
+            self.dialer.relay_endpoint(),
+        ))
+    }
+}
+
 /// Abstraction over the relay **data plane**: open a stream to `target_peer` whose bytes are
 /// proxied THROUGH the relay (RLY-002). This is the tier-6 TURN-like fallback — distinct from the
 /// tier-5 [`HolePunchCoordinator`](super::hole_punch::HolePunchCoordinator), which only signals.

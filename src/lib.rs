@@ -70,9 +70,14 @@ pub mod mux;
 pub mod peer;
 pub mod relay;
 pub mod relay_descriptor;
+pub mod runtime;
 pub mod strategy;
 pub mod stun;
+pub mod tunnel;
 pub mod wire;
+
+#[cfg(test)]
+mod relayed_dial_tests;
 
 use std::sync::Arc;
 
@@ -87,6 +92,11 @@ pub use dig_tls::{
 
 pub use config::{NatConfig, NatConfigBuilder};
 pub use error::{MethodError, NatError};
+pub use method::hole_punch::{HolePunchCoordinator, HolePunchMethod};
+pub use method::relayed::{
+    RelayedDialMethod, RelayedDialer, RelayedTransport, ReservationRelayedTransport,
+};
+pub use method::upnp::{IgdGateway, RealIgd, UpnpMethod};
 pub use method::{TraversalKind, TraversalMethod};
 pub use mux::{
     AvailabilityAnswer, AvailabilityItem, AvailabilityRequest, AvailabilityResponse, PeerSession,
@@ -94,55 +104,132 @@ pub use mux::{
 };
 pub use peer::{PeerConnection, PeerTarget};
 pub use relay_descriptor::{verify_relay_descriptor, RelayDescriptor, RelayDescriptorError};
+pub use runtime::{NatRuntime, NatRuntimeBuilder};
 
 use dialer::MtlsDialer;
 use method::direct::DirectMethod;
+use method::natpmp::NatPmpMethod;
+use method::pcp::PcpMethod;
 
-/// Establish a mutually-authenticated connection to `peer`, choosing the traversal method
-/// transparently (first success wins; relay is the last resort).
+/// Establish a mutually-authenticated connection to `peer` with an empty runtime — the convenience
+/// entry point for a caller that holds NO live transport handles (a publicly-reachable node). Only
+/// the **Direct** tier is composable without runtime handles; a NAT'd node that needs the full ladder
+/// (UPnP/NAT-PMP/PCP/hole-punch/relayed) calls [`connect_with_runtime`] with a [`NatRuntime`] carrying
+/// the gateway/port/relay handles.
 ///
 /// `node` is this node's [`NodeCert`] — its CA-signed mTLS identity from [`dig-tls`](dig_tls),
 /// presented as the client certificate; `config` selects which methods are enabled, the per-method
-/// timeout, the relay/STUN endpoints, and the [`BindingPolicy`] applied to the peer's #1204 cert
-/// binding. On success the returned [`PeerConnection`] carries the verified remote `peer_id`, the
-/// [`TraversalKind`] that established it, the peer's bound BLS pubkey (when present), and the
-/// authenticated stream.
+/// timeout, and the [`BindingPolicy`] applied to the peer's #1204 cert binding.
 ///
 /// # Errors
-/// - [`NatError::NoMethodsEnabled`] — the config enabled no methods.
-/// - [`NatError::AllMethodsFailed`] — every enabled method failed (with per-method reasons).
-/// - [`NatError::InvalidConfig`] — the relay/STUN config could not be used.
+/// - [`NatError::NoMethodsEnabled`] — no method could be composed (nothing enabled, or the enabled
+///   tiers all lacked their runtime inputs — here, only Direct is available).
+/// - [`NatError::AllMethodsFailed`] — every composed method failed (with per-method reasons).
 ///
-/// This function never panics and never hangs: every method (and its dial) is bounded by
+/// This never panics and never hangs: every method + dial is bounded by
 /// [`NatConfig::per_method_timeout`].
 pub async fn connect(
     peer: &PeerTarget,
     node: &Arc<NodeCert>,
     config: &NatConfig,
 ) -> Result<PeerConnection, NatError> {
-    let methods = build_enabled_methods(config);
+    connect_with_runtime(peer, node, config, &NatRuntime::default()).await
+}
+
+/// Establish a mutually-authenticated connection to `peer`, auto-composing the **FULL** NAT-traversal
+/// ladder — direct → UPnP → NAT-PMP → PCP → hole-punch → relayed — trying each in rank order, first
+/// success wins, relay last. The caller never chooses the method: it supplies the data [`NatConfig`]
+/// and the live [`NatRuntime`] handles, and the strategy picks the first tier that establishes an
+/// mTLS [`PeerConnection`] whose remote `peer_id` matches [`PeerTarget::peer_id`].
+///
+/// Each tier is composed ONLY when it is enabled in `config` AND its runtime inputs are present in
+/// `runtime` (an absent tier is skipped — the composition is honest, never a silently-broken dial):
+/// - **Direct** — always (no runtime input).
+/// - **UPnP** — `runtime.local_port` (+ an optional injected IGD gateway; else the real one).
+/// - **NAT-PMP** — `runtime.local_port` + `runtime.gateway_v4`.
+/// - **PCP** — `runtime.local_port` + `runtime.gateway_v4` + `runtime.client_ip`.
+/// - **Hole-punch** — `runtime.hole_punch` + `runtime.my_external_addr`.
+/// - **Relayed** — `runtime.relayed` (carries mTLS over the relay tunnel — NOT a weaker connection).
+///
+/// Every tier — including the relayed one — runs the SAME dig-tls mTLS: the CA-chained [`NodeCert`],
+/// the `peer_id` pin, and the #1204 BLS binding. IPv6 is preferred at every IP-dialing tier via
+/// `dig-ip` (§5.2). The relayed tier tunnels the identical handshake through the relay, which forwards
+/// only ciphertext it cannot read.
+///
+/// # Errors
+/// Same as [`connect`]: [`NatError::NoMethodsEnabled`] if no tier could be composed, else
+/// [`NatError::AllMethodsFailed`] with each composed tier's reason in attempt order.
+pub async fn connect_with_runtime(
+    peer: &PeerTarget,
+    node: &Arc<NodeCert>,
+    config: &NatConfig,
+    runtime: &NatRuntime,
+) -> Result<PeerConnection, NatError> {
+    let methods = compose_ladder(config, runtime);
     if methods.is_empty() {
         return Err(NatError::NoMethodsEnabled);
     }
-    let dialer = MtlsDialer::new(Arc::clone(node)).with_binding_policy(config.binding_policy);
+    let mut dialer = MtlsDialer::new(Arc::clone(node)).with_binding_policy(config.binding_policy);
+    if let Some(relayed) = &runtime.relayed {
+        dialer = dialer.with_relayed_dialer(Arc::clone(relayed));
+    }
     strategy::connect_with_strategy(peer, methods, &dialer, config.per_method_timeout).await
 }
 
-/// Assemble the enabled [`TraversalMethod`] trait objects for a config.
-///
-/// NOTE: the UPnP/NAT-PMP/PCP/hole-punch methods need runtime inputs the caller has not yet supplied
-/// through the current minimal config surface (gateway address, this node's local port + reflexive
-/// address, a live relay coordinator). Until those are wired through the builder, `connect` composes
-/// the methods it can construct from the config alone — currently the always-available **Direct**
-/// method. The other methods are fully implemented + tested and are composed explicitly by callers
-/// (e.g. `dig-node`) that hold that runtime context, via [`strategy::connect_with_strategy`]. This
-/// keeps `connect` honest (it never claims a method it cannot actually run) while the richer
-/// auto-composition lands with the discovery inputs.
-fn build_enabled_methods(config: &NatConfig) -> Vec<Arc<dyn TraversalMethod>> {
+/// Assemble the [`TraversalMethod`] trait objects for the full ladder from the enabled tiers in
+/// `config` whose runtime inputs are present in `runtime`. The strategy orders them by
+/// [`TraversalKind::rank`], so the order they are pushed here is irrelevant. A tier missing its
+/// runtime inputs is silently omitted — `connect` only ever attempts a tier it can actually run.
+fn compose_ladder(config: &NatConfig, runtime: &NatRuntime) -> Vec<Arc<dyn TraversalMethod>> {
     let mut methods: Vec<Arc<dyn TraversalMethod>> = Vec::new();
-    let direct = DirectMethod;
-    if config.is_enabled(direct.kind()) {
-        methods.push(Arc::new(direct));
+
+    // Direct — always composable (the peer's own candidate addresses).
+    if config.is_enabled(TraversalKind::Direct) {
+        methods.push(Arc::new(DirectMethod));
     }
+
+    // UPnP — needs a local port to map; uses an injected IGD gateway or the real SSDP-discovered one.
+    if config.is_enabled(TraversalKind::Upnp) {
+        if let Some(port) = runtime.local_port {
+            let gateway: Arc<dyn IgdGateway> = runtime
+                .igd
+                .clone()
+                .unwrap_or_else(|| Arc::new(RealIgd::default()));
+            methods.push(Arc::new(UpnpMethod::new(gateway, port)));
+        }
+    }
+
+    // NAT-PMP — needs the local port + the IPv4 gateway.
+    if config.is_enabled(TraversalKind::NatPmp) {
+        if let (Some(port), Some(gw)) = (runtime.local_port, runtime.gateway_v4) {
+            methods.push(Arc::new(NatPmpMethod::new(gw, port)));
+        }
+    }
+
+    // PCP — needs the local port + the IPv4 gateway + this node's client IP.
+    if config.is_enabled(TraversalKind::Pcp) {
+        if let (Some(port), Some(gw), Some(client_ip)) =
+            (runtime.local_port, runtime.gateway_v4, runtime.client_ip)
+        {
+            methods.push(Arc::new(PcpMethod::new(gw, port, client_ip)));
+        }
+    }
+
+    // Hole-punch — needs a relay coordinator + this node's STUN-discovered reflexive address.
+    if config.is_enabled(TraversalKind::HolePunch) {
+        if let (Some(coordinator), Some(my_addr)) =
+            (runtime.hole_punch.clone(), runtime.my_external_addr)
+        {
+            methods.push(Arc::new(HolePunchMethod::new(coordinator, my_addr)));
+        }
+    }
+
+    // Relayed (TURN-last) — needs the relay data-plane; the dial carries mTLS over the relay tunnel.
+    if config.is_enabled(TraversalKind::Relayed) {
+        if let Some(relayed) = runtime.relayed.clone() {
+            methods.push(Arc::new(RelayedDialMethod::new(relayed)));
+        }
+    }
+
     methods
 }

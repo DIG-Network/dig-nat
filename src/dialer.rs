@@ -20,19 +20,23 @@
 //! connection wins, the single mTLS handshake runs over it — the identity/cert behaviour below is
 //! unchanged; only the family selection + racing moved out. See `dig-ip`'s `SPEC.md`.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use dig_ip::{CandidateSource, DialConfig, LocalStack, PeerCandidates};
 use dig_tls::{BindingPolicy, NodeCert};
 use rustls_pki_types::ServerName;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
 use crate::error::MethodError;
+use crate::method::relayed::RelayedDialer;
 use crate::method::{MethodOutcome, TraversalKind};
 use crate::peer::{PeerConnection, PeerTarget};
 use crate::strategy::Dialer;
+use crate::tunnel::RelayTunnelStream;
 
 /// Tuning for the happy-eyeballs candidate race: how long each candidate connect may take, and how
 /// long to wait before ALSO starting the next (lower-priority) candidate. A thin dig-nat-facing view
@@ -95,7 +99,11 @@ pub fn candidates_from_outcome(outcome: &MethodOutcome) -> PeerCandidates {
 ///
 /// The [`NodeCert`] is shared behind an [`Arc`] (it is deliberately not `Clone` — its private key is
 /// held in a scrubbing wrapper), so cloning the dialer per dial never copies the key material.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written because the relay data-plane handle is a `dyn` trait object that carries no
+/// `Debug` bound (its concrete type may hold live sockets); the derived `Clone` is fine (every field
+/// is `Clone`, the `Arc`s share).
+#[derive(Clone)]
 pub struct MtlsDialer {
     node: Arc<NodeCert>,
     happy_eyeballs: HappyEyeballsConfig,
@@ -108,6 +116,11 @@ pub struct MtlsDialer {
     /// `None` = probe the real host per dial via [`LocalStack::cached`]; `Some` pins a deterministic
     /// stack (used by tests to exercise the intersection matrix without a host dependency).
     local_stack: Option<LocalStack>,
+    /// The relay data-plane used to open the byte tunnel for a [`TraversalKind::Relayed`] dial. `None`
+    /// = no relayed transport wired, so a relayed outcome cannot be dialed (the strategy will only
+    /// reach it when [`crate::connect`] composed the relayed tier, which requires this handle). The
+    /// tunnel carries the SAME mTLS as a direct dial — a relayed connection is not weaker.
+    relayed: Option<Arc<dyn RelayedDialer>>,
 }
 
 impl MtlsDialer {
@@ -120,6 +133,7 @@ impl MtlsDialer {
             happy_eyeballs: HappyEyeballsConfig::default(),
             binding_policy: BindingPolicy::default(),
             local_stack: None,
+            relayed: None,
         }
     }
 
@@ -142,6 +156,106 @@ impl MtlsDialer {
         self.local_stack = Some(stack);
         self
     }
+
+    /// Wire the relay data-plane used to dial a [`TraversalKind::Relayed`] outcome (open the RLY-002
+    /// byte tunnel the mTLS session runs over). [`crate::connect`] sets this from the runtime carrier
+    /// whenever it composes the relayed tier.
+    pub fn with_relayed_dialer(mut self, relayed: Arc<dyn RelayedDialer>) -> Self {
+        self.relayed = Some(relayed);
+        self
+    }
+
+    /// Run the mTLS handshake over an already-established byte `stream` (a raced TCP connection, or a
+    /// relay byte tunnel), presenting THIS node's [`NodeCert`] and pinning the remote's `peer_id` to
+    /// the one the caller asked for. Shared by every tier so a relayed/hole-punched connection is
+    /// authenticated IDENTICALLY to a direct one — same CA chain, same `peer_id` pin, same #1204 BLS
+    /// binding. `remote_addr` is recorded on the connection for observability.
+    async fn handshake_over<S>(
+        &self,
+        peer: &PeerTarget,
+        kind: TraversalKind,
+        stream: S,
+        remote_addr: SocketAddr,
+    ) -> Result<PeerConnection, MethodError>
+    where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        // The rustls client config — DigNetwork-CA chain check + peer_id pin (to the peer we asked
+        // for) + #1204 binding verification — comes ready-made from dig-tls, along with the handles
+        // that capture WHO answered during the handshake.
+        let client_tls =
+            dig_tls::client_config(&self.node, Some(peer.peer_id), self.binding_policy)
+                .map_err(|e| MethodError::failed(kind, format!("client cert config: {e}")))?;
+        let captured = client_tls.captured_peer_id;
+        let captured_bls = client_tls.captured_bls;
+        let connector = TlsConnector::from(client_tls.config);
+
+        // The server name is irrelevant to identity here (we verify by peer_id via the pinning
+        // verifier, not by hostname/CA), but rustls requires a syntactically valid SNI. A peer_id
+        // hex (64 chars) is not a valid DNS label (>63), so we use a fixed, well-formed placeholder.
+        let server_name = ServerName::try_from("peer.dig.invalid")
+            .map_err(|e| MethodError::failed(kind, format!("server name: {e}")))?;
+
+        let tls = connector
+            .connect(server_name, stream)
+            .await
+            .map_err(|e| classify_tls_error(kind, &e))?;
+
+        // The pinning verifier already rejected a mismatch; this is the authenticated identity.
+        let verified = captured
+            .get()
+            .ok_or_else(|| MethodError::failed(kind, "peer presented no certificate"))?;
+
+        // Wrap the single mTLS byte stream in yamux so the caller can open many concurrent
+        // (range-)streams over it — the streaming-first, multiplexed transport is uniform across
+        // every traversal tier.
+        let session = crate::mux::PeerSession::client(tls);
+
+        Ok(PeerConnection {
+            peer_id: verified,
+            method: kind,
+            remote_addr,
+            peer_bls_pub: captured_bls.get(),
+            session,
+        })
+    }
+
+    /// Dial a [`TraversalKind::Relayed`] outcome: open the RLY-002 byte tunnel to the peer over the
+    /// held relay reservation, then run the SAME mTLS handshake over it. Requires a relay data-plane
+    /// wired via [`with_relayed_dialer`](Self::with_relayed_dialer). The relay forwards only the TLS
+    /// records it cannot read — a relayed connection is not weaker than a direct one.
+    async fn dial_relayed(
+        &self,
+        peer: &PeerTarget,
+        outcome: &MethodOutcome,
+    ) -> Result<PeerConnection, MethodError> {
+        let kind = TraversalKind::Relayed;
+        let relayed = self.relayed.as_ref().ok_or_else(|| {
+            MethodError::failed(kind, "no relay data-plane wired for the relayed tier")
+        })?;
+        let tunnel = relayed
+            .open_dial_tunnel(&peer.peer_id.to_hex(), &peer.network_id)
+            .await
+            .map_err(|e| MethodError::failed(kind, e))?;
+        // The relay endpoint (observability) is the outcome's dial address; the byte path is the WS.
+        let remote_addr = outcome.dial_addr().unwrap_or(relayed.relay_endpoint());
+        let stream = RelayTunnelStream::new(tunnel);
+        self.handshake_over(peer, kind, stream, remote_addr).await
+    }
+}
+
+impl std::fmt::Debug for MtlsDialer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MtlsDialer")
+            .field("happy_eyeballs", &self.happy_eyeballs)
+            .field("binding_policy", &self.binding_policy)
+            .field("local_stack", &self.local_stack)
+            .field(
+                "relayed",
+                &self.relayed.as_ref().map(|_| "<relay data-plane>"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 #[async_trait]
@@ -152,6 +266,12 @@ impl Dialer for MtlsDialer {
         outcome: &MethodOutcome,
     ) -> Result<PeerConnection, MethodError> {
         let kind = outcome.kind;
+
+        // The relayed tier is not an IP dial — it carries mTLS over a relay byte tunnel. Every other
+        // tier (direct / mapping / hole-punch) yields dialable IP candidates and dials them directly.
+        if kind == TraversalKind::Relayed {
+            return self.dial_relayed(peer, outcome).await;
+        }
 
         // Delegate family selection + racing to dig-ip: it dials only the local∩peer family
         // intersection (never a family the local host or the peer lacks), IPv6-first with graceful
@@ -172,47 +292,10 @@ impl Dialer for MtlsDialer {
         )
         .await
         .map_err(|e| MethodError::failed(kind, e.to_string()))?;
-        let tcp = winner.conn;
-        let addr = winner.addr;
 
-        // The rustls client config — DigNetwork-CA chain check + peer_id pin (to the peer we asked
-        // for) + #1204 binding verification — comes ready-made from dig-tls, along with the handles
-        // that capture WHO answered during the handshake.
-        let client_tls =
-            dig_tls::client_config(&self.node, Some(peer.peer_id), self.binding_policy)
-                .map_err(|e| MethodError::failed(kind, format!("client cert config: {e}")))?;
-        let captured = client_tls.captured_peer_id;
-        let captured_bls = client_tls.captured_bls;
-        let connector = TlsConnector::from(client_tls.config);
-
-        // The server name is irrelevant to identity here (we verify by peer_id via the pinning
-        // verifier, not by hostname/CA), but rustls requires a syntactically valid SNI. A peer_id
-        // hex (64 chars) is not a valid DNS label (>63), so we use a fixed, well-formed placeholder.
-        let server_name = ServerName::try_from("peer.dig.invalid")
-            .map_err(|e| MethodError::failed(kind, format!("server name: {e}")))?;
-
-        let tls = connector
-            .connect(server_name, tcp)
+        // The winning raced TCP stream carries mTLS identically to every other tier.
+        self.handshake_over(peer, kind, winner.conn, winner.addr)
             .await
-            .map_err(|e| classify_tls_error(kind, &e))?;
-
-        // The pinning verifier already rejected a mismatch; this is the authenticated identity.
-        let verified = captured
-            .get()
-            .ok_or_else(|| MethodError::failed(kind, "peer presented no certificate"))?;
-
-        // Wrap the single mTLS byte stream in yamux so the caller can open many concurrent
-        // (range-)streams over it — the streaming-first, multiplexed transport is uniform across
-        // every traversal tier.
-        let session = crate::mux::PeerSession::client(tls);
-
-        Ok(PeerConnection {
-            peer_id: verified,
-            method: kind,
-            remote_addr: addr,
-            peer_bls_pub: captured_bls.get(),
-            session,
-        })
     }
 }
 

@@ -512,6 +512,16 @@ impl RelayTunnel {
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
         self.inbound.recv().await
     }
+
+    /// Poll for the next inbound payload. This is the non-`async` primitive the
+    /// [`RelayTunnelStream`](crate::tunnel::RelayTunnelStream) `AsyncRead` adapter drives so an mTLS
+    /// session can run OVER the relay tunnel. `Poll::Ready(None)` once the reservation drops.
+    pub(crate) fn poll_recv(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Vec<u8>>> {
+        self.inbound.poll_recv(cx)
+    }
 }
 
 impl Drop for RelayTunnel {
@@ -767,6 +777,45 @@ where
         other => tracing::debug!(?other, "relay message ignored by reservation loop"),
     }
     Ok(())
+}
+
+/// Wire two in-memory relay reservations to forward RLY-002 frames to each OTHER — a loopback relay
+/// with no real network. Each returned [`RelayStatus`] is `Connected` with a live outbound sink whose
+/// frames are routed into the peer's tunnels by `from` peer_id, exactly as a real relay would forward
+/// A→relay→B. Used to prove a full mTLS session round-trips over [`RelayTunnel`]s (see `tunnel.rs`).
+///
+/// `a` opens tunnels targeting `b_id`; `b` opens tunnels targeting `a_id`.
+#[cfg(test)]
+pub(crate) fn loopback_reservation_pair(
+    a_id: &str,
+    b_id: &str,
+) -> (Arc<RelayStatus>, Arc<RelayStatus>) {
+    let a = RelayStatus::new();
+    let b = RelayStatus::new();
+    a.set_connected(1);
+    b.set_connected(1);
+
+    let (a_tx, mut a_rx) = mpsc::unbounded_channel::<RelayMessage>();
+    let (b_tx, mut b_rx) = mpsc::unbounded_channel::<RelayMessage>();
+    a.set_transport(a_id, a_tx);
+    b.set_transport(b_id, b_tx);
+
+    // Drain a's outbound → forward into b (route by `from`), and symmetrically b → a. This is the
+    // relay's forwarding role, in-process.
+    let b_route = Arc::clone(&b);
+    tokio::spawn(async move {
+        while let Some(RelayMessage::RelayGossipMessage { from, payload, .. }) = a_rx.recv().await {
+            b_route.route_relayed(&from, payload);
+        }
+    });
+    let a_route = Arc::clone(&a);
+    tokio::spawn(async move {
+        while let Some(RelayMessage::RelayGossipMessage { from, payload, .. }) = b_rx.recv().await {
+            a_route.route_relayed(&from, payload);
+        }
+    });
+
+    (a, b)
 }
 
 /// Serialize + send one `RelayMessage` as a WebSocket text frame.

@@ -13,6 +13,7 @@
 //! behind [`HolePunchCoordinator`] so the method is unit-tested with a mock coordinator (no relay).
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -35,6 +36,23 @@ pub trait HolePunchCoordinator: Send + Sync {
         network_id: &str,
         my_external_addr: SocketAddr,
     ) -> Result<SocketAddr, String>;
+}
+
+/// Forward through a shared trait object so [`crate::connect`] can compose a hole-punch method from an
+/// `Arc<dyn HolePunchCoordinator>` held in the runtime carrier (a generic [`HolePunchMethod<C>`] over
+/// the trait object).
+#[async_trait]
+impl HolePunchCoordinator for Arc<dyn HolePunchCoordinator> {
+    async fn coordinate(
+        &self,
+        target_peer: &str,
+        network_id: &str,
+        my_external_addr: SocketAddr,
+    ) -> Result<SocketAddr, String> {
+        (**self)
+            .coordinate(target_peer, network_id, my_external_addr)
+            .await
+    }
 }
 
 /// The relay-coordinated hole-punch method. Needs this node's own reflexive (STUN-discovered)

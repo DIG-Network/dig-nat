@@ -12,6 +12,7 @@
 //! gateway. [`RealIgd`] is the production implementation delegating to `igd-next`.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -76,6 +77,21 @@ impl IgdGateway for RealIgd {
             .await
             .map_err(|e| format!("igd add_port: {e}"))?;
         Ok(internal_port)
+    }
+}
+
+/// Forward through a shared trait object so [`crate::connect`] can compose a UPnP method from an
+/// `Arc<dyn IgdGateway>` held in the runtime carrier (a generic [`UpnpMethod<G>`] over the object).
+#[async_trait]
+impl IgdGateway for Arc<dyn IgdGateway> {
+    async fn add_port_mapping(
+        &self,
+        internal_port: u16,
+        lifetime_secs: u32,
+    ) -> Result<u16, String> {
+        (**self)
+            .add_port_mapping(internal_port, lifetime_secs)
+            .await
     }
 }
 
