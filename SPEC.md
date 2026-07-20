@@ -8,12 +8,19 @@ strategy, dial behavior, identity model, and conformance points. Keywords **MUST
 
 ## 1. Scope
 
-An implementation of this spec provides `connect(peer, node, config) -> PeerConnection`, where the
-caller describes the peer once (identity + candidate addresses) and passes its own `dig_tls::NodeCert`
-(its mTLS identity) and receives a verified, multiplexed, encrypted connection. The caller **MUST
-NOT** be required to choose the traversal method; the crate selects it. The traversal technique that
-established the connection **MUST** be reported (`PeerConnection::method`) for observability but
-**MUST NOT** change how the caller uses the connection.
+An implementation of this spec provides two entry points:
+
+- `connect(peer, node, config) -> PeerConnection` — the convenience entry for a caller with NO live
+  transport handles; it composes only the tiers requiring no runtime input (currently **Direct**).
+- `connect_with_runtime(peer, node, config, runtime) -> PeerConnection` — auto-composes the **FULL**
+  ladder from the `NatRuntime` carrier's live handles (§4a). `connect` is exactly
+  `connect_with_runtime` with an empty runtime.
+
+The caller describes the peer once (identity + candidate addresses) and passes its own
+`dig_tls::NodeCert` (its mTLS identity) and receives a verified, multiplexed, encrypted connection.
+The caller **MUST NOT** be required to choose the traversal method; the crate selects it. The
+traversal technique that established the connection **MUST** be reported (`PeerConnection::method`)
+for observability but **MUST NOT** change how the caller uses the connection.
 
 ## 2. Peer identity + mTLS — delegated to `dig-tls`
 
@@ -186,6 +193,26 @@ The behaviour `dig-nat` INHERITS from `dig-ip` (its structural guarantees, teste
   only after tier 4 fails, to conserve relay bandwidth. Both tiers wrap the resulting byte path in the
   same mTLS session.
 
+## 4a. Full-ladder auto-composition + the runtime carrier (NORMATIVE)
+
+`connect_with_runtime` **MUST** auto-compose the traversal ladder from two inputs kept strictly
+separate: the DATA config (`NatConfig`, `Clone + Debug`) and the LIVE handles (`NatRuntime`, which
+**MUST NOT** be `Clone` or `Debug` — it carries `Arc<dyn …>` trait objects + live sockets).
+
+- A tier is composed **iff** it is enabled in `config.enabled_methods` AND its runtime inputs are
+  present in `runtime`. A tier missing its inputs **MUST** be omitted silently — the crate **MUST
+  NOT** attempt a tier it cannot actually run (no phantom or silently-broken dial). Per-tier inputs:
+  - **Direct** — none (always composable).
+  - **UPnP** — `local_port` (+ optional injected `IgdGateway`; else the real SSDP gateway).
+  - **NAT-PMP** — `local_port` + `gateway_v4`.
+  - **PCP** — `local_port` + `gateway_v4` + `client_ip`.
+  - **HolePunch** — `hole_punch` coordinator + `my_external_addr` (STUN reflexive).
+  - **Relayed** — a `relayed` `RelayedDialer` handle.
+- If no tier is composable, `connect`/`connect_with_runtime` **MUST** return `NoMethodsEnabled`.
+- Every composed tier — INCLUDING the relayed one — **MUST** run the identical `dig-tls` mTLS
+  (CA-chain check + `peer_id` pin + #1204 BLS binding). A relayed or hole-punched connection **MUST
+  NOT** be weaker than a direct one.
+
 ## 5. Transport surface
 
 - Whatever tier establishes the link, the result is one mTLS byte stream wrapped in `yamux`
@@ -255,6 +282,27 @@ THROUGH the relay by RLY-002 `relay_message` forwarding — the genuine last res
 - The production `RelayedTransport` (the strategy's tier-6 seam) is `ReservationRelayedTransport`; it
   gates on a live reservation and reports the relay endpoint for observability, while the byte stream
   is taken via `open_tunnel`.
+
+### 5b.1 Relayed dial — mTLS over the relay tunnel (NORMATIVE)
+
+The relayed tier is composed by `connect_with_runtime` from a `RelayedDialer` handle (implemented by
+`ReservationRelayedTransport`). Dialing it **MUST** carry the SAME mTLS as a direct dial:
+
+- `RelayedDialMethod::attempt` gates on `RelayedDialer::is_ready()` (a held reservation) and yields the
+  relay endpoint as the observability dial address. When not ready it **MUST** fail cleanly (the
+  strategy records the failure), never produce a doomed dial.
+- The dialer **MUST** open the byte tunnel via `RelayedDialer::open_dial_tunnel(peer_id_hex,
+  network_id)`, wrap the resulting `RelayTunnel` in a byte-stream adapter (`RelayTunnelStream`,
+  tokio `AsyncRead + AsyncWrite`), and run the IDENTICAL `dig_tls::client_config` handshake +
+  `yamux` session over it — so a relayed `PeerConnection` presents the same CA chain, `peer_id` pin,
+  and #1204 BLS binding as a direct one.
+- The relay routes tunnels by `peer_id`. A relay that substitutes a DIFFERENT peer for the pinned one
+  (a redirect attack) **MUST** be rejected by the mTLS `peer_id` pin — identity is proven by the
+  certificate, never by the relay's routing. The relay sees only TLS records (ciphertext); §5.4
+  recipient-sealing remains a layer ABOVE this transport.
+- `RelayTunnelStream` maps each write to one RLY-002 frame (≤ `MAX_RELAY_PAYLOAD`) and each read to
+  one inbound payload (buffering the remainder across reads); a dropped reservation surfaces as a
+  clean stream EOF that fails the handshake.
 
 ## 6. STUN/PCP anti-spoof requirements (NORMATIVE)
 
