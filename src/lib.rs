@@ -27,13 +27,16 @@
 //! resource — so a downloader fetches DIFFERENT ranges from DIFFERENT peers in parallel and
 //! reassembles. The API is streaming (read bytes as they arrive), never buffer-the-whole-response.
 //!
-//! ## Identity + mTLS
+//! ## Identity + mTLS — delegated to `dig-tls`
 //!
-//! Every peer connection is mutual TLS. A peer's identity is `peer_id = SHA-256(TLS SPKI DER)`
-//! ([`identity`], matching `dig-gossip`). The dial presents this node's certificate and the
-//! [`mtls::PeerIdPinningVerifier`] rejects the handshake unless the remote's derived `peer_id`
-//! matches the [`peer::PeerTarget::peer_id`] the caller asked for — so the transport is
-//! self-authenticating.
+//! Every peer connection is mutual TLS, and the entire certificate model is owned by the canonical
+//! [`dig-tls`](dig_tls) crate (L00): the shipped public DigNetwork CA, the per-peer CA-signed
+//! [`NodeCert`], `peer_id = SHA-256(TLS SPKI DER)`, the #1204 BLS-G1 cert binding, and the ready
+//! rustls mutual-auth configs. dig-nat presents this node's [`NodeCert`] and uses
+//! [`dig_tls::client_config`] to pin the remote's `peer_id` to the [`peer::PeerTarget::peer_id`] the
+//! caller asked for — so the transport is self-authenticating. dig-nat holds NO cert/binding/peer_id
+//! code of its own (it was extracted to dig-tls in 0.6.0); the names below are re-exports for
+//! convenience.
 //!
 //! ## Graceful fallback + relay resilience
 //!
@@ -47,10 +50,11 @@
 //! ## Example
 //!
 //! ```no_run
-//! # use dig_nat::{connect, NatConfig, LocalIdentity, PeerTarget, PeerId};
-//! # async fn run(identity: LocalIdentity, peer_id: PeerId, addr: std::net::SocketAddr) -> Result<(), dig_nat::NatError> {
+//! # use std::sync::Arc;
+//! # use dig_nat::{connect, NatConfig, NodeCert, PeerTarget, PeerId};
+//! # async fn run(node: Arc<NodeCert>, peer_id: PeerId, addr: std::net::SocketAddr) -> Result<(), dig_nat::NatError> {
 //! let peer = PeerTarget::with_addr(peer_id, addr, "DIG_MAINNET");
-//! let conn = connect(&peer, &identity, &NatConfig::default()).await?;
+//! let conn = connect(&peer, &node, &NatConfig::default()).await?;
 //! println!("connected to {} via {:?}", conn.peer_id, conn.method);
 //! # Ok(()) }
 //! ```
@@ -58,13 +62,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-pub mod cert_binding;
 pub mod config;
 pub mod dialer;
 pub mod error;
-pub mod identity;
 pub mod method;
-pub mod mtls;
 pub mod mux;
 pub mod peer;
 pub mod relay;
@@ -75,13 +76,17 @@ pub mod wire;
 
 use std::sync::Arc;
 
-pub use cert_binding::{
-    build_bound_cert, verify_binding_from_leaf_cert, BindingOutcome, BindingPolicy,
-    CertBindingError,
+// --- Certificate / mTLS / identity model — re-exported from the canonical `dig-tls` crate (L00).
+// dig-nat CONSUMES dig-tls for ALL of these (it holds no copy of its own), so a single source of
+// truth means the DIG cert shape can never byte-drift between crates. ---
+pub use dig_tls::binding::{verify_binding_from_leaf_cert, BindingOutcome};
+pub use dig_tls::verify::{CapturedBlsPub, CapturedPeerId};
+pub use dig_tls::{
+    peer_id_from_leaf_cert_der, peer_id_from_tls_spki_der, BindingPolicy, NodeCert, PeerId,
 };
-pub use config::{LocalIdentity, NatConfig, NatConfigBuilder};
+
+pub use config::{NatConfig, NatConfigBuilder};
 pub use error::{MethodError, NatError};
-pub use identity::{peer_id_from_leaf_cert_der, peer_id_from_tls_spki_der, PeerId};
 pub use method::{TraversalKind, TraversalMethod};
 pub use mux::{
     AvailabilityAnswer, AvailabilityItem, AvailabilityRequest, AvailabilityResponse, PeerSession,
@@ -96,28 +101,30 @@ use method::direct::DirectMethod;
 /// Establish a mutually-authenticated connection to `peer`, choosing the traversal method
 /// transparently (first success wins; relay is the last resort).
 ///
-/// `identity` is this node's mTLS identity (its client certificate + key); `config` selects which
-/// methods are enabled + the per-method timeout + the relay/STUN endpoints. On success the returned
-/// [`PeerConnection`] carries the verified remote `peer_id`, the [`TraversalKind`] that established
-/// it, and the authenticated stream.
+/// `node` is this node's [`NodeCert`] — its CA-signed mTLS identity from [`dig-tls`](dig_tls),
+/// presented as the client certificate; `config` selects which methods are enabled, the per-method
+/// timeout, the relay/STUN endpoints, and the [`BindingPolicy`] applied to the peer's #1204 cert
+/// binding. On success the returned [`PeerConnection`] carries the verified remote `peer_id`, the
+/// [`TraversalKind`] that established it, the peer's bound BLS pubkey (when present), and the
+/// authenticated stream.
 ///
 /// # Errors
 /// - [`NatError::NoMethodsEnabled`] — the config enabled no methods.
 /// - [`NatError::AllMethodsFailed`] — every enabled method failed (with per-method reasons).
-/// - [`NatError::InvalidConfig`] — the identity/relay/STUN config could not be used.
+/// - [`NatError::InvalidConfig`] — the relay/STUN config could not be used.
 ///
 /// This function never panics and never hangs: every method (and its dial) is bounded by
 /// [`NatConfig::per_method_timeout`].
 pub async fn connect(
     peer: &PeerTarget,
-    identity: &LocalIdentity,
+    node: &Arc<NodeCert>,
     config: &NatConfig,
 ) -> Result<PeerConnection, NatError> {
     let methods = build_enabled_methods(config);
     if methods.is_empty() {
         return Err(NatError::NoMethodsEnabled);
     }
-    let dialer = MtlsDialer::new(identity.clone());
+    let dialer = MtlsDialer::new(Arc::clone(node)).with_binding_policy(config.binding_policy);
     strategy::connect_with_strategy(peer, methods, &dialer, config.per_method_timeout).await
 }
 

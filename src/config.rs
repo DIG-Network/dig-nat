@@ -1,59 +1,17 @@
-//! Connection configuration — the local identity, relay endpoint, enabled methods, and timeouts
-//! that shape a [`crate::connect`] call. Built with a fluent builder; the caller never selects the
-//! traversal method (only which ones are *enabled*).
+//! Connection configuration — the enabled methods, per-method timeout, relay/STUN endpoints, and the
+//! cert-binding policy that shape a [`crate::connect`] call. Built with a fluent builder; the caller
+//! never selects the traversal method (only which ones are *enabled*).
+//!
+//! The local mTLS identity is NOT here: it is a [`dig_tls::NodeCert`] the caller passes to
+//! [`crate::connect`] directly (dig-tls owns the cert model — CA, leaf, peer_id, binding).
 
 use std::time::Duration;
 
-use zeroize::Zeroizing;
-
-use crate::identity::PeerId;
 use crate::method::TraversalKind;
+use dig_tls::BindingPolicy;
 
-/// The local node's mTLS identity: its certificate + private key (both DER) and the derived
-/// [`PeerId`] the remote will verify.
-///
-/// The certificate is self-signed and its public key IS the identity (see [`crate::mtls`]). Callers
-/// typically load a persisted `ChiaCertificate`-style pair; [`LocalIdentity::from_der`] derives the
-/// `peer_id` from the cert's SPKI so it always matches what a remote computes.
-#[derive(Clone)]
-pub struct LocalIdentity {
-    /// This node's leaf certificate, DER-encoded.
-    pub cert_der: Vec<u8>,
-    /// The matching private key, DER-encoded (PKCS#8).
-    ///
-    /// #179 finding 4: wrapped in [`Zeroizing`] (rather than a plain `Vec<u8>`) so every clone
-    /// (`LocalIdentity` is cloned per dial, see `dialer.rs`) and every drop scrubs the private-key
-    /// bytes from memory instead of leaving them in freed heap. Derefs transparently to `&[u8]` for
-    /// existing call sites (e.g. building a `rustls::pki_types::PrivateKeyDer`).
-    pub key_der: Zeroizing<Vec<u8>>,
-    /// This node's own `peer_id` = SHA-256(cert SPKI DER).
-    pub peer_id: PeerId,
-}
-
-impl LocalIdentity {
-    /// Build a local identity from a DER cert + PKCS#8 key, deriving `peer_id` from the cert SPKI.
-    /// Returns `None` if the certificate cannot be parsed.
-    pub fn from_der(cert_der: Vec<u8>, key_der: Vec<u8>) -> Option<Self> {
-        let peer_id = crate::identity::peer_id_from_leaf_cert_der(&cert_der)?;
-        Some(LocalIdentity {
-            cert_der,
-            key_der: Zeroizing::new(key_der),
-            peer_id,
-        })
-    }
-}
-
-impl std::fmt::Debug for LocalIdentity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LocalIdentity")
-            .field("peer_id", &self.peer_id)
-            .field("cert_der", &format!("<{} bytes>", self.cert_der.len()))
-            .field("key_der", &"<redacted>")
-            .finish()
-    }
-}
-
-/// Which traversal methods are enabled + the per-method deadline and relay settings for a connect.
+/// Which traversal methods are enabled + the per-method deadline, relay settings, and cert-binding
+/// policy for a connect.
 ///
 /// The DEFAULT enables every method in the canonical order with sane timeouts and the canonical
 /// [`dig_constants::DIG_RELAY_URL`] relay. The caller tweaks via the builder but never picks *which*
@@ -75,6 +33,13 @@ pub struct NatConfig {
     /// [`STUN_PORT`](crate::config::STUN_PORT) (the relay co-locates a STUN server, L7 spec §3):
     /// point a node at a private relay and its STUN follows.
     pub stun_server: Option<std::net::SocketAddr>,
+    /// The #1204 BLS cert-binding verification stance applied to the PEER's certificate during the
+    /// mTLS handshake. Defaults to [`BindingPolicy::Opportunistic`] (the rollout default: verify a
+    /// binding when present, reject a present-but-invalid one, tolerate a legacy peer that has none).
+    /// A node that requires payload sealing sets [`BindingPolicy::Required`] (fail-closed,
+    /// anti-downgrade). Verified via `dig-tls`; the verified peer BLS pubkey lands on
+    /// [`crate::PeerConnection::peer_bls_pub`].
+    pub binding_policy: BindingPolicy,
 }
 
 /// The standard STUN port (RFC 5389). The DIG relay serves STUN here, co-located with the relay host
@@ -95,6 +60,7 @@ impl Default for NatConfig {
             per_method_timeout: Duration::from_secs(5),
             relay_endpoint: dig_constants::DIG_RELAY_URL.to_string(),
             stun_server: None,
+            binding_policy: BindingPolicy::Opportunistic,
         }
     }
 }
@@ -147,6 +113,14 @@ impl NatConfigBuilder {
     /// Set the STUN server used for reflexive-address discovery.
     pub fn stun_server(mut self, addr: std::net::SocketAddr) -> Self {
         self.cfg.stun_server = Some(addr);
+        self
+    }
+
+    /// Set the #1204 cert-binding verification stance for the peer's certificate (default
+    /// [`BindingPolicy::Opportunistic`]). Use [`BindingPolicy::Required`] on a node that seals
+    /// payloads to peers (fail-closed, anti-downgrade).
+    pub fn binding_policy(mut self, policy: BindingPolicy) -> Self {
+        self.cfg.binding_policy = policy;
         self
     }
 

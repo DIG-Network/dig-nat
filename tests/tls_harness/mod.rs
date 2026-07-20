@@ -7,7 +7,26 @@
 
 #![allow(dead_code)]
 
+use std::sync::Arc;
+
 use dig_nat::mux::PeerSession;
+use dig_nat::NodeCert;
+use dig_tls::bls::SecretKey;
+use sha2::{Digest, Sha256};
+
+/// A deterministic BLS identity secret key from a label — derived, never an integer-literal secret
+/// (so a second implementation reproduces the same vector and CodeQL does not flag a hard-coded key).
+pub fn test_bls_sk(label: &str) -> SecretKey {
+    let seed: [u8; 32] = Sha256::digest(label.as_bytes()).into();
+    SecretKey::from_seed(&seed)
+}
+
+/// A CA-signed dig-tls [`NodeCert`] (signed by the shipped embedded DigNetwork CA) for `label`,
+/// shared behind an [`Arc`] the way `MtlsDialer` holds it. This is the identity a peer presents in
+/// the mTLS handshake.
+pub fn test_node(label: &str) -> Arc<NodeCert> {
+    Arc::new(NodeCert::generate_signed(&test_bls_sk(label)).expect("generate node cert"))
+}
 
 /// A connected pair of multiplexed sessions over an in-memory duplex: `(client, server)`. The client
 /// opens streams; the server accepts them. Real yamux, no network.

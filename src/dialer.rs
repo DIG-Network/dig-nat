@@ -2,10 +2,12 @@
 //! returns a [`PeerConnection`] whose remote `peer_id` has been verified.
 //!
 //! This is the single place transport detail lives: (happy-eyeballs) TCP connect → rustls client
-//! handshake presenting THIS node's certificate (mutual TLS) → the [`PeerIdPinningVerifier`]
-//! captures the peer's leaf cert, derives `peer_id = SHA-256(SPKI DER)`, and rejects the handshake
-//! unless it matches the [`PeerTarget::peer_id`] the caller asked for. On success the caller gets an
-//! authenticated, encrypted [`tokio_rustls::client::TlsStream`].
+//! handshake presenting THIS node's [`NodeCert`] (mutual TLS). The rustls `ClientConfig` — including
+//! the DigNetwork-CA chain check, the `peer_id = SHA-256(SPKI DER)` pin, and the #1204 BLS-binding
+//! verification — comes ready-made from [`dig_tls::client_config`]; dig-nat holds no verifier of its
+//! own. dig-tls captures the peer's `peer_id` (and bound BLS pubkey) during the handshake and rejects
+//! it unless the derived id matches the [`PeerTarget::peer_id`] the caller asked for. On success the
+//! caller gets an authenticated, encrypted [`tokio_rustls::client::TlsStream`].
 //!
 //! ## IPv6-first, IPv4-fallback — delegated to `dig-ip` (CLAUDE.md §5.2)
 //!
@@ -22,16 +24,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use dig_ip::{CandidateSource, DialConfig, LocalStack, PeerCandidates};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use rustls::ClientConfig;
+use dig_tls::{BindingPolicy, NodeCert};
+use rustls_pki_types::ServerName;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
-use crate::cert_binding::BindingPolicy;
-use crate::config::LocalIdentity;
 use crate::error::MethodError;
 use crate::method::{MethodOutcome, TraversalKind};
-use crate::mtls::{CapturedBlsPub, CapturedPeerId, PeerIdPinningVerifier};
 use crate::peer::{PeerConnection, PeerTarget};
 use crate::strategy::Dialer;
 
@@ -89,12 +88,16 @@ pub fn candidates_from_outcome(outcome: &MethodOutcome) -> PeerCandidates {
     candidates
 }
 
-/// The production mTLS dialer. Holds this node's [`LocalIdentity`] (its client certificate for
-/// mutual TLS) and builds a fresh pinning verifier per dial. The candidate race is tuned by
-/// [`MtlsDialer::happy_eyeballs`], and the local stack it dials from by [`MtlsDialer::local_stack`].
+/// The production mTLS dialer. Holds this node's [`NodeCert`] (its CA-signed dig-tls identity,
+/// presented as the mutual-TLS client cert) and builds a fresh [`dig_tls::client_config`] per dial.
+/// The candidate race is tuned by [`MtlsDialer::happy_eyeballs`], and the local stack it dials from by
+/// [`MtlsDialer::local_stack`].
+///
+/// The [`NodeCert`] is shared behind an [`Arc`] (it is deliberately not `Clone` — its private key is
+/// held in a scrubbing wrapper), so cloning the dialer per dial never copies the key material.
 #[derive(Debug, Clone)]
 pub struct MtlsDialer {
-    identity: LocalIdentity,
+    node: Arc<NodeCert>,
     happy_eyeballs: HappyEyeballsConfig,
     /// The BLS cert-binding verification stance for the peer's cert (#1204). Defaults to
     /// [`BindingPolicy::Opportunistic`] — the rollout default: verify a binding when the peer
@@ -108,12 +111,12 @@ pub struct MtlsDialer {
 }
 
 impl MtlsDialer {
-    /// Build a dialer that authenticates as `identity` (presents its cert as the mTLS client cert),
-    /// using the default happy-eyeballs tuning, the real host's detected address-family stack, and
-    /// the default [`BindingPolicy::Opportunistic`] cert-binding stance.
-    pub fn new(identity: LocalIdentity) -> Self {
+    /// Build a dialer that authenticates as `node` (presents its dig-tls cert as the mTLS client
+    /// cert), using the default happy-eyeballs tuning, the real host's detected address-family stack,
+    /// and the default [`BindingPolicy::Opportunistic`] cert-binding stance.
+    pub fn new(node: Arc<NodeCert>) -> Self {
         MtlsDialer {
-            identity,
+            node,
             happy_eyeballs: HappyEyeballsConfig::default(),
             binding_policy: BindingPolicy::default(),
             local_stack: None,
@@ -138,32 +141,6 @@ impl MtlsDialer {
     pub fn with_local_stack(mut self, stack: LocalStack) -> Self {
         self.local_stack = Some(stack);
         self
-    }
-
-    /// Construct the rustls [`ClientConfig`] for one dial: present our client cert, and verify the
-    /// server (peer) via the [`PeerIdPinningVerifier`] pinned to `expected` (the peer we want).
-    fn client_config(
-        &self,
-        expected: crate::identity::PeerId,
-        captured: CapturedPeerId,
-        captured_bls: CapturedBlsPub,
-    ) -> Result<ClientConfig, String> {
-        let cert = CertificateDer::from(self.identity.cert_der.clone());
-        // `key_der` is `Zeroizing<Vec<u8>>` (#179 finding 4); `.to_vec()` copies the bytes out into
-        // a plain `Vec<u8>` for rustls (which takes ownership into its own `PrivateKeyDer`) — the
-        // `Zeroizing` original still scrubs itself on drop as normal.
-        let key = PrivateKeyDer::try_from(self.identity.key_der.to_vec())
-            .map_err(|e| format!("invalid private key: {e}"))?;
-
-        let verifier = Arc::new(
-            PeerIdPinningVerifier::new(Some(expected), captured)
-                .with_binding(self.binding_policy, captured_bls),
-        );
-        ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(verifier)
-            .with_client_auth_cert(vec![cert], key)
-            .map_err(|e| format!("client cert config: {e}"))
     }
 }
 
@@ -198,12 +175,15 @@ impl Dialer for MtlsDialer {
         let tcp = winner.conn;
         let addr = winner.addr;
 
-        let captured = CapturedPeerId::default();
-        let captured_bls = CapturedBlsPub::default();
-        let config = self
-            .client_config(peer.peer_id, captured.clone(), captured_bls.clone())
-            .map_err(|e| MethodError::failed(kind, e))?;
-        let connector = TlsConnector::from(Arc::new(config));
+        // The rustls client config — DigNetwork-CA chain check + peer_id pin (to the peer we asked
+        // for) + #1204 binding verification — comes ready-made from dig-tls, along with the handles
+        // that capture WHO answered during the handshake.
+        let client_tls =
+            dig_tls::client_config(&self.node, Some(peer.peer_id), self.binding_policy)
+                .map_err(|e| MethodError::failed(kind, format!("client cert config: {e}")))?;
+        let captured = client_tls.captured_peer_id;
+        let captured_bls = client_tls.captured_bls;
+        let connector = TlsConnector::from(client_tls.config);
 
         // The server name is irrelevant to identity here (we verify by peer_id via the pinning
         // verifier, not by hostname/CA), but rustls requires a syntactically valid SNI. A peer_id

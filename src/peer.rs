@@ -8,9 +8,9 @@
 
 use std::net::SocketAddr;
 
-use crate::identity::PeerId;
 use crate::method::TraversalKind;
 use crate::mux::{PeerSession, PeerStream};
+use dig_tls::PeerId;
 
 /// A description of the peer to connect to.
 ///
@@ -105,7 +105,7 @@ impl PeerTarget {
 /// An established, mutually-authenticated, **multiplexed** connection to a peer.
 ///
 /// The connection is one mTLS byte stream whose remote presented a certificate whose `peer_id`
-/// equals [`Self::peer_id`] (verified during the handshake by [`crate::mtls::PeerIdPinningVerifier`]),
+/// equals [`Self::peer_id`] (verified during the handshake by `dig-tls`'s client verifier),
 /// wrapped in a [`PeerSession`] so the caller can open **many concurrent logical streams**
 /// ([`open_stream`](Self::open_stream)) or **byte-range streams**
 /// ([`open_range_stream`](Self::open_range_stream)) — streaming-first, no head-of-line blocking.

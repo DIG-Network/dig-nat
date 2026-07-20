@@ -4,6 +4,35 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.6.0] - 2026-07-19
+
+### ⚠ BREAKING CHANGES
+
+- **cert model:** dig-nat now CONSUMES the canonical `dig-tls` crate (crates.io `dig-tls = "0.1"`)
+  for ALL certificate / mTLS / peer_id / BLS-binding concerns. The duplicated modules
+  `cert_binding`, `mtls`, and `identity` are DELETED and their equivalents are re-exported from
+  dig-tls, so there is exactly one implementation of the DIG cert model and no byte-drift risk (#1274).
+  - `LocalIdentity` is REMOVED — pass a `dig_tls::NodeCert` (re-exported as `dig_nat::NodeCert`) to
+    `connect`. `connect(peer, node, config)` now takes `&Arc<NodeCert>` instead of `&LocalIdentity`.
+  - `cert_binding::build_bound_cert` and `CertBindingError` are REMOVED — mint a `NodeCert` via
+    `NodeCert::generate_signed` / `load_or_generate` (dig-tls) instead.
+  - **Certs are now CA-signed (DigNetwork CA), not self-signed.** A peer that presents a leaf that
+    does not chain to the shipped DigNetwork CA is rejected. Consumers regenerate their cert as a
+    CA-signed `NodeCert` on adopt. The #1204 BLS binding is byte-compatible (same OID, context
+    `dig-nat/cert-bls-binding/v1`, layout); only the issuer changed.
+  - `MtlsDialer::new` now takes `Arc<NodeCert>`.
+
+### Features
+
+- **config:** `NatConfig` gains a `binding_policy` (default `Opportunistic`) threaded into `connect`
+  so the peer's #1204 cert binding is verified per the configured stance (#1274).
+
+### Tests
+
+- Cross-crate BLS conformance (`tests/identity.rs`): dig-tls's and dig-identity's BLS G1/G2 backends
+  agree byte-for-byte (same pubkey, cross-verifying signatures, matching cert-bound seal target) — the
+  integration-level check dig-tls's `bls.rs` defers to. FAILS if a future chia-bls/blst bump diverges.
+
 ## [0.5.1] - 2026-07-19
 
 ### Chores
