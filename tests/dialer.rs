@@ -1,59 +1,46 @@
 //! Dialer + PeerConnection integration over a real LOOPBACK mTLS server (in-process, no external
-//! network). Proves the production `MtlsDialer` establishes an mTLS session, verifies the peer_id,
+//! network). Proves the production `MtlsDialer` — presenting a dig-tls `NodeCert` and using
+//! `dig_tls::client_config` for the handshake — establishes an mTLS session, verifies the peer_id,
 //! rejects a mismatch, and that the resulting PeerConnection's mux passthroughs work end-to-end.
+
+mod tls_harness;
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use dig_ip::LocalStack;
-use dig_nat::config::LocalIdentity;
 use dig_nat::dialer::{HappyEyeballsConfig, MtlsDialer};
-use dig_nat::identity::peer_id_from_leaf_cert_der;
 use dig_nat::method::{MethodOutcome, TraversalKind};
 use dig_nat::mux::{
     AvailabilityAnswer, AvailabilityItem, AvailabilityRequest, AvailabilityResponse,
 };
 use dig_nat::peer::PeerTarget;
 use dig_nat::strategy::Dialer;
-use dig_nat::{PeerId, PeerSession};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::ServerConfig;
+use dig_nat::{BindingPolicy, NodeCert, PeerId, PeerSession};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-/// Generate a self-signed identity (cert DER, key DER, derived peer_id).
-fn gen() -> (Vec<u8>, Vec<u8>, PeerId) {
-    let c = rcgen::generate_simple_self_signed(vec!["peer.dig".into()]).unwrap();
-    let cert = c.cert.der().to_vec();
-    let key = c.key_pair.serialize_der();
-    let id = peer_id_from_leaf_cert_der(&cert).unwrap();
-    (cert, key, id)
-}
+use tls_harness::test_node;
 
-/// Stand up a loopback mTLS server that presents `server_cert` and, once connected, runs a yamux
-/// SERVER session that answers one availability query + serves accepted streams. Returns its addr.
-async fn spawn_mtls_server(server_cert: Vec<u8>, server_key: Vec<u8>) -> std::net::SocketAddr {
-    // The server accepts any client cert (client auth optional) — we only test server-identity here.
-    let cfg = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![CertificateDer::from(server_cert)],
-            PrivateKeyDer::try_from(server_key).unwrap(),
-        )
-        .unwrap();
-    let acceptor = TlsAcceptor::from(Arc::new(cfg));
+/// Stand up a loopback mTLS server that presents `server`'s CA-signed cert (requiring the client's
+/// cert to chain to the DigNetwork CA) and, once connected, runs a yamux SERVER session that answers
+/// one availability query. Returns its address + the server's `peer_id`.
+async fn spawn_mtls_server(server: &Arc<NodeCert>) -> (std::net::SocketAddr, PeerId) {
+    let server_id = server.peer_id();
+    // dig-tls server config: mutual TLS, verify the client chains to the DigNetwork CA.
+    let server_tls =
+        dig_tls::server_config(server, BindingPolicy::Off).expect("build server config");
+    let acceptor = TlsAcceptor::from(server_tls.config);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     tokio::spawn(async move {
         if let Ok((tcp, _)) = listener.accept().await {
             if let Ok(tls) = acceptor.accept(tcp).await {
-                // Run a yamux server over the accepted mTLS stream; echo availability requests.
                 let mut session = PeerSession::server(tls);
                 while let Some(mut s) = session.accept_stream().await {
                     tokio::spawn(async move {
-                        // If it's an availability request, answer; otherwise echo.
                         if let Ok(req) = AvailabilityRequest::decode(&mut s).await {
                             let resp = AvailabilityResponse {
                                 items: req
@@ -76,22 +63,17 @@ async fn spawn_mtls_server(server_cert: Vec<u8>, server_key: Vec<u8>) -> std::ne
             }
         }
     });
-    addr
-}
-
-fn local_identity() -> LocalIdentity {
-    let (cert, key, _) = gen();
-    LocalIdentity::from_der(cert, key).unwrap()
+    (addr, server_id)
 }
 
 /// Dialing a server whose cert derives the expected peer_id succeeds, verifies identity, and yields
 /// a working multiplexed PeerConnection (availability passthrough round-trips over the real mTLS).
 #[tokio::test]
 async fn dial_success_verifies_identity_and_muxes() {
-    let (scert, skey, server_id) = gen();
-    let addr = spawn_mtls_server(scert, skey).await;
+    let server = test_node("dialer/server-a");
+    let (addr, server_id) = spawn_mtls_server(&server).await;
 
-    let dialer = MtlsDialer::new(local_identity());
+    let dialer = MtlsDialer::new(test_node("dialer/client-a"));
     let peer = PeerTarget::with_addr(server_id, addr, "DIG_MAINNET");
     let outcome = MethodOutcome::single(TraversalKind::Direct, addr);
 
@@ -102,7 +84,6 @@ async fn dial_success_verifies_identity_and_muxes() {
     );
     assert_eq!(conn.method, TraversalKind::Direct);
 
-    // Exercise the PeerConnection passthroughs over the real mTLS+mux link.
     let resp = conn
         .query_availability(vec![AvailabilityItem {
             store_id: "aa".repeat(32),
@@ -117,14 +98,13 @@ async fn dial_success_verifies_identity_and_muxes() {
 }
 
 /// Dialing with a pinned peer_id that does NOT match the server's cert fails the handshake — the
-/// self-authenticating guarantee.
+/// self-authenticating guarantee (now enforced by dig-tls's client verifier).
 #[tokio::test]
 async fn dial_rejects_wrong_peer_id() {
-    let (scert, skey, _server_id) = gen();
-    let addr = spawn_mtls_server(scert, skey).await;
+    let server = test_node("dialer/server-b");
+    let (addr, _server_id) = spawn_mtls_server(&server).await;
 
-    let dialer = MtlsDialer::new(local_identity());
-    // Pin to a different id than the server presents.
+    let dialer = MtlsDialer::new(test_node("dialer/client-b"));
     let wrong = PeerId::from_bytes([0x7fu8; 32]);
     let peer = PeerTarget::with_addr(wrong, addr, "DIG_MAINNET");
     let outcome = MethodOutcome::single(TraversalKind::Direct, addr);
@@ -144,23 +124,18 @@ async fn dial_rejects_wrong_peer_id() {
 /// the real `MtlsDialer` (not just the pure racing helper).
 #[tokio::test]
 async fn dial_falls_back_from_unreachable_ipv6_to_ipv4() {
-    let (scert, skey, server_id) = gen();
-    let addr = spawn_mtls_server(scert, skey).await; // 127.0.0.1:<port> (IPv4 loopback)
+    let server = test_node("dialer/server-c");
+    let (addr, server_id) = spawn_mtls_server(&server).await; // IPv4 loopback
 
-    // A short happy-eyeballs config so the IPv6 attempt fails fast and the fallback is quick. Pin a
-    // dual-stack local stack so the fallback is exercised deterministically regardless of the CI
-    // host's real IPv6 capability (an IPv4-only host would otherwise never attempt the IPv6 leg).
-    let dialer = MtlsDialer::new(local_identity())
+    let dialer = MtlsDialer::new(test_node("dialer/client-c"))
         .with_happy_eyeballs(HappyEyeballsConfig {
             per_attempt_timeout: Duration::from_secs(2),
             stagger: Duration::from_millis(30),
         })
         .with_local_stack(LocalStack::from_flags(true, true));
 
-    // Documentation range 2001:db8::/32 is not routable — the IPv6 attempt fails; IPv4 loopback wins.
     let unreachable_v6: std::net::SocketAddr = "[2001:db8::1]:9".parse().unwrap();
     let peer = PeerTarget::with_addrs(server_id, vec![unreachable_v6, addr], "DIG_MAINNET");
-    // The outcome carries both candidates; dig-ip tries the IPv6 leg first (IPv4 fallback).
     let outcome = MethodOutcome::candidates(TraversalKind::Direct, peer.direct_addrs().to_vec());
 
     let conn = dialer
@@ -182,8 +157,8 @@ async fn dial_falls_back_from_unreachable_ipv6_to_ipv4() {
 /// IMMEDIATELY (dig-ip's `NoCommonFamily`) — it never emits a doomed IPv6 SYN that could only hang.
 #[tokio::test]
 async fn dial_v4_only_host_to_v6_only_peer_is_clean_no_common_family() {
-    let dialer =
-        MtlsDialer::new(local_identity()).with_local_stack(LocalStack::from_flags(false, true));
+    let dialer = MtlsDialer::new(test_node("dialer/client-d"))
+        .with_local_stack(LocalStack::from_flags(false, true));
     let v6_only: std::net::SocketAddr = "[2001:db8::1]:9".parse().unwrap();
     let peer = PeerTarget::with_addr(PeerId::from_bytes([1u8; 32]), v6_only, "DIG_MAINNET");
     let outcome = MethodOutcome::single(TraversalKind::Direct, v6_only);
@@ -195,14 +170,13 @@ async fn dial_v4_only_host_to_v6_only_peer_is_clean_no_common_family() {
         "reports a clean no-common-family error, got: {}",
         err.reason
     );
-    // Crucially NOT a tcp-connect error — no dial was attempted.
     assert!(!err.reason.contains("tcp connect"));
 }
 
 /// Dialing an address with nothing listening fails cleanly (tcp connect error), no panic/hang.
 #[tokio::test]
 async fn dial_tcp_refused_is_clean_error() {
-    let dialer = MtlsDialer::new(local_identity());
+    let dialer = MtlsDialer::new(test_node("dialer/client-e"));
     let peer = PeerTarget::with_addr(
         PeerId::from_bytes([1u8; 32]),
         "127.0.0.1:9".parse().unwrap(),

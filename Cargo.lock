@@ -560,18 +560,17 @@ dependencies = [
 
 [[package]]
 name = "dig-nat"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "dig-constants",
  "dig-identity",
  "dig-ip",
+ "dig-tls",
  "futures",
  "futures-util",
  "igd-next",
- "rcgen",
  "ring",
- "rustls",
  "rustls-pki-types",
  "serde",
  "serde_bytes",
@@ -583,8 +582,27 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "tracing",
- "x509-parser",
  "yamux",
+]
+
+[[package]]
+name = "dig-tls"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d92132ecd0d40254676788e391382cbd2e7743b157df037de0a270f025053847"
+dependencies = [
+ "blst",
+ "chia-bls 0.26.0",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "rustls-webpki 0.102.8",
+ "sha2",
+ "thiserror 2.0.18",
+ "time",
+ "tracing",
+ "x509-parser",
  "zeroize",
 ]
 
@@ -1551,6 +1569,7 @@ dependencies = [
  "ring",
  "rustls-pki-types",
  "time",
+ "x509-parser",
  "yasna",
 ]
 
@@ -1602,12 +1621,22 @@ version = "0.23.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b92b125634d9b795e7beca796cc790df15a7fb38323bf3196fda83292d06b1f"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
- "rustls-webpki",
+ "rustls-webpki 0.103.13",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rustls-pemfile"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]
@@ -1617,6 +1646,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "764899a24af3980067ee14bc143654f297b22eaebfe3c7b6b211920a5a59b046"
 dependencies = [
  "zeroize",
+]
+
+[[package]]
+name = "rustls-webpki"
+version = "0.102.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64ca1bc8749bd4cf37b5ce386cc146580777b4e8572c7b97baf22c83f444bee9"
+dependencies = [
+ "ring",
+ "rustls-pki-types",
+ "untrusted",
 ]
 
 [[package]]
@@ -2356,6 +2396,7 @@ dependencies = [
  "lazy_static",
  "nom",
  "oid-registry",
+ "ring",
  "rusticata-macros",
  "thiserror 1.0.69",
  "time",

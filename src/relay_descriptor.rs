@@ -1,6 +1,6 @@
 //! Relay descriptor verification (#1199) — a self-authenticating (peer_id, addrs, BLS_pub) record.
 //!
-//! On a DIRECT connection the [`crate::cert_binding`] cert extension is the authoritative,
+//! On a DIRECT connection the `dig-tls` cert BLS-binding extension is the authoritative,
 //! tamper-proof `peer_id ↔ BLS_pub` binding. But a node also learns of relays/peers BEFORE dialing —
 //! from PEX/DHT/relay registration records — and #1199's relay store-and-forward routes past a relay
 //! with no direct handshake. Those discovery records must be self-authenticating so a MITM cannot

@@ -8,26 +8,37 @@ strategy, dial behavior, identity model, and conformance points. Keywords **MUST
 
 ## 1. Scope
 
-An implementation of this spec provides `connect(peer, identity, config) -> PeerConnection`, where
-the caller describes the peer once (identity + candidate addresses) and receives a verified,
-multiplexed, encrypted connection. The caller **MUST NOT** be required to choose the traversal
-method; the crate selects it. The traversal technique that established the connection **MUST** be
-reported (`PeerConnection::method`) for observability but **MUST NOT** change how the caller uses the
-connection.
+An implementation of this spec provides `connect(peer, node, config) -> PeerConnection`, where the
+caller describes the peer once (identity + candidate addresses) and passes its own `dig_tls::NodeCert`
+(its mTLS identity) and receives a verified, multiplexed, encrypted connection. The caller **MUST
+NOT** be required to choose the traversal method; the crate selects it. The traversal technique that
+established the connection **MUST** be reported (`PeerConnection::method`) for observability but
+**MUST NOT** change how the caller uses the connection.
 
-## 2. Peer identity + mTLS (unchanged contract)
+## 2. Peer identity + mTLS — delegated to `dig-tls`
+
+The certificate model is owned entirely by the canonical **`dig-tls`** crate (hierarchy L00);
+`dig-nat` (L10) **CONSUMES** it and holds NO cert / mTLS-config / binding / `peer_id` code of its own
+(the duplicated copies were extracted to dig-tls in 0.6.0, so there is exactly one implementation and
+no byte-drift risk). The names below are re-exported from dig-tls for consumer convenience.
 
 - A peer's identity is `peer_id = SHA-256(TLS SubjectPublicKeyInfo DER)`, byte-identical to
-  `dig-gossip`. All node-to-node traffic is mutual TLS. Certificates are self-signed; the key IS the
-  identity (there is no CA).
-- The dialer **MUST** present this node's certificate as the mTLS client certificate and **MUST**
-  reject the handshake unless the remote's derived `peer_id` equals the `peer_id` the caller asked to
-  reach (`PeerIdPinningVerifier`). The verified identity **MUST** be reported on the returned
-  connection.
-- `LocalIdentity::key_der` (this node's PKCS#8 private key DER) **MUST** be held in a zeroizing
-  container (`zeroize::Zeroizing<Vec<u8>>`) so the plaintext key bytes are scrubbed on every clone
-  and drop — `LocalIdentity` is cloned per dial. Implementations **MUST NOT** hold the private key
-  material in a plain, non-zeroizing buffer.
+  `dig-gossip` and to `dig-tls`. All node-to-node traffic is mutual TLS.
+- The local mTLS identity is a `dig_tls::NodeCert`: a per-peer leaf **signed by the shipped public
+  DigNetwork CA** (dig-tls ships the CA cert + key; the CA key is intentionally public — a shared
+  trust-domain marker, the Chia precedent — so real authentication comes from the `peer_id` pin + the
+  BLS binding, never CA-key secrecy). The dialer **MUST** present this `NodeCert` as the mTLS client
+  certificate. Certificates are NO LONGER self-signed as of 0.6.0 — a peer that presents a leaf that
+  does not chain to the DigNetwork CA **MUST** be rejected. (Migration: consumers regenerate their
+  cert as a CA-signed `NodeCert` on adopt.)
+- The rustls mutual-auth `ClientConfig`/`ServerConfig` — including the DigNetwork-CA chain check, the
+  `peer_id` pin, and the #1204 BLS-binding verification — **MUST** be obtained from
+  `dig_tls::client_config` / `dig_tls::server_config`. The dial **MUST** reject the handshake unless
+  the remote's derived `peer_id` equals the `peer_id` the caller asked to reach, and the verified
+  identity (and any bound BLS pubkey) **MUST** be reported on the returned connection.
+- The node's PKCS#8 private key is held by `dig_tls::NodeCert` in a zeroizing container so the
+  plaintext key bytes are scrubbed on drop; `NodeCert` is deliberately not `Clone` and is shared
+  behind an `Arc`, so it is never copied per dial.
 
 ## 2a. Cert BLS-binding — peer_id ↔ BLS G1 identity (NORMATIVE, #1204)
 
@@ -40,8 +51,8 @@ BLS key it does not control for a given `peer_id`.
 
 ### 2a.1 The binding (embedded in the leaf certificate)
 
-- The self-signed mTLS leaf certificate **MUST** carry a custom X.509 extension, OID
-  `1.3.6.1.4.1.58968.1.1` (a DIG provisional private-use arc; canonical), whose value is:
+- The mTLS leaf certificate (a CA-signed `dig_tls::NodeCert`) **MUST** carry a custom X.509 extension,
+  OID `1.3.6.1.4.1.58968.1.1` (a DIG provisional private-use arc; canonical), whose value is:
   `version(1 byte = 0x01) || bls_pub(48 bytes, compressed G1) || bls_sig(96 bytes, G2)`.
 - `bls_sig` **MUST** be a BLS G2 signature (Chia AugScheme) by the node/relay BLS secret key over
   `binding_message = "dig-nat/cert-bls-binding/v1" || SPKI_DER`, where `SPKI_DER` is the leaf's own
@@ -274,8 +285,9 @@ source address. Both properties are REQUIRED, independently of each other:
 ## 7. Configuration + defaults
 
 - `NatConfig` selects the enabled methods (default: all six), the per-method timeout, the relay
-  endpoint (default `dig_constants::DIG_RELAY_URL`, `DIG_RELAY_URL=off` opt-out honored), and the STUN
-  server (default derived from the relay host on port 3478).
+  endpoint (default `dig_constants::DIG_RELAY_URL`, `DIG_RELAY_URL=off` opt-out honored), the STUN
+  server (default derived from the relay host on port 3478), and the peer cert-`binding_policy`
+  (default `Opportunistic`; `connect` applies it to the peer's #1204 cert binding).
 - `HappyEyeballsConfig` defaults to a ~250ms stagger and a generous per-attempt timeout (the strategy
   per-method timeout is the real outer bound).
 
@@ -297,17 +309,19 @@ MethodOutcome.dial_addrs: Vec<SocketAddr>                   // candidates, disco
 // Family selection + happy-eyeballs racing is dig-ip's job (dial-time); dig-nat wires into it:
 dialer::HappyEyeballsConfig { per_attempt_timeout, stagger } // -> dig_ip::DialConfig
 dialer::candidates_from_outcome(&MethodOutcome) -> dig_ip::PeerCandidates
-dialer::MtlsDialer::new(identity).with_happy_eyeballs(cfg).with_local_stack(dig_ip::LocalStack)
+dialer::MtlsDialer::new(Arc<dig_tls::NodeCert>).with_happy_eyeballs(cfg).with_local_stack(dig_ip::LocalStack)
 dialer::MtlsDialer::with_binding_policy(BindingPolicy)      // cert-binding stance (default Opportunistic)
 
-connect(peer, identity, config) -> Result<PeerConnection, NatError>
+connect(peer, &Arc<dig_tls::NodeCert>, config) -> Result<PeerConnection, NatError>
+config.binding_policy: BindingPolicy                        // peer cert-binding stance (default Opportunistic)
 PeerConnection.peer_bls_pub: Option<[u8; 48]>              // verified peer BLS G1 key (§2a)
 
-// Cert BLS-binding (§2a, #1204)
-cert_binding::build_bound_cert(&rcgen::KeyPair, &SecretKey, Vec<String>) -> Result<Vec<u8>, CertBindingError>
-cert_binding::verify_binding_from_leaf_cert(cert_der) -> BindingOutcome  // Bound{bls_pub}/Absent/Invalid
-cert_binding::evaluate(&BindingOutcome, BindingPolicy) -> Result<Option<[u8;48]>, &'static str>
-cert_binding::BindingPolicy { Off, Opportunistic (default), Required }
+// Certificate / mTLS / identity model — RE-EXPORTED from dig-tls (dig-nat owns no copy):
+dig_nat::NodeCert                                           // = dig_tls::NodeCert (CA-signed leaf + key + peer_id)
+dig_nat::PeerId, peer_id_from_tls_spki_der, peer_id_from_leaf_cert_der  // = dig_tls
+dig_nat::BindingPolicy { Off, Opportunistic (default), Required }       // = dig_tls
+dig_nat::verify_binding_from_leaf_cert(cert_der) -> BindingOutcome      // = dig_tls (Bound{bls_pub}/Absent/Invalid)
+dig_nat::{CapturedPeerId, CapturedBlsPub}                   // = dig_tls::verify handles
 
 // Relay descriptor (§2a.4, #1199)
 relay_descriptor::RelayDescriptor { peer_id_spki_hash, bls_pub, addresses, network_id, did, signature }
@@ -325,13 +339,19 @@ relay_descriptor::verify_relay_descriptor(&desc, presented_spki_der, did_resolve
   connects over IPv4; a v4-only host asked for a v6-only peer returns a clean no-common-family error.
 - IPv6 selection: `select_global_ipv6` returns a global-unicast IPv6 and rejects link-local / ULA /
   loopback / unspecified.
-- Identity: `peer_id = SHA-256(SPKI DER)` matches `dig-gossip` (cross-crate conformance test).
-- Cert BLS-binding (§2a, `cert_binding` tests + `tests/mtls.rs`): a cert built by `build_bound_cert`
-  verifies to `Bound{bls_pub}`; a substituted BLS pubkey, a binding replayed onto a different SPKI, a
-  bad G1 point, and a malformed/unknown-version extension all verify to `Invalid`; an un-bound cert is
-  `Absent`. Over a real handshake: Required accepts a bound cert (capturing `peer_bls_pub`) and rejects
-  an un-bound one (anti-downgrade); Opportunistic accepts an un-bound cert and captures the key when
-  present. Relay descriptors reject a tampered signature, a `peer_id_spki_hash` mismatch, a substituted
+- Identity: `peer_id = SHA-256(SPKI DER)` matches `dig-gossip` (`tests/identity.rs` conformance).
+- Cross-crate BLS conformance (`tests/identity.rs`, the extraction's keystone): dig-tls's BLS G1/G2
+  work (via its own `chia-bls`/`blst`) and dig-identity's **MUST** agree byte-for-byte — the same
+  secret scalar derives the same 48-byte G1 pubkey in both, signatures cross-verify in both
+  directions, and the pubkey dig-tls binds into a real `NodeCert` (recovered via
+  `verify_binding_from_leaf_cert`) equals dig-identity's derived pubkey. This is the check dig-tls's
+  `bls.rs` defers to the integration level; it FAILS if a future `chia-bls`/`blst` bump ever diverges.
+- Cert BLS-binding (§2a, verified via re-exported `dig_tls` in `tests/identity.rs` + exhaustively in
+  dig-tls's own suite): a CA-signed `NodeCert` verifies to `Bound{bls_pub}`; a substituted BLS pubkey,
+  a binding replayed onto a different SPKI, a bad G1 point, and a malformed/unknown-version extension
+  all verify to `Invalid`; an un-bound cert is `Absent`. Over a real `MtlsDialer` handshake
+  (`tests/dialer.rs`): the dial verifies the peer's `peer_id`, rejects a mismatch, and muxes. Relay
+  descriptors reject a tampered signature, a `peer_id_spki_hash` mismatch, a substituted
   pubkey, a bad G1 point, and a DID resolving to a different key; an unresolvable DID is tolerated.
 - STUN/PCP anti-spoof: transaction id / MAP nonce samples show CSPRNG-level variation across their
   full byte range (not a wall-clock-derived pattern); `query_reflexive_address` and the PCP

@@ -13,7 +13,7 @@
 # the others so the ordering/fallback strategy is tested with mock methods regardless.
 [package]
 name = "dig-nat"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -31,13 +31,20 @@ categories = ["network-programming"]
 # published 0.5.x on crates.io.
 dig-constants = { version = ">=0.4, <0.6" }
 
+# The CANONICAL DIG peer mTLS crate (L00): the shipped public DigNetwork CA, per-peer `NodeCert`
+# (CA-signed leaf carrying the #1204 BLS-G1 binding), `peer_id = SHA-256(TLS SPKI DER)`, the ready
+# rustls mutual-auth `client_config`/`server_config`, and the binding verify + `BindingPolicy`.
+# dig-nat CONSUMES all of this instead of hand-rolling cert generation / mTLS config / the binding /
+# peer_id (deleted in 0.6.0), so there is exactly ONE implementation of the DIG cert model and no
+# byte-drift risk. dig-tls is L00, so dig-nat (L10) → dig-tls is a valid reference-DOWN edge.
+dig-tls = { version = "0.1" }
+
 # The node/relay BLS12-381 G1 identity primitives (dig-identity slot 0x0010, EIP-2333 path
 # m/12381'/8444'/9'/0'): `sign_message`/`verify_signature` (BLS G2 over the AugScheme),
-# `g1_subgroup_check` (reject small-subgroup / identity points), `public_key_bytes`. dig-nat uses
-# these to (a) self-attest the peer_id↔BLS-pubkey binding embedded in the mTLS leaf cert and
-# (b) verify that binding + signed relay descriptors on every handshake — the anti-substitution ROOT
-# of the recipient-seal family (#1204/#1075/#1199). Sourced from the crates.io release; the `>=0.4.1,
-# <0.5` req resolves to the latest published 0.4.x and guards against a breaking 0.5.
+# `g1_subgroup_check`, `public_key_bytes`. Still needed by `relay_descriptor.rs` to verify signed
+# relay descriptors (#1204/#1199), AND by the cross-crate conformance test that pins dig-tls's binding
+# BLS derivation byte-identical to dig-identity's (the check dig-tls's `bls.rs` doc-comment defers to
+# this integration level). The cert-binding + peer_id use of dig-identity moved to dig-tls.
 dig-identity = { version = ">=0.4.1, <0.5" }
 
 # The ecosystem's single, canonical address-family discovery + IPv6-first happy-eyeballs dial
@@ -66,26 +73,17 @@ yamux = "0.13"
 tokio-util = { version = "0.7", features = ["compat"] }
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 
-# mTLS transport. rustls (pure-Rust, no OpenSSL) so peer-cert capture + a custom verifier that
-# pins peer_id = SHA256(SPKI DER) is straightforward and portable across all target OSes.
+# mTLS transport plumbing. The rustls mutual-auth CONFIGS (with peer_id pinning + BLS binding) come
+# ready-made from `dig_tls::{client_config, server_config}`; dig-nat only needs the connector/acceptor
+# to run the handshake over the raced TCP stream, and `rustls-pki-types` for the placeholder SNI.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = "1"
 # CSPRNG for STUN transaction ids (RFC 5389 §10.1) and PCP MAP nonces (RFC 6887 §11.1) — both are
 # the sole anti-spoof check on their respective UDP responses and MUST be unpredictable, not derived
-# from wall-clock time. `ring` is already pulled in transitively by rustls; declared directly here
-# because dig-nat itself now calls `ring::rand::SystemRandom`, not just rustls internals.
+# from wall-clock time. dig-nat calls `ring::rand::SystemRandom` directly.
 ring = "0.17"
-# Parse the peer leaf certificate to lift the SubjectPublicKeyInfo DER (matches dig-gossip's
-# `peer_id_from_tls_spki_der` — SHA256 of the SPKI raw DER).
-x509-parser = "0.16"
+# SHA-256 for the signed relay-descriptor digest (`relay_descriptor.rs`).
 sha2 = "0.10"
-
-# Build the self-signed leaf certificate that CARRIES the BLS-binding X.509 extension
-# (`cert_binding::build_bound_cert`). rcgen is the maintained pure-Rust cert builder; it also
-# supports the custom-OID extension the binding needs. Promoted from a dev-dependency to a real one
-# because dig-nat now generates bound certs as part of its public API (dig-node/dig-relay call it).
-rcgen = "0.13"
 
 # UPnP/IGD port mapping — the one large protocol we don't hand-roll. `igd-next` is the maintained
 # fork of `igd`; its live SSDP+SOAP call sits behind the `TraversalMethod` trait.
@@ -95,17 +93,15 @@ igd-next = { version = "0.17", features = ["aio_tokio"] }
 thiserror = "2"
 tracing = "0.1"
 
-# LocalIdentity.key_der (the node's mTLS private key, PKCS#8 DER) is held in Zeroizing<Vec<u8>> so
-# every clone (one per dial, see dialer.rs) and every drop scrubs the plaintext key bytes from
-# memory instead of leaving them in freed heap (matches the ecosystem's dig-keystore identity-key
-# hygiene, CLAUDE.md SS5.2). Already present transitively (via blst/chia-bls); declared directly
-# because dig-nat's own public type now depends on it.
-zeroize = "1"
-
 [dev-dependencies]
 # Loopback relay + fake IGD + mock methods drive the tests entirely in-process (no real network).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "test-util"] }
 tokio-tungstenite = "0.24"
+# The loopback mTLS tests build a real server config from a `NodeCert` and run the handshake.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls-pki-types = "1"
+# The identity/peer_id tests hash SPKI DER directly to pin the derivation.
+sha2 = "0.10"
 
 [profile.release]
 overflow-checks = true
