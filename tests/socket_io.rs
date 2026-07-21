@@ -203,7 +203,8 @@ async fn stun_query_reflexive_address_against_loopback_server() {
         let (_, from) = server.recv_from(&mut buf).await.unwrap();
         // Echo the transaction id from the request (bytes 8..20).
         let txid: [u8; 12] = buf[8..20].try_into().unwrap();
-        let reflexive = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 55)), 41234);
+        // A genuinely-global reflexive address (documentation ranges are rejected by #1387).
+        let reflexive = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 41234);
         let resp = build_xor_mapped_response(&txid, reflexive);
         server.send_to(&resp, from).await.unwrap();
     });
@@ -213,7 +214,36 @@ async fn stun_query_reflexive_address_against_loopback_server() {
         .await
         .unwrap();
     assert_eq!(got.port(), 41234);
-    assert_eq!(got.ip(), IpAddr::V4(Ipv4Addr::new(203, 0, 113, 55)));
+    assert_eq!(got.ip(), IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+}
+
+/// #1387: a STUN server that returns a NON-GLOBAL/reserved reflexive address (here loopback) must
+/// be rejected — `query_reflexive_address` surfaces `NoMappedAddress` rather than advertising a
+/// bogus address. Guards against a malicious/compromised STUN server (the relay).
+#[tokio::test]
+async fn stun_rejects_reserved_reflexive_address() {
+    let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        let (_, from) = server.recv_from(&mut buf).await.unwrap();
+        let txid: [u8; 12] = buf[8..20].try_into().unwrap();
+        // A reserved (loopback) reflexive — never a legitimate server-reflexive candidate.
+        let bogus = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 41234);
+        let resp = build_xor_mapped_response(&txid, bogus);
+        server.send_to(&resp, from).await.unwrap();
+    });
+
+    let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let err = query_reflexive_address(&client, server_addr, Duration::from_secs(2))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        StunError::NoMappedAddress,
+        "a reserved/non-global reflexive must be rejected as NoMappedAddress"
+    );
 }
 
 /// #179 MEDIUM regression: `query_reflexive_address` previously discarded the datagram source
@@ -228,8 +258,10 @@ async fn stun_ignores_response_from_non_queried_source() {
     let server_addr = server.local_addr().unwrap();
     let attacker = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
 
-    let genuine_reflexive = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 55)), 41234);
-    let poisoned_reflexive = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 66)), 6666);
+    // Both are genuinely-global addresses (documentation ranges are rejected by #1387); the point
+    // of this test is source-address selection, so both must pass the usability guard.
+    let genuine_reflexive = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 41234);
+    let poisoned_reflexive = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 6666);
 
     tokio::spawn(async move {
         let mut buf = [0u8; 512];
@@ -257,6 +289,39 @@ async fn stun_ignores_response_from_non_queried_source() {
     assert_eq!(
         got, genuine_reflexive,
         "must return the server's genuine reflexive address, not the attacker's poisoned one"
+    );
+}
+
+/// #1387 Bug 1: a STUN server that returns an IPv4-mapped IPv6 reflexive smuggling a reserved
+/// IPv4 range (here `::ffff:127.0.0.1`) must be rejected — the guard folds the mapped form to V4
+/// before classifying, so it cannot bypass the V4 predicate. Proves the fix end-to-end through
+/// `decode_mapped_address` (the attacker controls all 16 bytes), not just the predicate in isolation.
+#[tokio::test]
+async fn stun_rejects_ipv4_mapped_reserved_reflexive_address() {
+    let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        let (_, from) = server.recv_from(&mut buf).await.unwrap();
+        let txid: [u8; 12] = buf[8..20].try_into().unwrap();
+        // ::ffff:127.0.0.1 — an IPv4-mapped loopback smuggled as a V6 XOR-MAPPED-ADDRESS.
+        let bogus = SocketAddr::new(
+            IpAddr::V6(Ipv4Addr::new(127, 0, 0, 1).to_ipv6_mapped()),
+            41234,
+        );
+        let resp = build_xor_mapped_v6_response(&txid, bogus);
+        server.send_to(&resp, from).await.unwrap();
+    });
+
+    let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let err = query_reflexive_address(&client, server_addr, Duration::from_secs(2))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        StunError::NoMappedAddress,
+        "an IPv4-mapped reserved reflexive must be rejected, not smuggled past the V6 arm"
     );
 }
 
@@ -315,6 +380,41 @@ fn build_xor_mapped_response(txid: &[u8; 12], addr: SocketAddr) -> Vec<u8> {
     let mut octets = v4.octets();
     for (i, o) in octets.iter_mut().enumerate() {
         *o ^= cookie_be[i];
+    }
+    value.extend_from_slice(&octets);
+
+    let mut attr = Vec::new();
+    attr.extend_from_slice(&0x0020u16.to_be_bytes()); // XOR-MAPPED-ADDRESS
+    attr.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    attr.extend_from_slice(&value);
+
+    let mut msg = Vec::new();
+    msg.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
+    msg.extend_from_slice(&(attr.len() as u16).to_be_bytes());
+    msg.extend_from_slice(&cookie_be);
+    msg.extend_from_slice(txid);
+    msg.extend_from_slice(&attr);
+    msg
+}
+
+/// Build a STUN Binding success response with an XOR-MAPPED-ADDRESS (IPv6). The 16-byte address is
+/// XORed with the cookie‖transaction-id key (RFC 5389 §15.2) — exactly what a malicious server can
+/// forge to smuggle an IPv4-mapped address past a V6-only classifier.
+fn build_xor_mapped_v6_response(txid: &[u8; 12], addr: SocketAddr) -> Vec<u8> {
+    let cookie_be = MAGIC_COOKIE.to_be_bytes();
+    let mut value = vec![0u8]; // reserved
+    value.push(0x02); // IPv6
+    let port = addr.port() ^ ((MAGIC_COOKIE >> 16) as u16);
+    value.extend_from_slice(&port.to_be_bytes());
+    let IpAddr::V6(v6) = addr.ip() else {
+        unreachable!()
+    };
+    let mut octets = v6.octets();
+    let mut key = [0u8; 16];
+    key[..4].copy_from_slice(&cookie_be);
+    key[4..].copy_from_slice(txid);
+    for (o, k) in octets.iter_mut().zip(key.iter()) {
+        *o ^= *k;
     }
     value.extend_from_slice(&octets);
 
