@@ -186,14 +186,22 @@ The behaviour `dig-nat` INHERITS from `dig-ip` (its structural guarantees, teste
   failure and falls through) any reflexive address that is, across BOTH families: unspecified
   (`0.0.0.0`/`::`), loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, `fe80::/10`),
   multicast (`224.0.0.0/4`, `ff00::/8`), a documentation range (`192.0.2.0/24`, `198.51.100.0/24`,
-  `203.0.113.0/24`, `2001:db8::/32`), the IPv4 limited broadcast (`255.255.255.255`), or has
-  `port == 0`. This is a defense against a malicious or misconfigured STUN server (the relay runs one)
-  returning a bogus reflexive address a consumer would then advertise. It is **NOT** a blanket
-  `is_global` filter: PRIVATE (RFC 1918), CGNAT (`100.64.0.0/10`), and IPv6 ULA (`fc00::/7`) addresses
-  are ACCEPTED — they are legitimate reflexive addresses on a LAN or behind carrier-grade NAT, and
-  rejecting them would break LAN/test-network reflexive discovery (including the #1062 EC2 e2e). The
-  pure parser `parse_binding_response` does NOT apply this guard; callers wanting a usable candidate
-  use `query_reflexive_address`.
+  `203.0.113.0/24`, `2001:db8::/32`), the IPv4 limited broadcast (`255.255.255.255`), the IPv4
+  "this-network" block (`0.0.0.0/8`), the 6to4 relay anycast prefix (`192.88.99.0/24`), the
+  benchmarking range (`198.18.0.0/15`), the reserved / class-E block (`240.0.0.0/4`), or has
+  `port == 0`. **IPv4-mapped (`::ffff:a.b.c.d`) and deprecated IPv4-compatible (`::a.b.c.d`) IPv6
+  forms are folded to their IPv4 address BEFORE classification** (`Ipv6Addr::to_ipv4`, which folds
+  both the mapped and the deprecated compatible forms), so a
+  STUN server — which fully controls the 16 decoded address bytes — cannot smuggle a rejected IPv4
+  range (e.g. `::ffff:127.0.0.1`) past the IPv6 arm; the rejection therefore holds identically whether
+  a reserved address arrives as native IPv4 or as a mapped/compat IPv6. This is a defense against a
+  malicious or misconfigured STUN server (the relay runs one) returning a bogus reflexive address a
+  consumer would then advertise. It is **NOT** a blanket `is_global` filter: PRIVATE (RFC 1918), CGNAT
+  (`100.64.0.0/10`), and IPv6 ULA (`fc00::/7`) addresses are ACCEPTED — they are legitimate reflexive
+  addresses on a LAN or behind carrier-grade NAT (a mapped private form such as `::ffff:10.0.0.1` is
+  likewise accepted), and rejecting them would break LAN/test-network reflexive discovery (including
+  the #1062 EC2 e2e). The pure parser `parse_binding_response` does NOT apply this guard; callers
+  wanting a usable candidate use `query_reflexive_address`.
 - **Dialable candidate vs. public-IP-only (NORMATIVE).** `query_reflexive_address(socket, …)` returns
   a **DIALABLE** server-reflexive candidate: it learns the reflexive `ip:port` mapping of the caller's
   OWN listen `socket`, so the port is the real external NAT binding a remote peer can dial. It is the

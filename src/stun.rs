@@ -81,7 +81,18 @@ pub fn encode_binding_request(transaction_id: &[u8; 12]) -> Vec<u8> {
 ///
 /// Returns `false` (reject) for addresses that can never be a legitimate reflexive candidate,
 /// across BOTH families: unspecified, loopback, link-local, multicast, the RFC-5737/3849
-/// documentation ranges, the IPv4 limited-broadcast address, and `port == 0`.
+/// documentation ranges, the IPv4 limited-broadcast address, the never-dialable IPv4 ranges
+/// (`0.0.0.0/8` "this-network", `192.88.99.0/24` 6to4-relay anycast, `198.18.0.0/15` benchmarking,
+/// `240.0.0.0/4` reserved/class-E), and `port == 0`.
+///
+/// # IPv4-mapped / -compatible IPv6 cannot smuggle a rejected IPv4 range
+///
+/// The address is folded to IPv4 BEFORE classification, so an IPv4-mapped (`::ffff:a.b.c.d`) or
+/// deprecated IPv4-compatible (`::a.b.c.d`) form is evaluated as the IPv4 address it represents and
+/// hits the IPv4 predicate. Without this, a malicious STUN server (which fully controls the 16
+/// decoded bytes) could smuggle e.g. `::ffff:127.0.0.1` or the compat form `::7f00:1` past a V6-only
+/// classifier and induce a peer to self-dial loopback / the same LAN. [`Ipv6Addr::to_ipv4`] folds
+/// BOTH forms (stable since Rust 1.0), unlike `to_canonical` which folds only the mapped form.
 ///
 /// # Why this is NOT a blanket `is_global`
 ///
@@ -95,28 +106,55 @@ fn is_usable_reflexive_addr(addr: &SocketAddr) -> bool {
     if addr.port() == 0 {
         return false;
     }
+    // Fold IPv4-mapped/-compatible IPv6 to V4 first so those forms cannot bypass the V4 predicate
+    // (an on-path STUN server controls every decoded byte — see the doc-comment). `to_ipv4` folds
+    // both `::ffff:a.b.c.d` and the deprecated `::a.b.c.d`; a genuine native V6 yields `None`.
     match addr.ip() {
-        IpAddr::V4(v4) => {
-            !v4.is_unspecified()
-                && !v4.is_loopback()
-                && !v4.is_link_local()
-                && !v4.is_multicast()
-                && !v4.is_broadcast()
-                && !v4.is_documentation()
-        }
-        IpAddr::V6(v6) => {
-            let seg = v6.segments();
-            // fe80::/10 — link-local unicast (`is_unicast_link_local` is unstable, check manually).
-            let is_link_local = (seg[0] & 0xffc0) == 0xfe80;
-            // 2001:db8::/32 — documentation (`is_documentation` is unstable, check manually).
-            let is_documentation = seg[0] == 0x2001 && seg[1] == 0x0db8;
-            !v6.is_unspecified()
-                && !v6.is_loopback()
-                && !v6.is_multicast()
-                && !is_link_local
-                && !is_documentation
-        }
+        IpAddr::V4(v4) => is_usable_reflexive_v4(v4),
+        IpAddr::V6(v6) => match v6.to_ipv4() {
+            Some(v4) => is_usable_reflexive_v4(v4),
+            None => is_usable_reflexive_v6(v6),
+        },
     }
+}
+
+/// The IPv4 reflexive predicate: reject only the ranges that are *never* a valid dial target,
+/// keeping private/CGNAT accepted (see [`is_usable_reflexive_addr`]).
+fn is_usable_reflexive_v4(v4: Ipv4Addr) -> bool {
+    let [a, b, _, _] = v4.octets();
+    // `0.0.0.0/8` "this-network" (RFC 1122) — non-zero hosts here are not dialable either.
+    let is_this_network = a == 0;
+    // `192.88.99.0/24` — 6to4 relay anycast (RFC 7526), not a unicast dial target.
+    let is_6to4_relay_anycast = v4.octets()[..3] == [192, 88, 99];
+    // `198.18.0.0/15` — benchmarking (RFC 2544).
+    let is_benchmarking = a == 198 && (b & 0xfe) == 18;
+    // `240.0.0.0/4` — reserved / class-E (RFC 1112), incl. the 255.255.255.255 broadcast.
+    let is_reserved_class_e = a >= 240;
+    !v4.is_unspecified()
+        && !v4.is_loopback()
+        && !v4.is_link_local()
+        && !v4.is_multicast()
+        && !v4.is_broadcast()
+        && !v4.is_documentation()
+        && !is_this_network
+        && !is_6to4_relay_anycast
+        && !is_benchmarking
+        && !is_reserved_class_e
+}
+
+/// The genuine-native-IPv6 reflexive predicate. Only ever sees real V6 addresses — mapped/compat
+/// forms are folded to V4 by [`is_usable_reflexive_addr`] before this is reached.
+fn is_usable_reflexive_v6(v6: Ipv6Addr) -> bool {
+    let seg = v6.segments();
+    // fe80::/10 — link-local unicast (`is_unicast_link_local` is unstable, check manually).
+    let is_link_local = (seg[0] & 0xffc0) == 0xfe80;
+    // 2001:db8::/32 — documentation (`is_documentation` is unstable, check manually).
+    let is_documentation = seg[0] == 0x2001 && seg[1] == 0x0db8;
+    !v6.is_unspecified()
+        && !v6.is_loopback()
+        && !v6.is_multicast()
+        && !is_link_local
+        && !is_documentation
 }
 
 /// Parse a STUN **Binding success response**, returning the reflexive [`SocketAddr`] from its
@@ -453,5 +491,40 @@ mod reflexive_guard_tests {
         assert!(!is_usable_reflexive_addr(&addr("[febf::1]:1234"))); // link-local upper edge
         assert!(!is_usable_reflexive_addr(&addr("[ff02::1]:1234"))); // multicast ff00::/8
         assert!(!is_usable_reflexive_addr(&addr("[2001:db8::1]:1234"))); // documentation 2001:db8::/32
+    }
+
+    #[test]
+    fn rejects_ipv4_mapped_and_compat_smuggling_reserved_ranges() {
+        // Bug 1: an on-path STUN server controls the 16 decoded bytes and could smuggle any rejected
+        // IPv4 range as an IPv4-mapped (`::ffff:a.b.c.d`) or deprecated IPv4-compat (`::a.b.c.d`)
+        // address. After to_canonical folding these MUST hit the V4 predicate and be rejected.
+        assert!(!is_usable_reflexive_addr(&addr("[::ffff:127.0.0.1]:1234"))); // mapped loopback
+        assert!(!is_usable_reflexive_addr(&addr(
+            "[::ffff:169.254.1.1]:1234"
+        ))); // mapped link-local
+        assert!(!is_usable_reflexive_addr(&addr("[::ffff:224.0.0.1]:1234"))); // mapped multicast
+        assert!(!is_usable_reflexive_addr(&addr("[::ffff:192.0.2.1]:1234"))); // mapped TEST-NET-1
+        assert!(!is_usable_reflexive_addr(&addr(
+            "[::ffff:255.255.255.255]:1234"
+        ))); // mapped broadcast
+        assert!(!is_usable_reflexive_addr(&addr("[::ffff:0.0.0.0]:1234"))); // mapped unspecified
+        assert!(!is_usable_reflexive_addr(&addr("[::7f00:1]:1234"))); // compat 127.0.0.1
+    }
+
+    #[test]
+    fn accepts_ipv4_mapped_private() {
+        // The accept-private design survives folding: a mapped private address is still ACCEPTED.
+        assert!(is_usable_reflexive_addr(&addr("[::ffff:10.0.0.1]:9000")));
+    }
+
+    #[test]
+    fn rejects_never_dialable_ipv4_ranges() {
+        // Bug 2: never-dialable ranges the stdlib predicates miss (their unstable helpers can't be
+        // called, so the masks are hand-rolled).
+        assert!(!is_usable_reflexive_addr(&addr("198.18.0.1:1234"))); // benchmarking 198.18.0.0/15
+        assert!(!is_usable_reflexive_addr(&addr("198.19.0.1:1234"))); // benchmarking upper half
+        assert!(!is_usable_reflexive_addr(&addr("240.0.0.1:1234"))); // reserved/class-E 240.0.0.0/4
+        assert!(!is_usable_reflexive_addr(&addr("0.1.2.3:1234"))); // this-network 0.0.0.0/8 non-zero host
+        assert!(!is_usable_reflexive_addr(&addr("192.88.99.1:1234"))); // 6to4 relay anycast
     }
 }
