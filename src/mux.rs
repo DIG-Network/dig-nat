@@ -31,9 +31,12 @@
 //! the CONTENT layer above dig-nat; dig-nat carries these frames faithfully over the mux transport.
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::Notify;
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
 /// One logical, bidirectional stream to the peer — a tokio [`AsyncRead`] + [`AsyncWrite`]. Reads
@@ -290,6 +293,44 @@ pub struct PeerSession {
     /// Inbound streams opened BY the peer (server role / bidirectional use). A pure client can
     /// ignore this; a serving node reads accepted range-request streams from here.
     inbound_rx: tokio::sync::mpsc::Receiver<PeerStream>,
+    /// Set + notified when the driver task ends (the underlying byte stream closed — a clean close or
+    /// a transport error). Observed via [`Self::closed_handle`] so fast-connect can detect a transport
+    /// dying and fall back without holding the session lock.
+    closed_flag: Arc<AtomicBool>,
+    closed_notify: Arc<Notify>,
+}
+
+/// A cheap, cloneable observer of a [`PeerSession`]'s underlying byte stream closing (the mux driver
+/// task ending — a clean close OR a transport error). Fast-connect's promotion guard holds one to
+/// detect the active transport dying and fall back to another tier, without locking the session.
+#[derive(Clone)]
+pub struct ClosedHandle {
+    flag: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl ClosedHandle {
+    /// Whether the session's transport has already closed.
+    pub fn is_closed(&self) -> bool {
+        self.flag.load(Ordering::Acquire)
+    }
+
+    /// Resolve once the session's transport has closed (returns immediately if already closed).
+    pub async fn closed(&self) {
+        loop {
+            if self.flag.load(Ordering::Acquire) {
+                return;
+            }
+            // Arm the wait, then re-check the flag: the driver sets the flag BEFORE
+            // `notify_waiters`, so a close that races this arming is caught by the recheck (no lost
+            // wakeup).
+            let notified = self.notify.notified();
+            if self.flag.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 impl std::fmt::Debug for PeerSession {
@@ -327,8 +368,29 @@ impl PeerSession {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<MuxCommand>(64);
         let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<PeerStream>(64);
         let conn = yamux::Connection::new(io.compat(), yamux::Config::default(), mode);
-        tokio::spawn(drive_connection(conn, cmd_rx, inbound_tx));
-        PeerSession { cmd_tx, inbound_rx }
+        let closed_flag = Arc::new(AtomicBool::new(false));
+        let closed_notify = Arc::new(Notify::new());
+        tokio::spawn(drive_connection(
+            conn,
+            cmd_rx,
+            inbound_tx,
+            Arc::clone(&closed_flag),
+            Arc::clone(&closed_notify),
+        ));
+        PeerSession {
+            cmd_tx,
+            inbound_rx,
+            closed_flag,
+            closed_notify,
+        }
+    }
+
+    /// A cloneable observer of this session's transport closing — see [`ClosedHandle`].
+    pub fn closed_handle(&self) -> ClosedHandle {
+        ClosedHandle {
+            flag: Arc::clone(&self.closed_flag),
+            notify: Arc::clone(&self.closed_notify),
+        }
     }
 
     /// Open a new outbound logical stream to the peer. Cheap — open as many as you need to run
@@ -391,6 +453,8 @@ async fn drive_connection<T>(
     mut conn: yamux::Connection<T>,
     mut cmd_rx: tokio::sync::mpsc::Receiver<MuxCommand>,
     inbound_tx: tokio::sync::mpsc::Sender<PeerStream>,
+    closed_flag: Arc<AtomicBool>,
+    closed_notify: Arc<Notify>,
 ) where
     T: futures::AsyncRead + futures::AsyncWrite + Send + Unpin + 'static,
 {
@@ -408,7 +472,7 @@ async fn drive_connection<T>(
                     None => {
                         // Session dropped — close the connection and end the driver.
                         let _ = poll_fn(|cx| conn.poll_close(cx)).await;
-                        return;
+                        break;
                     }
                 }
             }
@@ -421,10 +485,15 @@ async fn drive_connection<T>(
                     }
                     Some(Err(_)) | None => {
                         // Connection closed / errored — end the driver.
-                        return;
+                        break;
                     }
                 }
             }
         }
     }
+
+    // The transport is gone: publish closure (flag BEFORE notify, so `ClosedHandle::closed`'s
+    // arm-then-recheck can never miss the wakeup).
+    closed_flag.store(true, Ordering::Release);
+    closed_notify.notify_waiters();
 }

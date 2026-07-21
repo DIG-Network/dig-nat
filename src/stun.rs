@@ -145,6 +145,9 @@ fn is_usable_reflexive_v4(v4: Ipv4Addr) -> bool {
 /// The genuine-native-IPv6 reflexive predicate. Only ever sees real V6 addresses — mapped/compat
 /// forms are folded to V4 by [`is_usable_reflexive_addr`] before this is reached.
 fn is_usable_reflexive_v6(v6: Ipv6Addr) -> bool {
+    // NOTE: `::1` (IPv6 loopback) never reaches here — `to_ipv4()` folds it to `0.0.0.1`, which the
+    // v4 `0.0.0.0/8` "this-network" rule in `is_usable_reflexive_v4` rejects. That v4 rule is
+    // therefore LOAD-BEARING for this predicate; do NOT drop it as "redundant" in a future cleanup.
     let seg = v6.segments();
     // fe80::/10 — link-local unicast (`is_unicast_link_local` is unstable, check manually).
     let is_link_local = (seg[0] & 0xffc0) == 0xfe80;
@@ -497,7 +500,7 @@ mod reflexive_guard_tests {
     fn rejects_ipv4_mapped_and_compat_smuggling_reserved_ranges() {
         // Bug 1: an on-path STUN server controls the 16 decoded bytes and could smuggle any rejected
         // IPv4 range as an IPv4-mapped (`::ffff:a.b.c.d`) or deprecated IPv4-compat (`::a.b.c.d`)
-        // address. After to_canonical folding these MUST hit the V4 predicate and be rejected.
+        // address. After to_ipv4 folding these MUST hit the V4 predicate and be rejected.
         assert!(!is_usable_reflexive_addr(&addr("[::ffff:127.0.0.1]:1234"))); // mapped loopback
         assert!(!is_usable_reflexive_addr(&addr(
             "[::ffff:169.254.1.1]:1234"

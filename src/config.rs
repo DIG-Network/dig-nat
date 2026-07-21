@@ -40,7 +40,15 @@ pub struct NatConfig {
     /// anti-downgrade). Verified via `dig-tls`; the verified peer BLS pubkey lands on
     /// [`crate::PeerConnection::peer_bls_pub`].
     pub binding_policy: BindingPolicy,
+    /// Fast-connect ([`crate::connect_fast`]) drain window: after a live relayed→direct promotion,
+    /// how long to keep the swapped-out relayed transport alive for in-flight streams to finish
+    /// before dropping it (releasing the per-peer relay tunnel). A short cap bounds the worst case
+    /// (a stuck stream can't pin the tunnel forever); request-scoped streams finish well within it.
+    pub fast_connect_grace: Duration,
 }
+
+/// The default [`NatConfig::fast_connect_grace`] post-promotion drain window.
+pub const DEFAULT_FAST_CONNECT_GRACE: Duration = Duration::from_secs(5);
 
 /// The standard STUN port (RFC 5389). The DIG relay serves STUN here, co-located with the relay host
 /// (`relay.dig.net:3478`); a node derives its STUN host from `DIG_RELAY_URL` (L7 spec §3).
@@ -61,6 +69,7 @@ impl Default for NatConfig {
             relay_endpoint: dig_constants::DIG_RELAY_URL.to_string(),
             stun_server: None,
             binding_policy: BindingPolicy::Opportunistic,
+            fast_connect_grace: DEFAULT_FAST_CONNECT_GRACE,
         }
     }
 }
@@ -121,6 +130,13 @@ impl NatConfigBuilder {
     /// payloads to peers (fail-closed, anti-downgrade).
     pub fn binding_policy(mut self, policy: BindingPolicy) -> Self {
         self.cfg.binding_policy = policy;
+        self
+    }
+
+    /// Set the fast-connect ([`crate::connect_fast`]) post-promotion drain window (default
+    /// [`DEFAULT_FAST_CONNECT_GRACE`]). A test uses a tiny value for fast, deterministic teardown.
+    pub fn fast_connect_grace(mut self, grace: Duration) -> Self {
+        self.cfg.fast_connect_grace = grace;
         self
     }
 
