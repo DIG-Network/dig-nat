@@ -65,6 +65,7 @@
 pub mod config;
 pub mod dialer;
 pub mod error;
+pub mod fast_connect;
 pub mod method;
 pub mod mux;
 pub mod peer;
@@ -92,6 +93,7 @@ pub use dig_tls::{
 
 pub use config::{NatConfig, NatConfigBuilder};
 pub use error::{MethodError, NatError};
+pub use fast_connect::{connect_fast, FastPeerConnection, FastPeerStream};
 pub use method::hole_punch::{HolePunchCoordinator, HolePunchMethod};
 pub use method::relayed::{
     RelayedDialMethod, RelayedDialer, RelayedTransport, ReservationRelayedTransport,
@@ -99,8 +101,8 @@ pub use method::relayed::{
 pub use method::upnp::{IgdGateway, RealIgd, UpnpMethod};
 pub use method::{TraversalKind, TraversalMethod};
 pub use mux::{
-    AvailabilityAnswer, AvailabilityItem, AvailabilityRequest, AvailabilityResponse, PeerSession,
-    PeerStream, RangeFrame, RangeRequest,
+    AvailabilityAnswer, AvailabilityItem, AvailabilityRequest, AvailabilityResponse, ClosedHandle,
+    PeerSession, PeerStream, RangeFrame, RangeRequest,
 };
 pub use peer::{PeerConnection, PeerTarget};
 pub use relay_descriptor::{verify_relay_descriptor, RelayDescriptor, RelayDescriptorError};

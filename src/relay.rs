@@ -433,6 +433,14 @@ impl RelayStatus {
         self.tunnels.lock().unwrap().remove(target_peer);
     }
 
+    /// Whether a relayed tunnel to `target_peer` is currently registered — the test hook fast-connect
+    /// uses to assert the per-peer tunnel was released (dropped) after a relayed→direct promotion,
+    /// while the reservation itself stays held.
+    #[cfg(test)]
+    pub(crate) fn open_tunnel_exists(&self, target_peer: &str) -> bool {
+        self.tunnels.lock().unwrap().contains_key(target_peer)
+    }
+
     /// A JSON snapshot for a `control.relayStatus`-style RPC. `state` is the canonical truth;
     /// `connected` is a convenience boolean (== `state == connected`).
     pub fn snapshot_json(&self, endpoint: &str, peer_id: &str) -> serde_json::Value {

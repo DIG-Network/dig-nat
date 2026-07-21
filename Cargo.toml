@@ -13,7 +13,7 @@
 # the others so the ordering/fallback strategy is tested with mock methods regardless.
 [package]
 name = "dig-nat"
-version = "0.8.1"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -72,6 +72,12 @@ serde_bytes = "0.11"
 yamux = "0.13"
 tokio-util = { version = "0.7", features = ["compat"] }
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+
+# Lock-free atomic swap of the current transport slot for fast-connect's live relayed→direct
+# promotion: `open_stream` loads the active transport and promotion atomically stores the new one,
+# so NEW streams route to the promoted transport while in-flight streams drain on the old one (no
+# reader/writer blocking on a swap).
+arc-swap = "1"
 
 # mTLS transport plumbing. The rustls mutual-auth CONFIGS (with peer_id pinning + BLS binding) come
 # ready-made from `dig_tls::{client_config, server_config}`; dig-nat only needs the connector/acceptor
