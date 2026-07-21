@@ -168,6 +168,18 @@ The behaviour `dig-nat` INHERITS from `dig-ip` (its structural guarantees, teste
 
 - **STUN (RFC 5389)** parses BOTH `FAMILY_IPV4` and `FAMILY_IPV6` XOR-MAPPED-ADDRESS attributes;
   reflexive-address discovery is family-agnostic.
+- **Reflexive discovery is happy-eyeballs across BOTH families (NORMATIVE, CLAUDE.md §5.2).**
+  `stun::discover_reflexive_address(stun_servers, local, timeout)` races a STUN Binding transaction
+  over the `local ∩ stun_servers` family intersection via `dig_ip::connect` — **IPv6-first with IPv4
+  FALLBACK**. Callers MUST pass STUN endpoints across BOTH families (e.g. every A + AAAA record of the
+  relay's `host:3478`) and MUST NOT pre-collapse `to_socket_addrs()` to a single family. The reflexive
+  address is **NEVER** nulled just because the IPv6 STUN server was unreachable: an IPv4-only host (or
+  a dual-stack host whose IPv6 STUN server does not answer) falls back to the reachable IPv4 STUN
+  server and returns its reflexive address. Returns `None` only when no family's STUN server answered
+  within `timeout` (or the candidate list is empty). This is the canonical fix for the #1062 gap where
+  an IPv4-only EC2 host stranded on the IPv6 STUN address (`reflexive_addr:null`) and advertised only
+  its private VPC IP; per the dig-ip charter, NO consumer hand-rolls a family sort or happy-eyeballs
+  racer — this function is the single front door.
 - **PCP (RFC 6887)** uses 16-byte (128-bit) address fields throughout and is IPv6-capable (IPv4 is
   encoded as an IPv4-mapped IPv6 address).
 - **UPnP/IGD** and **NAT-PMP (RFC 6886)** are protocol-inherently IPv4 (they map an inbound IPv4

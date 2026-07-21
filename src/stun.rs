@@ -236,6 +236,63 @@ pub async fn query_reflexive_address(
     }
 }
 
+/// Discover this node's server-reflexive (public) address via STUN, IPv6-first with IPv4 FALLBACK
+/// (CLAUDE.md §5.2). `stun_servers` are the resolved STUN endpoints across BOTH families (e.g. every
+/// A + AAAA record of `<relay-host>:3478` — the caller MUST NOT pre-collapse to one family). The STUN
+/// Binding transaction is raced over the local∩server family intersection via [`dig_ip::connect`]:
+/// IPv6 is attempted first and IPv4 is used as a fallback when the IPv6 STUN server is unreachable —
+/// the reflexive address is NEVER nulled just because the IPv6 STUN server did not respond. Returns
+/// the discovered reflexive [`SocketAddr`], or `None` when no family's STUN server answered.
+///
+/// This is the canonical front-door fix for the #1062 gap: consumers (dig-node) MUST call this
+/// instead of hand-rolling a family sort or collapsing `to_socket_addrs()` to a single family — the
+/// happy-eyeballs racer and the local∩server intersection live here, in ONE place, per the dig-ip
+/// charter ("NO repo hand-rolls a family sort or happy-eyeballs racer").
+pub async fn discover_reflexive_address(
+    stun_servers: &[SocketAddr],
+    local: dig_ip::LocalStack,
+    timeout: Duration,
+) -> Option<SocketAddr> {
+    if stun_servers.is_empty() {
+        return None;
+    }
+
+    let mut candidates = dig_ip::PeerCandidates::new();
+    candidates.extend(
+        stun_servers.iter().copied(),
+        dig_ip::CandidateSource::StunReflexive,
+    );
+
+    let config = dig_ip::DialConfig {
+        per_attempt_timeout: timeout,
+        ..Default::default()
+    };
+
+    // One "dial" == one full STUN Binding transaction against a candidate server. We bind an
+    // ephemeral UDP socket in the SERVER's family (dig-ip only hands us a family the local host can
+    // originate on) and learn that socket's reflexive mapping. The racer returns the first family's
+    // successful reflexive address, preferring IPv6.
+    let winner = dig_ip::connect(&local, &candidates, config, |stun_addr| async move {
+        let bind: SocketAddr = if stun_addr.is_ipv6() {
+            (Ipv6Addr::UNSPECIFIED, 0).into()
+        } else {
+            (Ipv4Addr::UNSPECIFIED, 0).into()
+        };
+        let socket = UdpSocket::bind(bind)
+            .await
+            .map_err(|e| format!("bind {bind}: {e}"))?;
+        query_reflexive_address(&socket, stun_addr, timeout)
+            .await
+            .map_err(|e| e.to_string())
+    })
+    .await;
+
+    match winner {
+        Ok(w) => Some(w.conn),
+        Err(_) => None,
+    }
+}
+
 /// Generate a 96-bit STUN transaction id from a CSPRNG (RFC 5389 §10.1: "It primarily serves to
 /// correlate requests with responses... **and MUST be uniformly and randomly chosen from the
 /// interval 0 .. 2**96 - 1, and SHOULD be cryptographically random").
