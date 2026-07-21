@@ -47,8 +47,11 @@ pub enum StunError {
     /// The transaction id in the response did not match the request (possible spoof / stale reply).
     #[error("STUN transaction id mismatch")]
     TransactionIdMismatch,
-    /// The message parsed but carried no usable mapped-address attribute.
-    #[error("no mapped address in STUN response")]
+    /// The message parsed but carried no usable mapped address: either no (XOR-)MAPPED-ADDRESS
+    /// attribute at all, OR a parsed address that failed the reflexive-usability guard
+    /// ([`is_usable_reflexive_addr`] — e.g. a non-global/reserved address such as loopback,
+    /// link-local, multicast, a documentation range, or `port == 0`).
+    #[error("no usable mapped address in STUN response")]
     NoMappedAddress,
     /// The message type was not a Binding success response.
     #[error("unexpected STUN message type: {0:#06x}")]
@@ -72,11 +75,60 @@ pub fn encode_binding_request(transaction_id: &[u8; 12]) -> Vec<u8> {
     msg
 }
 
+/// Whether a parsed reflexive [`SocketAddr`] is usable as a server-reflexive candidate — a
+/// defense-in-depth guard against a malicious or misconfigured STUN server (the relay runs one)
+/// returning a bogus address that a consumer would then advertise (#1387).
+///
+/// Returns `false` (reject) for addresses that can never be a legitimate reflexive candidate,
+/// across BOTH families: unspecified, loopback, link-local, multicast, the RFC-5737/3849
+/// documentation ranges, the IPv4 limited-broadcast address, and `port == 0`.
+///
+/// # Why this is NOT a blanket `is_global`
+///
+/// PRIVATE (RFC 1918 `10/8`, `172.16/12`, `192.168/16`), CGNAT (RFC 6598 `100.64/10`), and IPv6
+/// ULA (`fc00::/7`) addresses are deliberately ACCEPTED. They are genuinely valid reflexive
+/// addresses on a LAN or behind carrier-grade NAT — a peer on the same LAN/CGNAT region reaches
+/// them directly. Rejecting them would break LAN and test-network reflexive discovery, including
+/// the #1062 EC2 e2e where nodes learn a private VPC reflexive address. This guard removes only
+/// the addresses that are *never* a valid dial target, not merely non-public ones.
+fn is_usable_reflexive_addr(addr: &SocketAddr) -> bool {
+    if addr.port() == 0 {
+        return false;
+    }
+    match addr.ip() {
+        IpAddr::V4(v4) => {
+            !v4.is_unspecified()
+                && !v4.is_loopback()
+                && !v4.is_link_local()
+                && !v4.is_multicast()
+                && !v4.is_broadcast()
+                && !v4.is_documentation()
+        }
+        IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            // fe80::/10 — link-local unicast (`is_unicast_link_local` is unstable, check manually).
+            let is_link_local = (seg[0] & 0xffc0) == 0xfe80;
+            // 2001:db8::/32 — documentation (`is_documentation` is unstable, check manually).
+            let is_documentation = seg[0] == 0x2001 && seg[1] == 0x0db8;
+            !v6.is_unspecified()
+                && !v6.is_loopback()
+                && !v6.is_multicast()
+                && !is_link_local
+                && !is_documentation
+        }
+    }
+}
+
 /// Parse a STUN **Binding success response**, returning the reflexive [`SocketAddr`] from its
 /// `XOR-MAPPED-ADDRESS` (preferred) or legacy `MAPPED-ADDRESS` attribute.
 ///
 /// Validates the magic cookie and (when `expected_txid` is `Some`) the transaction id, so a stale
 /// or spoofed datagram is rejected. Implements the XOR de-obfuscation of RFC 5389 §15.2.
+///
+/// This is a PURE parser: it does NOT check whether the returned address is a usable
+/// (non-reserved, globally/LAN-dialable) reflexive candidate. A caller wanting a usable
+/// server-reflexive candidate should use [`query_reflexive_address`], which applies the
+/// [`is_usable_reflexive_addr`] guard on top of parsing.
 pub fn parse_binding_response(
     msg: &[u8],
     expected_txid: Option<&[u8; 12]>,
@@ -191,8 +243,17 @@ fn decode_mapped_address(
 /// discovered reflexive (public) [`SocketAddr`] of `socket`. Bounded by `timeout`; a lost datagram
 /// surfaces as [`StunError::Timeout`] (the caller retries or falls through to the next method).
 ///
+/// This is **THE API to obtain a DIALABLE server-reflexive candidate**: it returns the reflexive
+/// `ip:port` mapping of the caller's OWN listen socket, so the port is the real external binding a
+/// remote peer can dial (unlike [`discover_reflexive_address`], which learns the public IP over a
+/// throwaway ephemeral socket — see its `## Port caveat`). Connectivity-core (dig-node) should STUN
+/// from its actual listen socket via this function to advertise a dialable candidate.
+///
 /// The `socket` should be the very UDP socket whose external mapping the caller wants to learn —
 /// the reflexive address is specific to the NAT binding created by *that* socket.
+///
+/// The returned address is checked against [`is_usable_reflexive_addr`]: a parsed-but-unusable
+/// (non-global/reserved) reflexive address is rejected as [`StunError::NoMappedAddress`] (#1387).
 ///
 /// ## Anti-spoof: source address validation (#179 finding 2)
 ///
@@ -232,7 +293,15 @@ pub async fn query_reflexive_address(
             // Not from the queried server — ignore and keep waiting for the genuine reply.
             continue;
         }
-        return parse_binding_response(&buf[..n], Some(&txid));
+        let addr = parse_binding_response(&buf[..n], Some(&txid))?;
+        // Defense-in-depth (#1387): a malicious/misconfigured STUN server can return a bogus
+        // reflexive address (loopback, multicast, a documentation range, port 0, …) that we would
+        // otherwise advertise. Reject any address that is not a usable reflexive candidate; the
+        // caller (or `discover_reflexive_address`) then falls through to the next candidate.
+        if !is_usable_reflexive_addr(&addr) {
+            return Err(StunError::NoMappedAddress);
+        }
+        return Ok(addr);
     }
 }
 
@@ -248,6 +317,14 @@ pub async fn query_reflexive_address(
 /// instead of hand-rolling a family sort or collapsing `to_socket_addrs()` to a single family — the
 /// happy-eyeballs racer and the local∩server intersection live here, in ONE place, per the dig-ip
 /// charter ("NO repo hand-rolls a family sort or happy-eyeballs racer").
+///
+/// ## Port caveat
+///
+/// Each candidate is STUNed over a THROWAWAY ephemeral UDP socket bound just for that transaction,
+/// so the returned IP is the node's stable public IP but the **PORT is that throwaway socket's NAT
+/// binding — NOT reliably dialable** under most NAT types (a remote peer dialing it will usually
+/// fail). Use this to learn the public IP; for a DIALABLE server-reflexive candidate, STUN from
+/// your ACTUAL listen socket via [`query_reflexive_address`] instead.
 pub async fn discover_reflexive_address(
     stun_servers: &[SocketAddr],
     local: dig_ip::LocalStack,
@@ -317,4 +394,64 @@ pub fn new_transaction_id() -> [u8; 12] {
         .fill(&mut id)
         .expect("OS CSPRNG must be available to generate a STUN transaction id");
     id
+}
+
+#[cfg(test)]
+mod reflexive_guard_tests {
+    //! Unit tests for the private [`is_usable_reflexive_addr`] guard (#1387). Covers every reject
+    //! category across BOTH families, and asserts private/CGNAT/ULA are ACCEPTED (not a blanket
+    //! `is_global` — see the function's doc-comment).
+    use super::is_usable_reflexive_addr;
+    use std::net::SocketAddr;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().expect("valid SocketAddr literal")
+    }
+
+    #[test]
+    fn accepts_genuinely_global_addresses() {
+        assert!(is_usable_reflexive_addr(&addr("1.1.1.1:443")));
+        assert!(is_usable_reflexive_addr(&addr("8.8.8.8:53")));
+        assert!(is_usable_reflexive_addr(&addr(
+            "[2606:4700:4700::1111]:443"
+        )));
+    }
+
+    #[test]
+    fn accepts_private_cgnat_and_ula() {
+        // NOT rejected: legitimate reflexive addresses on a LAN / behind CGNAT (#1062 e2e).
+        assert!(is_usable_reflexive_addr(&addr("192.168.1.5:9000")));
+        assert!(is_usable_reflexive_addr(&addr("10.0.0.7:9000")));
+        assert!(is_usable_reflexive_addr(&addr("172.16.5.5:9000")));
+        assert!(is_usable_reflexive_addr(&addr("100.64.0.1:9000"))); // CGNAT (RFC 6598)
+        assert!(is_usable_reflexive_addr(&addr("[fd00::1]:9000"))); // ULA (fc00::/7)
+    }
+
+    #[test]
+    fn rejects_port_zero() {
+        assert!(!is_usable_reflexive_addr(&addr("1.1.1.1:0")));
+        assert!(!is_usable_reflexive_addr(&addr("[2606:4700:4700::1111]:0")));
+    }
+
+    #[test]
+    fn rejects_reserved_ipv4() {
+        assert!(!is_usable_reflexive_addr(&addr("0.0.0.0:1234"))); // unspecified
+        assert!(!is_usable_reflexive_addr(&addr("127.0.0.1:1234"))); // loopback
+        assert!(!is_usable_reflexive_addr(&addr("169.254.1.1:1234"))); // link-local
+        assert!(!is_usable_reflexive_addr(&addr("224.0.0.1:1234"))); // multicast
+        assert!(!is_usable_reflexive_addr(&addr("255.255.255.255:1234"))); // broadcast
+        assert!(!is_usable_reflexive_addr(&addr("192.0.2.1:1234"))); // TEST-NET-1
+        assert!(!is_usable_reflexive_addr(&addr("198.51.100.1:1234"))); // TEST-NET-2
+        assert!(!is_usable_reflexive_addr(&addr("203.0.113.1:1234"))); // TEST-NET-3
+    }
+
+    #[test]
+    fn rejects_reserved_ipv6() {
+        assert!(!is_usable_reflexive_addr(&addr("[::]:1234"))); // unspecified
+        assert!(!is_usable_reflexive_addr(&addr("[::1]:1234"))); // loopback
+        assert!(!is_usable_reflexive_addr(&addr("[fe80::1]:1234"))); // link-local fe80::/10
+        assert!(!is_usable_reflexive_addr(&addr("[febf::1]:1234"))); // link-local upper edge
+        assert!(!is_usable_reflexive_addr(&addr("[ff02::1]:1234"))); // multicast ff00::/8
+        assert!(!is_usable_reflexive_addr(&addr("[2001:db8::1]:1234"))); // documentation 2001:db8::/32
+    }
 }

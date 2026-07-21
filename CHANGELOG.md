@@ -4,6 +4,19 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.8.1] - 2026-07-21
+
+### Bug Fixes
+- **stun:** Reject non-global/reserved STUN reflexive addresses (loopback, link-local, multicast,
+  documentation ranges, unspecified, IPv4 broadcast, port 0) — defense-in-depth against a malicious
+  or misconfigured STUN server; private/CGNAT/ULA addresses are still accepted (LAN + #1062 e2e)
+  (DIG-Network/dig_ecosystem#1387)
+
+### Documentation
+- **stun:** Clarify the dialable-candidate API — `discover_reflexive_address` learns the public IP
+  over a throwaway ephemeral socket (port not dialable); `query_reflexive_address` returns a dialable
+  server-reflexive candidate from the caller's own listen socket (DIG-Network/dig_ecosystem#1388)
+
 ## [0.8.0] - 2026-07-21
 
 ### Features

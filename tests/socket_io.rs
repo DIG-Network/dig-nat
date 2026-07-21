@@ -203,7 +203,8 @@ async fn stun_query_reflexive_address_against_loopback_server() {
         let (_, from) = server.recv_from(&mut buf).await.unwrap();
         // Echo the transaction id from the request (bytes 8..20).
         let txid: [u8; 12] = buf[8..20].try_into().unwrap();
-        let reflexive = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 55)), 41234);
+        // A genuinely-global reflexive address (documentation ranges are rejected by #1387).
+        let reflexive = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 41234);
         let resp = build_xor_mapped_response(&txid, reflexive);
         server.send_to(&resp, from).await.unwrap();
     });
@@ -213,7 +214,36 @@ async fn stun_query_reflexive_address_against_loopback_server() {
         .await
         .unwrap();
     assert_eq!(got.port(), 41234);
-    assert_eq!(got.ip(), IpAddr::V4(Ipv4Addr::new(203, 0, 113, 55)));
+    assert_eq!(got.ip(), IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+}
+
+/// #1387: a STUN server that returns a NON-GLOBAL/reserved reflexive address (here loopback) must
+/// be rejected — `query_reflexive_address` surfaces `NoMappedAddress` rather than advertising a
+/// bogus address. Guards against a malicious/compromised STUN server (the relay).
+#[tokio::test]
+async fn stun_rejects_reserved_reflexive_address() {
+    let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        let (_, from) = server.recv_from(&mut buf).await.unwrap();
+        let txid: [u8; 12] = buf[8..20].try_into().unwrap();
+        // A reserved (loopback) reflexive — never a legitimate server-reflexive candidate.
+        let bogus = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 41234);
+        let resp = build_xor_mapped_response(&txid, bogus);
+        server.send_to(&resp, from).await.unwrap();
+    });
+
+    let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let err = query_reflexive_address(&client, server_addr, Duration::from_secs(2))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        StunError::NoMappedAddress,
+        "a reserved/non-global reflexive must be rejected as NoMappedAddress"
+    );
 }
 
 /// #179 MEDIUM regression: `query_reflexive_address` previously discarded the datagram source
@@ -228,8 +258,10 @@ async fn stun_ignores_response_from_non_queried_source() {
     let server_addr = server.local_addr().unwrap();
     let attacker = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
 
-    let genuine_reflexive = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 55)), 41234);
-    let poisoned_reflexive = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 66)), 6666);
+    // Both are genuinely-global addresses (documentation ranges are rejected by #1387); the point
+    // of this test is source-address selection, so both must pass the usability guard.
+    let genuine_reflexive = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 41234);
+    let poisoned_reflexive = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 6666);
 
     tokio::spawn(async move {
         let mut buf = [0u8; 512];

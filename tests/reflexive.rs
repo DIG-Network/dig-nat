@@ -94,7 +94,9 @@ const SHORT: Duration = Duration::from_millis(300);
 /// back to the reachable IPv4 STUN server and return its reflexive address — never null it out.
 #[tokio::test]
 async fn falls_back_to_ipv4_when_ipv6_stun_is_dead() {
-    let reflexive = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)), 1234);
+    // A genuinely-global reflexive address (1.1.1.1). Documentation ranges (203.0.113.x) are now
+    // rejected by the #1387 usability guard, so the reflexive must be a real global address here.
+    let reflexive = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 1234);
     let v4 = spawn_responder(IpAddr::V4(Ipv4Addr::LOCALHOST), reflexive).await;
 
     // IPv6 candidate listed FIRST (dead), live IPv4 second. Dual-stack local host.
@@ -112,7 +114,7 @@ async fn falls_back_to_ipv4_when_ipv6_stun_is_dead() {
 /// entirely (it is never even attempted) and the IPv4 reflexive is returned.
 #[tokio::test]
 async fn ipv4_only_host_uses_ipv4_stun() {
-    let reflexive = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)), 9000);
+    let reflexive = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 9000);
     let v4 = spawn_responder(IpAddr::V4(Ipv4Addr::LOCALHOST), reflexive).await;
 
     let servers = [dead_v6(), v4];
@@ -125,11 +127,12 @@ async fn ipv4_only_host_uses_ipv4_stun() {
 /// When IPv6 STUN answers, IPv6 is preferred (attempted first) even though a live IPv4 STUN exists.
 #[tokio::test]
 async fn prefers_ipv6_when_it_answers() {
+    // Global v6 (Cloudflare 2606:4700:4700::1111); 2001:db8::/32 is a rejected documentation range.
     let v6_reflexive = SocketAddr::new(
-        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+        IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
         4321,
     );
-    let v4_reflexive = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)), 5555);
+    let v4_reflexive = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)), 5555);
     let v6 = spawn_responder(IpAddr::V6(Ipv6Addr::LOCALHOST), v6_reflexive).await;
     let v4 = spawn_responder(IpAddr::V4(Ipv4Addr::LOCALHOST), v4_reflexive).await;
 

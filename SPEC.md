@@ -180,6 +180,28 @@ The behaviour `dig-nat` INHERITS from `dig-ip` (its structural guarantees, teste
   an IPv4-only EC2 host stranded on the IPv6 STUN address (`reflexive_addr:null`) and advertised only
   its private VPC IP; per the dig-ip charter, NO consumer hand-rolls a family sort or happy-eyeballs
   racer — this function is the single front door.
+- **Reflexive-address usability guard (NORMATIVE, defense-in-depth).** A parsed reflexive address is
+  accepted as a candidate only if it is a plausible dial target. `query_reflexive_address` REJECTS
+  (surfacing `StunError::NoMappedAddress`, which `discover_reflexive_address` treats as a candidate
+  failure and falls through) any reflexive address that is, across BOTH families: unspecified
+  (`0.0.0.0`/`::`), loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, `fe80::/10`),
+  multicast (`224.0.0.0/4`, `ff00::/8`), a documentation range (`192.0.2.0/24`, `198.51.100.0/24`,
+  `203.0.113.0/24`, `2001:db8::/32`), the IPv4 limited broadcast (`255.255.255.255`), or has
+  `port == 0`. This is a defense against a malicious or misconfigured STUN server (the relay runs one)
+  returning a bogus reflexive address a consumer would then advertise. It is **NOT** a blanket
+  `is_global` filter: PRIVATE (RFC 1918), CGNAT (`100.64.0.0/10`), and IPv6 ULA (`fc00::/7`) addresses
+  are ACCEPTED — they are legitimate reflexive addresses on a LAN or behind carrier-grade NAT, and
+  rejecting them would break LAN/test-network reflexive discovery (including the #1062 EC2 e2e). The
+  pure parser `parse_binding_response` does NOT apply this guard; callers wanting a usable candidate
+  use `query_reflexive_address`.
+- **Dialable candidate vs. public-IP-only (NORMATIVE).** `query_reflexive_address(socket, …)` returns
+  a **DIALABLE** server-reflexive candidate: it learns the reflexive `ip:port` mapping of the caller's
+  OWN listen `socket`, so the port is the real external NAT binding a remote peer can dial. It is the
+  API connectivity-core (dig-node) uses to obtain an advertisable candidate.
+  `discover_reflexive_address` instead STUNs each candidate over a THROWAWAY ephemeral UDP socket, so
+  its returned IP is the stable public IP but the PORT is that throwaway socket's binding — **not
+  reliably dialable** under most NAT types. Use `discover_reflexive_address` to learn the public IP;
+  use `query_reflexive_address` for a dialable candidate.
 - **PCP (RFC 6887)** uses 16-byte (128-bit) address fields throughout and is IPv6-capable (IPv4 is
   encoded as an IPv4-mapped IPv6 address).
 - **UPnP/IGD** and **NAT-PMP (RFC 6886)** are protocol-inherently IPv4 (they map an inbound IPv4
