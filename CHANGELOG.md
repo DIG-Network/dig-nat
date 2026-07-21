@@ -7,21 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ## [0.8.1] - 2026-07-21
 
 ### Bug Fixes
-- **stun:** Reject non-global/reserved STUN reflexive addresses (loopback, link-local, multicast,
-  documentation ranges, unspecified, IPv4 broadcast, port 0) — defense-in-depth against a malicious
-  or misconfigured STUN server; private/CGNAT/ULA addresses are still accepted (LAN + #1062 e2e)
-  (DIG-Network/dig_ecosystem#1387)
-- **stun:** Canonicalize IPv4-mapped (`::ffff:a.b.c.d`) and deprecated IPv4-compatible (`::a.b.c.d`)
-  IPv6 reflexive addresses to IPv4 BEFORE the usability guard, closing a bypass where a STUN server
-  could smuggle a rejected IPv4 range (e.g. `::ffff:127.0.0.1`) past the IPv6 arm. Also reject the
-  never-dialable IPv4 ranges the guard previously missed: `0.0.0.0/8`, `192.88.99.0/24` (6to4 relay
-  anycast), `198.18.0.0/15` (benchmarking), and `240.0.0.0/4` (reserved/class-E)
-  (DIG-Network/dig_ecosystem#1387)
-
-### Documentation
-- **stun:** Clarify the dialable-candidate API — `discover_reflexive_address` learns the public IP
-  over a throwaway ephemeral socket (port not dialable); `query_reflexive_address` returns a dialable
-  server-reflexive candidate from the caller's own listen socket (DIG-Network/dig_ecosystem#1388)
+- **dig-nat:** Reject non-global/reserved STUN reflexive addresses + clarify dialable-candidate API (#11)
 
 ## [0.8.0] - 2026-07-21
 
