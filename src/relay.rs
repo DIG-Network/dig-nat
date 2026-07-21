@@ -18,14 +18,17 @@
 //! [`RelayState`]s and surfaced verbatim to a `control.relayStatus`-style RPC / `/health`.
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use dig_ip::{CandidateSource, DialConfig, LocalStack, PeerCandidates};
 use futures_util::{SinkExt, StreamExt};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{client_async_tls_with_config, MaybeTlsStream, WebSocketStream};
 
 use crate::wire::{RelayMessage, RelayPeerInfo};
 
@@ -613,6 +616,138 @@ pub async fn run_relay_connection_with(
     }
 }
 
+/// A relay WebSocket endpoint parsed into the pieces the happy-eyeballs dial needs: the host to
+/// resolve and the TCP port. The scheme (`ws`/`wss`) only selects the default port here — the
+/// plaintext-vs-TLS choice is re-derived from the URL by [`client_async_tls_with_config`] during the
+/// handshake, so a single code path serves both.
+#[derive(Debug, PartialEq, Eq)]
+struct RelayEndpoint {
+    host: String,
+    port: u16,
+}
+
+/// Parse a relay endpoint URL (`ws://host[:port][/path]` / `wss://host[:port][/path]`, IPv6 hosts in
+/// `[…]`) into its host + port. Only the authority is needed for the dial; any path/query/fragment and
+/// userinfo are ignored (the full URL is still handed to the WS handshake for the correct `Host`/SNI).
+fn parse_relay_endpoint(endpoint: &str) -> Result<RelayEndpoint, String> {
+    let (scheme, rest) = endpoint
+        .split_once("://")
+        .ok_or_else(|| format!("relay endpoint missing scheme: {endpoint}"))?;
+    let default_port = match scheme.to_ascii_lowercase().as_str() {
+        "ws" => 80,
+        "wss" => 443,
+        other => return Err(format!("unsupported relay scheme: {other}")),
+    };
+    // Authority only: drop any path/query/fragment, then any `userinfo@`.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+
+    let (host, port) = if let Some(stripped) = authority.strip_prefix('[') {
+        // Bracketed IPv6 literal: `[addr]` or `[addr]:port`.
+        let (h, after) = stripped
+            .split_once(']')
+            .ok_or_else(|| format!("malformed IPv6 authority: {authority}"))?;
+        let port = match after.strip_prefix(':') {
+            Some(p) => p.parse().map_err(|_| format!("bad relay port: {after}"))?,
+            None => default_port,
+        };
+        (h.to_string(), port)
+    } else if let Some((h, p)) = authority.rsplit_once(':') {
+        (
+            h.to_string(),
+            p.parse().map_err(|_| format!("bad relay port: {p}"))?,
+        )
+    } else {
+        (authority.to_string(), default_port)
+    };
+
+    if host.is_empty() {
+        return Err(format!("relay endpoint missing host: {endpoint}"));
+    }
+    Ok(RelayEndpoint { host, port })
+}
+
+/// Resolve a relay host to its family-tagged dial candidates: a literal IP yields one candidate (no
+/// DNS), a hostname is resolved to its full A + AAAA set. The candidates feed `dig_ip::connect`, which
+/// applies the §5.2 IPv6-first preference + local∩peer family intersection, so no ordering is imposed
+/// here — the addresses are added as resolved and tagged by family for observability.
+async fn resolve_relay_candidates(host: &str, port: u16) -> Result<PeerCandidates, String> {
+    let mut candidates = PeerCandidates::new();
+    let source_for = |ip: &IpAddr| {
+        if ip.is_ipv6() {
+            CandidateSource::DnsAAAA
+        } else {
+            CandidateSource::DnsA
+        }
+    };
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        candidates.add(SocketAddr::new(ip, port), source_for(&ip));
+    } else {
+        let resolved = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|e| format!("resolve {host}:{port}: {e}"))?;
+        for addr in resolved {
+            candidates.add(addr, source_for(&addr.ip()));
+        }
+    }
+    if candidates.is_empty() {
+        return Err(format!("no addresses resolved for {host}:{port}"));
+    }
+    Ok(candidates)
+}
+
+/// Race the relay `candidates` IPv6-first with graceful IPv4 fallback via `dig_ip::connect` (§5.2,
+/// RFC 8305). The transport connect stays a caller-supplied closure so the racing logic is unit-tested
+/// with a fake dial (no real DNS/sockets) exactly as the direct-peer dialer does in `dialer.rs`; the
+/// production caller ([`open_relay_ws`]) hands it a real [`TcpStream::connect`].
+async fn race_relay_candidates<C, F, Fut>(
+    local: &LocalStack,
+    candidates: &PeerCandidates,
+    config: DialConfig,
+    dial_fn: F,
+) -> Result<dig_ip::DialWinner<C>, String>
+where
+    F: Fn(SocketAddr) -> Fut + Sync,
+    Fut: std::future::Future<Output = Result<C, String>> + Send,
+    C: Send,
+{
+    dig_ip::connect(local, candidates, config, dial_fn)
+        .await
+        .map_err(|e| format!("relay happy-eyeballs dial: {e}"))
+}
+
+/// Open the relay WebSocket over an IPv6-first happy-eyeballs TCP race (§5.2), matching the direct-peer
+/// dial path in `dialer.rs`: resolve the endpoint host to its A + AAAA candidates, race the TCP connect
+/// via `dig_ip::connect` (IPv6-first, fast IPv4 fallback), then run the WS handshake over the WINNING
+/// socket — TLS-over-that-stream for `wss://`, plaintext for `ws://` (the mode is taken from the URL by
+/// [`client_async_tls_with_config`]). Replaces `tokio_tungstenite::connect_async`, whose sequential,
+/// single-family resolve-and-connect contradicted the IPv6-first reservation guarantee.
+async fn open_relay_ws(
+    endpoint: &str,
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, String> {
+    let parsed = parse_relay_endpoint(endpoint)?;
+    let candidates = resolve_relay_candidates(&parsed.host, parsed.port).await?;
+    let local = LocalStack::cached();
+    let winner = race_relay_candidates(
+        &local,
+        &candidates,
+        DialConfig::default(),
+        |addr| async move {
+            TcpStream::connect(addr)
+                .await
+                .map_err(|e| format!("tcp connect {addr}: {e}"))
+        },
+    )
+    .await?;
+    let (ws, _resp) = client_async_tls_with_config(endpoint, winner.conn, None, None)
+        .await
+        .map_err(|e| format!("ws handshake: {e}"))?;
+    Ok(ws)
+}
+
 /// One connect → register → serve cycle. Returns `Ok` on a clean close, `Err(reason)` on failure.
 async fn connect_once(
     endpoint: &str,
@@ -626,9 +761,7 @@ async fn connect_once(
     status.clear_known_peers();
     status.clear_transport();
 
-    let (ws, _resp) = tokio_tungstenite::connect_async(endpoint)
-        .await
-        .map_err(|e| format!("connect: {e}"))?;
+    let ws = open_relay_ws(endpoint).await?;
     let (mut write, mut read) = ws.split();
 
     // RLY-001: register immediately so the relay holds our reservation, advertising the node's gossip
@@ -829,4 +962,134 @@ where
         .send(Message::Text(txt))
         .await
         .map_err(|e| format!("send: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dig_ip::Family;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn parses_wss_host_and_explicit_port() {
+        let ep = parse_relay_endpoint("wss://relay.dig.net:443").unwrap();
+        assert_eq!(ep.host, "relay.dig.net");
+        assert_eq!(ep.port, 443);
+    }
+
+    #[test]
+    fn parses_default_ports_by_scheme() {
+        assert_eq!(
+            parse_relay_endpoint("wss://relay.dig.net").unwrap().port,
+            443
+        );
+        assert_eq!(parse_relay_endpoint("ws://relay.dig.net").unwrap().port, 80);
+    }
+
+    #[test]
+    fn parses_bracketed_ipv6_authority_with_and_without_port() {
+        let with_port = parse_relay_endpoint("wss://[2001:db8::1]:8443").unwrap();
+        assert_eq!(with_port.host, "2001:db8::1");
+        assert_eq!(with_port.port, 8443);
+        let no_port = parse_relay_endpoint("wss://[2001:db8::1]/ws").unwrap();
+        assert_eq!(no_port.host, "2001:db8::1");
+        assert_eq!(no_port.port, 443);
+    }
+
+    #[test]
+    fn ignores_path_query_and_userinfo() {
+        let ep = parse_relay_endpoint("wss://user@relay.dig.net:9443/ws?x=1#f").unwrap();
+        assert_eq!(ep.host, "relay.dig.net");
+        assert_eq!(ep.port, 9443);
+    }
+
+    #[test]
+    fn rejects_malformed_endpoints() {
+        assert!(parse_relay_endpoint("relay.dig.net:443").is_err()); // no scheme
+        assert!(parse_relay_endpoint("http://relay.dig.net").is_err()); // wrong scheme
+        assert!(parse_relay_endpoint("wss://relay.dig.net:notaport").is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_relay_candidates_handles_ip_literals_without_dns() {
+        let v6 = resolve_relay_candidates("2001:db8::1", 443).await.unwrap();
+        assert_eq!(v6.all().len(), 1);
+        assert_eq!(v6.all()[0].family, Family::V6);
+        assert_eq!(v6.all()[0].source, CandidateSource::DnsAAAA);
+
+        let v4 = resolve_relay_candidates("203.0.113.7", 443).await.unwrap();
+        assert_eq!(v4.all()[0].family, Family::V4);
+        assert_eq!(v4.all()[0].source, CandidateSource::DnsA);
+    }
+
+    /// The relay dial races BOTH families and falls back to IPv4 when the IPv6 candidate is dead —
+    /// the §5.2 happy-eyeballs guarantee, proven with a FAKE dial closure (no real DNS/sockets). A
+    /// dead IPv6 candidate + a live IPv4 candidate on a dual-stack host must yield the IPv4 winner,
+    /// and BOTH families must have been attempted.
+    #[tokio::test]
+    async fn relay_dial_races_both_families_and_falls_back_to_ipv4() {
+        let mut candidates = PeerCandidates::new();
+        let v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let v4: SocketAddr = "203.0.113.7:443".parse().unwrap();
+        candidates.add(v6, CandidateSource::DnsAAAA);
+        candidates.add(v4, CandidateSource::DnsA);
+
+        let dual = LocalStack::from_flags(true, true);
+        let attempted: StdMutex<Vec<SocketAddr>> = StdMutex::new(Vec::new());
+        // Fast attempt-delay so the hedged IPv4 starts promptly once the IPv6 attempt fails.
+        let cfg = DialConfig {
+            per_attempt_timeout: Duration::from_secs(1),
+            attempt_delay: Duration::from_millis(5),
+        };
+
+        let winner = race_relay_candidates(&dual, &candidates, cfg, |addr| {
+            let attempted = &attempted;
+            async move {
+                attempted.lock().unwrap().push(addr);
+                if addr.is_ipv6() {
+                    Err(format!("simulated dead IPv6 {addr}"))
+                } else {
+                    Ok(addr) // the fake "connection" is just the address that won
+                }
+            }
+        })
+        .await
+        .expect("IPv4 fallback wins when IPv6 is dead");
+
+        assert_eq!(winner.conn, v4, "the live IPv4 candidate won");
+        assert_eq!(winner.family, Family::V4);
+        let tried = attempted.lock().unwrap();
+        assert!(
+            tried.contains(&v6),
+            "the IPv6 candidate was attempted first"
+        );
+        assert!(
+            tried.contains(&v4),
+            "the IPv4 candidate was attempted as fallback"
+        );
+    }
+
+    /// IPv6 is the PREFERENCE, not merely first-attempted: with both families live on a dual-stack
+    /// host, the IPv6 candidate wins the race (IPv4 is only a fallback).
+    #[tokio::test]
+    async fn relay_dial_prefers_ipv6_when_both_live() {
+        let mut candidates = PeerCandidates::new();
+        let v6: SocketAddr = "[2001:db8::2]:443".parse().unwrap();
+        let v4: SocketAddr = "203.0.113.8:443".parse().unwrap();
+        candidates.add(v6, CandidateSource::DnsAAAA);
+        candidates.add(v4, CandidateSource::DnsA);
+
+        let dual = LocalStack::from_flags(true, true);
+        let calls = AtomicUsize::new(0);
+        let winner = race_relay_candidates(&dual, &candidates, DialConfig::default(), |addr| {
+            calls.fetch_add(1, AtomicOrdering::Relaxed);
+            async move { Ok::<SocketAddr, String>(addr) }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(winner.conn, v6, "IPv6 preferred when both are viable");
+        assert_eq!(winner.family, Family::V6);
+    }
 }
