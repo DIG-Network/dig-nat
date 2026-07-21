@@ -30,13 +30,14 @@
 //! ## Identity + mTLS — delegated to `dig-tls`
 //!
 //! Every peer connection is mutual TLS, and the entire certificate model is owned by the canonical
-//! [`dig-tls`](dig_tls) crate (L00): the shipped public DigNetwork CA, the per-peer CA-signed
-//! [`NodeCert`], `peer_id = SHA-256(TLS SPKI DER)`, the #1204 BLS-G1 cert binding, and the ready
-//! rustls mutual-auth configs. dig-nat presents this node's [`NodeCert`] and uses
-//! [`dig_tls::client_config`] to pin the remote's `peer_id` to the [`peer::PeerTarget::peer_id`] the
-//! caller asked for — so the transport is self-authenticating. dig-nat holds NO cert/binding/peer_id
-//! code of its own (it was extracted to dig-tls in 0.6.0); the names below are re-exports for
-//! convenience.
+//! [`dig-tls`](dig_tls) crate (L00): `peer_id = SHA-256(TLS SPKI DER)`, the #1204 BLS-G1 cert
+//! binding, and the ready rustls mutual-auth configs. dig-nat presents this node's [`NodeCert`]
+//! and uses [`dig_tls::client_config_spki_pinned`] for the outbound handshake, authenticating the
+//! remote peer by its SPKI `peer_id` pin (matched to the [`peer::PeerTarget::peer_id`] the caller
+//! specified), rustls proof-of-possession, and the #1204 BLS cert binding — with NO DigNetwork-CA
+//! chain requirement; live self-signed peer leaves are accepted (the §3.6b CA-everywhere migration
+//! is deferred). dig-nat holds NO cert/binding/peer_id code of its own (it was extracted to
+//! dig-tls in 0.6.0); the names below are re-exports for convenience.
 //!
 //! ## Graceful fallback + relay resilience
 //!
