@@ -282,9 +282,11 @@ interrupting in-flight work.
   EQUALITY — the direct connection's `peer_id` AND its #1204 BLS pubkey EQUAL the relayed transport's
   (the invariant that makes swapping transports "to the same peer" safe); (3) ONE successful application
   round-trip over the direct session (an empty `query_availability(vec![])` probe), proving real
-  bidirectional mux traffic (a NAT mapping can complete TLS then blackhole). A path that fails ANY gate
-  **MUST** be refused and the connection stays relayed. Promotion **MUST NOT** occur on
-  handshake-completion alone.
+  bidirectional mux traffic (a NAT mapping can complete TLS then blackhole). The gate-3 probe **MUST**
+  succeed within `NatConfig::per_method_timeout`; a probe that errors OR times out is a gate FAILURE that
+  fails closed (no promotion, stay relayed), so a post-TLS blackhole cannot hang promotion indefinitely.
+  A path that fails ANY gate **MUST** be refused and the connection stays relayed. Promotion **MUST NOT**
+  occur on handshake-completion alone.
 - **Promote + drain:** on a passed gate the active slot is swapped to the direct transport atomically
   (`current_method()` flips to `Direct`; subscribers are notified). The swapped-out relayed slot **MUST**
   be held until its in-flight streams finish OR a bounded grace cap (`NatConfig::fast_connect_grace`,
@@ -292,7 +294,10 @@ interrupting in-flight work.
   it **MUST NOT** tear down the node's persistent relay reservation (§5a).
 - **Failure modes:** (a) direct never lands → stay relayed indefinitely (usable), reservation intact;
   (b) a promoted direct transport that dies → fall back by re-establishing a relayed session (the
-  reservation is still held), flipping `current_method()` back to `Relayed`; (c) a relay drop while still
+  reservation is still held), flipping `current_method()` back to `Relayed`; a lone death re-dials
+  immediately, but a FLAPPING transport (re-dial succeeds then instantly dies) is paced by a
+  capped-exponential backoff that resets once a re-established session is held stably, so a hostile/broken
+  peer cannot drive an unbounded re-dial busy-loop; (c) a relay drop while still
   relayed → the existing reservation reconnect/backoff (§5a) applies.
 - **mTLS + NC-1:** the session does not survive the swap and need not — `peer_id = SHA-256(TLS SPKI DER)`
   is transport-bound and the direct path runs its OWN mTLS to the SAME `peer_id`; identity-equality

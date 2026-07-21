@@ -332,7 +332,14 @@ pub async fn connect_fast(
         est
     });
 
-    connect_fast_with(peer.peer_id, direct, relayed, config.fast_connect_grace).await
+    connect_fast_with(
+        peer.peer_id,
+        direct,
+        relayed,
+        config.fast_connect_grace,
+        config.per_method_timeout,
+    )
+    .await
 }
 
 /// The transport-agnostic core: race the direct + relayed establishers, return the first-usable
@@ -343,12 +350,19 @@ async fn connect_fast_with(
     direct: Establisher,
     relayed: Option<Establisher>,
     grace_cap: Duration,
+    probe_timeout: Duration,
 ) -> Result<FastPeerConnection, NatError> {
     let direct_fut = direct();
     let Some(relayed) = relayed else {
         // No relay tier: the direct ladder is the only path. First-usable == direct.
         let conn = direct_fut.await?;
-        return Ok(build(expected_peer_id, conn, GuardPlan::none(), grace_cap));
+        return Ok(build(
+            expected_peer_id,
+            conn,
+            GuardPlan::none(),
+            grace_cap,
+            probe_timeout,
+        ));
     };
     let relayed_fut = relayed();
 
@@ -362,7 +376,13 @@ async fn connect_fast_with(
                     promote_from: Some(direct_fut),
                     fallback: Some(relayed),
                 };
-                Ok(build(expected_peer_id, relayed_conn, plan, grace_cap))
+                Ok(build(
+                    expected_peer_id,
+                    relayed_conn,
+                    plan,
+                    grace_cap,
+                    probe_timeout,
+                ))
             }
             // Relayed failed — fall back to whatever the direct ladder produces.
             Err(relayed_err) => match direct_fut.await {
@@ -371,6 +391,7 @@ async fn connect_fast_with(
                     direct_conn,
                     GuardPlan::fallback_only(Some(relayed)),
                     grace_cap,
+                    probe_timeout,
                 )),
                 Err(direct_err) => Err(merge_errors(relayed_err, direct_err)),
             },
@@ -386,6 +407,7 @@ async fn connect_fast_with(
                     direct_conn,
                     GuardPlan::fallback_only(Some(relayed)),
                     grace_cap,
+                    probe_timeout,
                 ))
             }
             // Direct failed — await the relayed attempt.
@@ -396,7 +418,13 @@ async fn connect_fast_with(
                         promote_from: Some(direct()),
                         fallback: Some(relayed),
                     };
-                    Ok(build(expected_peer_id, relayed_conn, plan, grace_cap))
+                    Ok(build(
+                        expected_peer_id,
+                        relayed_conn,
+                        plan,
+                        grace_cap,
+                        probe_timeout,
+                    ))
                 }
                 Err(relayed_err) => Err(merge_errors(relayed_err, direct_err)),
             },
@@ -435,6 +463,7 @@ fn build(
     initial: PeerConnection,
     plan: GuardPlan,
     grace_cap: Duration,
+    probe_timeout: Duration,
 ) -> FastPeerConnection {
     let slot = TransportSlot::from_conn(initial);
     let (events, _rx) = watch::channel(slot.method);
@@ -445,6 +474,7 @@ fn build(
         events.clone(),
         plan,
         grace_cap,
+        probe_timeout,
     ));
     FastPeerConnection {
         peer_id,
@@ -462,12 +492,21 @@ async fn run_guard(
     events: watch::Sender<TraversalKind>,
     plan: GuardPlan,
     grace_cap: Duration,
+    probe_timeout: Duration,
 ) {
     // Phase 1 — promotion: if a direct attempt is pending, await it and (on a passed gate) promote
     // the relayed connection to it, draining the swapped-out relayed slot.
     if let Some(promote_from) = plan.promote_from {
         if let Ok(direct_conn) = promote_from.await {
-            try_promote(peer_id, &active, &events, direct_conn, grace_cap).await;
+            try_promote(
+                peer_id,
+                &active,
+                &events,
+                direct_conn,
+                grace_cap,
+                probe_timeout,
+            )
+            .await;
         }
         // A failed direct attempt or a refused gate simply stays on the current (relayed) transport.
     }
@@ -476,12 +515,31 @@ async fn run_guard(
     // re-dial on close. On a direct death this re-dials relayed; on a relayed death this reconnects
     // relayed. With no fallback (a public peer with no relay), the guard exits — a lost direct
     // connection then simply surfaces as stream errors to the caller.
+    //
+    // A flapping transport (dial-succeeds-then-instantly-dies) would otherwise drive an unbounded
+    // re-dial busy-loop; a capped-exponential backoff paces RAPID successive deaths. A session that
+    // was held STABLY (lived past [`FALLBACK_STABILITY`]) resets the backoff, so an ordinary lone
+    // death still re-dials immediately (the single-re-dial-per-death contract is unchanged).
     let Some(fallback) = plan.fallback else {
         return;
     };
+    let mut rapid_deaths: u32 = 0;
     loop {
         let closed = active.load().closed.clone();
+        let established_at = tokio::time::Instant::now();
         closed.closed().await;
+
+        // Pace only RAPID re-deaths; a stably-held session resets the counter.
+        if established_at.elapsed() >= FALLBACK_STABILITY {
+            rapid_deaths = 0;
+        } else {
+            rapid_deaths = rapid_deaths.saturating_add(1);
+        }
+        let backoff = fallback_backoff(rapid_deaths, FALLBACK_BACKOFF_BASE, FALLBACK_BACKOFF_CAP);
+        if !backoff.is_zero() {
+            tokio::time::sleep(backoff).await;
+        }
+
         match fallback().await {
             Ok(conn) => {
                 let slot = TransportSlot::from_conn(conn);
@@ -495,6 +553,26 @@ async fn run_guard(
     }
 }
 
+/// First delay for the fallback re-dial backoff (the shortest paced wait after a rapid death).
+const FALLBACK_BACKOFF_BASE: Duration = Duration::from_millis(50);
+/// Upper bound on the fallback re-dial backoff — no single wait exceeds this.
+const FALLBACK_BACKOFF_CAP: Duration = Duration::from_secs(5);
+/// A re-established session that lives at least this long is "stable" and resets the backoff, so an
+/// ordinary lone transport death always re-dials immediately.
+const FALLBACK_STABILITY: Duration = Duration::from_secs(10);
+
+/// Capped-exponential fallback re-dial backoff (mirrors the relay reservation loop's
+/// [`crate::relay::backoff_secs`]). `rapid_deaths == 0` → no wait (a lone death re-dials at once);
+/// each additional rapid death doubles the wait, clamped to `cap`. Pure → unit-tested.
+fn fallback_backoff(rapid_deaths: u32, base: Duration, cap: Duration) -> Duration {
+    if rapid_deaths == 0 {
+        return Duration::ZERO;
+    }
+    let base_ms = base.as_millis() as u64;
+    let shifted = base_ms.checked_shl(rapid_deaths - 1).unwrap_or(u64::MAX);
+    Duration::from_millis(shifted).clamp(base, cap)
+}
+
 /// Run the promotion gate over a landed direct connection and, iff it passes, swap the active
 /// transport to it and drain the swapped-out relayed slot. A refused gate leaves the connection
 /// relayed (the `direct_conn` is dropped).
@@ -504,6 +582,7 @@ async fn try_promote(
     events: &watch::Sender<TraversalKind>,
     mut direct_conn: PeerConnection,
     grace_cap: Duration,
+    probe_timeout: Duration,
 ) {
     let relayed_slot = active.load_full();
 
@@ -518,10 +597,23 @@ async fn try_promote(
 
     // Gate (3) — one successful application round-trip (empty availability). Proves real bidirectional
     // mux traffic; a NAT mapping that completes TLS then blackholes fails here. Never promote on
-    // handshake-completion alone.
-    if direct_conn.query_availability(vec![]).await.is_err() {
-        tracing::warn!("fast-connect: direct path failed the availability probe — staying relayed");
-        return;
+    // handshake-completion alone. The probe is BOUNDED by `probe_timeout` (the per-method timeout): a
+    // post-TLS blackhole (TLS completes, mux never answers) would hang the probe forever, so a timeout
+    // is treated as a probe FAILURE and fails closed — no promotion, stay relayed.
+    match tokio::time::timeout(probe_timeout, direct_conn.query_availability(vec![])).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) => {
+            tracing::warn!(
+                "fast-connect: direct path failed the availability probe — staying relayed"
+            );
+            return;
+        }
+        Err(_) => {
+            tracing::warn!(
+                "fast-connect: direct path availability probe timed out — staying relayed"
+            );
+            return;
+        }
     }
 
     // Gate passed — swap NEW streams onto the direct transport atomically. In-flight relayed streams
@@ -645,6 +737,97 @@ mod tests {
                 });
             }
         });
+    }
+
+    /// Spawn a server that completes the mTLS handshake + yamux session but then BLACKHOLES: it never
+    /// accepts an inbound stream, so a client's `query_availability` probe writes its request and then
+    /// hangs forever awaiting a response. The session is held alive (not dropped), so the client's
+    /// [`ClosedHandle`] does NOT fire — this models a NAT mapping that completes TLS then silently
+    /// stops answering at the mux layer (the exact case gate 3 + its timeout must catch).
+    fn serve_blackhole<S>(acceptor: TlsAcceptor, stream: S)
+    where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        tokio::spawn(async move {
+            let Ok(tls) = acceptor.accept(stream).await else {
+                return;
+            };
+            let _session = PeerSession::server(tls);
+            // Hold the session alive but never accept/answer a stream — blackhole at the mux layer.
+            std::future::pending::<()>().await;
+        });
+    }
+
+    /// A direct [`Establisher`] to `server` (identity matches — same `peer_id` + BLS as a relayed
+    /// establisher to the same node) whose mTLS + yamux come up, but which BLACKHOLES the mux layer
+    /// (never answers the availability probe). Used to prove gate 3 refuses a post-TLS blackhole and
+    /// that the probe is bounded by a timeout rather than hanging forever.
+    fn blackhole_direct_establisher(
+        client: &Arc<NodeCert>,
+        server: &Arc<NodeCert>,
+        delay: Duration,
+    ) -> Establisher {
+        let node = Arc::clone(client);
+        let server = Arc::clone(server);
+        let server_id = server.peer_id();
+        Arc::new(move || {
+            let node = Arc::clone(&node);
+            let server = Arc::clone(&server);
+            Box::pin(async move {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+                let server_tls = dig_tls::server_config(&server, BindingPolicy::Opportunistic)
+                    .expect("server config")
+                    .config;
+                serve_blackhole(TlsAcceptor::from(server_tls), server_io);
+
+                let client_cfg =
+                    dig_tls::client_config(&node, Some(server_id), BindingPolicy::Opportunistic)
+                        .expect("client config");
+                let captured = client_cfg.captured_peer_id;
+                let captured_bls = client_cfg.captured_bls;
+                let connector = tokio_rustls::TlsConnector::from(client_cfg.config);
+                let sni = rustls_pki_types::ServerName::try_from("peer.dig.invalid").unwrap();
+                let tls = connector.connect(sni, client_io).await.map_err(|e| {
+                    NatError::AllMethodsFailed(vec![MethodError::failed(
+                        TraversalKind::Direct,
+                        format!("mtls handshake: {e}"),
+                    )])
+                })?;
+                let verified = captured.get().expect("peer presented a cert");
+                Ok(PeerConnection {
+                    peer_id: verified,
+                    method: TraversalKind::Direct,
+                    remote_addr: "203.0.113.9:4444".parse().unwrap(),
+                    peer_bls_pub: captured_bls.get(),
+                    session: PeerSession::client(tls),
+                })
+            })
+        })
+    }
+
+    /// A direct [`Establisher`] to `server` whose `peer_id` MATCHES the expected peer but whose
+    /// `peer_bls_pub` is OVERWRITTEN to a value that differs from the real (relayed) slot's BLS. This
+    /// isolates the BLS-equality leg of gate 2 (existing test 6 differs in BOTH peer_id and BLS, so it
+    /// cannot catch a dropped BLS clause).
+    fn mismatched_bls_establisher(
+        client: &Arc<NodeCert>,
+        server: &Arc<NodeCert>,
+        tag: u64,
+        delay: Duration,
+    ) -> Establisher {
+        let inner = direct_establisher(client, server, tag, delay);
+        Arc::new(move || {
+            let inner = Arc::clone(&inner);
+            Box::pin(async move {
+                let mut conn = inner().await?;
+                // Same peer_id as the relayed slot, but a deliberately different BLS pubkey.
+                conn.peer_bls_pub = Some([0xAB; 48]);
+                Ok(conn)
+            })
+        })
     }
 
     /// A relayed [`Establisher`] over a loopback relay reservation to a server serving with `tag`.
@@ -778,6 +961,7 @@ mod tests {
                 direct,
                 Some(relayed),
                 Duration::from_millis(200),
+                Duration::from_secs(5),
             ),
         )
         .await
@@ -832,6 +1016,7 @@ mod tests {
             server.peer_id(),
             direct,
             Some(relayed),
+            Duration::from_secs(5),
             Duration::from_secs(5),
         )
         .await
@@ -891,6 +1076,7 @@ mod tests {
             direct,
             Some(relayed),
             Duration::from_millis(100),
+            Duration::from_secs(5),
         )
         .await
         .unwrap();
@@ -941,6 +1127,7 @@ mod tests {
             direct,
             Some(relayed),
             Duration::from_millis(200),
+            Duration::from_secs(5),
         )
         .await
         .unwrap();
@@ -969,6 +1156,7 @@ mod tests {
             direct,
             Some(relayed),
             Duration::from_millis(200),
+            Duration::from_secs(5),
         )
         .await
         .unwrap();
@@ -1017,6 +1205,7 @@ mod tests {
             direct,
             Some(relayed),
             Duration::from_millis(100),
+            Duration::from_secs(5),
         )
         .await
         .unwrap();
@@ -1047,6 +1236,155 @@ mod tests {
         // A fresh stream now succeeds over the re-dialed relayed transport (tag 11).
         let after = conn.query_availability(vec![avail_item()]).await.unwrap();
         assert_eq!(after.items[0].total_length, Some(11), "re-dialed relayed");
+    }
+
+    /// (7) Gate-3 REFUSES a post-TLS blackhole, BOUNDED by the probe timeout. A direct fake whose
+    /// mTLS + identity match the relayed peer but which then blackholes the mux layer must NOT be
+    /// promoted — the empty-availability probe hangs, the `probe_timeout` fires, and the connection
+    /// stays relayed (fail-closed). SECURITY-CRITICAL (gate 3).
+    ///
+    /// Red-verify: deleting the gate-3 probe block in `try_promote` (the
+    /// `tokio::time::timeout(probe_timeout, direct_conn.query_availability(vec![]))` match) makes this
+    /// test FAIL — with no probe the blackhole peer promotes to Direct.
+    #[tokio::test]
+    async fn refuses_promotion_to_a_post_tls_blackhole() {
+        let client = test_node("fc/7/client");
+        let server = test_node("fc/7/server");
+        let (relayed, _status) = relayed_establisher(&client, &server, 11);
+        // Direct fake: SAME identity (server node) but blackholes the mux after TLS.
+        let direct = blackhole_direct_establisher(&client, &server, Duration::from_millis(100));
+
+        let conn = connect_fast_with(
+            server.peer_id(),
+            direct,
+            Some(relayed),
+            Duration::from_millis(200), // grace
+            Duration::from_millis(300), // probe_timeout — bounds the blackhole probe
+        )
+        .await
+        .unwrap();
+        assert_eq!(conn.current_method(), TraversalKind::Relayed);
+
+        // Allow the direct fake to land + the (bounded) probe to time out and be refused.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(
+            conn.current_method(),
+            TraversalKind::Relayed,
+            "post-TLS blackhole refused — probe timed out, stays relayed"
+        );
+        let resp = conn.query_availability(vec![avail_item()]).await.unwrap();
+        assert_eq!(resp.items[0].total_length, Some(11), "still relayed");
+    }
+
+    /// (8) Gate-2 BLS leg REFUSES same-peer_id / different-BLS. A direct fake whose `peer_id` matches
+    /// the relayed peer but whose BLS pubkey differs must be refused. Isolates the BLS clause (test 6
+    /// differs in BOTH peer_id and BLS, so it cannot catch a dropped BLS clause). SECURITY-CRITICAL.
+    ///
+    /// Red-verify: removing `|| direct_conn.peer_bls_pub != relayed_slot.peer_bls_pub` from gate 2
+    /// makes this test FAIL — peer_id alone matches, so the different-BLS peer would promote to Direct.
+    #[tokio::test]
+    async fn refuses_promotion_on_bls_mismatch_same_peer_id() {
+        let client = test_node("fc/8/client");
+        let server = test_node("fc/8/server");
+        let (relayed, _status) = relayed_establisher(&client, &server, 11);
+        // Direct fake: peer_id == server (matches expected), but BLS pubkey overwritten to differ.
+        let direct = mismatched_bls_establisher(&client, &server, 22, Duration::from_millis(100));
+
+        let conn = connect_fast_with(
+            server.peer_id(),
+            direct,
+            Some(relayed),
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        // The direct path lands with a matching peer_id but a mismatched BLS → gate 2 refuses.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            conn.current_method(),
+            TraversalKind::Relayed,
+            "promotion refused on BLS mismatch despite matching peer_id"
+        );
+        let resp = conn.query_availability(vec![avail_item()]).await.unwrap();
+        assert_eq!(resp.items[0].total_length, Some(11), "still relayed");
+    }
+
+    /// (9) An in-flight relayed stream SURVIVES a short grace cap. With a sub-millisecond
+    /// `fast_connect_grace`, the post-promotion drain task releases its own hold as soon as the cap
+    /// elapses — but a stream held across the promotion boundary keeps the relayed slot alive via its
+    /// OWN `Arc<TransportSlot>`, so it still completes (no truncation on cap).
+    ///
+    /// Red-verify: a hypothetical drain that TRUNCATED the slot on cap (e.g. forcibly closed the
+    /// relayed session when `deadline` fires instead of only dropping its own reference) would make the
+    /// held `pre` stream's `decode` fail — this assertion (the held stream still yields tag 11) guards
+    /// against that regression.
+    #[tokio::test]
+    async fn inflight_relayed_stream_survives_short_grace_cap() {
+        let client = test_node("fc/9/client");
+        let server = test_node("fc/9/server");
+        let (relayed, _status) = relayed_establisher(&client, &server, 11);
+        let direct = direct_establisher(&client, &server, 22, Duration::from_millis(150));
+
+        let conn = connect_fast_with(
+            server.peer_id(),
+            direct,
+            Some(relayed),
+            Duration::from_millis(1), // tiny grace — the drain cap fires almost immediately
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("relayed lands first");
+        assert_eq!(conn.current_method(), TraversalKind::Relayed);
+
+        // Open a relayed stream + write the request BEFORE promotion; hold it open across the boundary.
+        let mut pre = conn.open_stream().await.unwrap();
+        pre.write_all(
+            &AvailabilityRequest {
+                items: vec![avail_item()],
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+        pre.flush().await.unwrap();
+
+        // Wait for promotion to Direct (the drain task then fires its ~1ms cap immediately).
+        let mut rx = conn.subscribe();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while *rx.borrow_and_update() != TraversalKind::Direct {
+                rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("promoted to Direct");
+        // Let the grace cap elapse + the drain task run to completion.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The held stream STILL completes over the relayed transport (tag 11) — its Arc kept the slot
+        // alive past the grace cap; the cap only bounded the drain task's own hold, not the stream.
+        let pre_resp = AvailabilityResponse::decode(&mut pre).await.unwrap();
+        assert_eq!(
+            pre_resp.items[0].total_length,
+            Some(11),
+            "in-flight relayed stream survived the short grace cap"
+        );
+    }
+
+    #[test]
+    fn fallback_backoff_is_zero_for_a_lone_death_then_capped_exponential() {
+        let base = Duration::from_millis(50);
+        let cap = Duration::from_secs(5);
+        // A lone death (counter 0) re-dials immediately.
+        assert_eq!(fallback_backoff(0, base, cap), Duration::ZERO);
+        // Rapid re-deaths back off exponentially from the base.
+        assert_eq!(fallback_backoff(1, base, cap), Duration::from_millis(50));
+        assert_eq!(fallback_backoff(2, base, cap), Duration::from_millis(100));
+        assert_eq!(fallback_backoff(3, base, cap), Duration::from_millis(200));
+        // Clamped to the cap and never overflows for a large death count.
+        assert_eq!(fallback_backoff(20, base, cap), cap);
+        assert_eq!(fallback_backoff(u32::MAX, base, cap), cap);
     }
 
     fn avail_item() -> AvailabilityItem {
