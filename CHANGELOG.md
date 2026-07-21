@@ -7,9 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ## [0.8.0] - 2026-07-21
 
 ### Features
-- Add `stun::discover_reflexive_address` — happy-eyeballs STUN reflexive discovery, IPv6-first with
-  IPv4 fallback via `dig_ip::connect` (CLAUDE.md §5.2). Fixes the #1062 gap where an IPv4-only host
-  nulled its reflexive address because the IPv6 STUN server was unreachable (#1385).
+- **dig-nat:** Happy-eyeballs STUN reflexive discovery (§5.2 IPv6-first, IPv4-fallback) (#1385) (#10)
 
 ## [0.7.0] - 2026-07-20
 
