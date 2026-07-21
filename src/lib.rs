@@ -35,8 +35,8 @@
 //! and uses [`dig_tls::client_config_spki_pinned`] for the outbound handshake, authenticating the
 //! remote peer by its SPKI `peer_id` pin (matched to the [`peer::PeerTarget::peer_id`] the caller
 //! specified), rustls proof-of-possession, and the #1204 BLS cert binding — with NO DigNetwork-CA
-//! chain requirement; live self-signed peer leaves are accepted (the §3.6b CA-everywhere migration
-//! is deferred). dig-nat holds NO cert/binding/peer_id code of its own (it was extracted to
+//! chain requirement; live self-signed peer leaves are accepted (the DIG-CA-everywhere migration
+//! #1378 is deferred). dig-nat holds NO cert/binding/peer_id code of its own (it was extracted to
 //! dig-tls in 0.6.0); the names below are re-exports for convenience.
 //!
 //! ## Graceful fallback + relay resilience
