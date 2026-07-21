@@ -2,12 +2,15 @@
 //! returns a [`PeerConnection`] whose remote `peer_id` has been verified.
 //!
 //! This is the single place transport detail lives: (happy-eyeballs) TCP connect → rustls client
-//! handshake presenting THIS node's [`NodeCert`] (mutual TLS). The rustls `ClientConfig` — including
-//! the DigNetwork-CA chain check, the `peer_id = SHA-256(SPKI DER)` pin, and the #1204 BLS-binding
-//! verification — comes ready-made from [`dig_tls::client_config`]; dig-nat holds no verifier of its
-//! own. dig-tls captures the peer's `peer_id` (and bound BLS pubkey) during the handshake and rejects
-//! it unless the derived id matches the [`PeerTarget::peer_id`] the caller asked for. On success the
-//! caller gets an authenticated, encrypted [`tokio_rustls::client::TlsStream`].
+//! handshake presenting THIS node's [`NodeCert`] (mutual TLS). The rustls `ClientConfig` comes
+//! ready-made from [`dig_tls::client_config_spki_pinned`]; dig-nat holds no verifier of its own. That
+//! config authenticates the peer by SPKI-pinning — `peer_id = SHA-256(TLS SPKI DER)` pinned to the
+//! peer the caller asked for + rustls proof-of-possession + the #1204 BLS-binding verification —
+//! with NO DigNetwork-CA chain requirement, because live §5.2 peers still present self-signed leaves
+//! (the #1378 CA-everywhere migration is deferred). dig-tls captures the peer's `peer_id` (and bound
+//! BLS pubkey) during the handshake and rejects it unless the derived id matches the
+//! [`PeerTarget::peer_id`] the caller asked for. On success the caller gets an authenticated,
+//! encrypted [`tokio_rustls::client::TlsStream`].
 //!
 //! ## IPv6-first, IPv4-fallback — delegated to `dig-ip` (CLAUDE.md §5.2)
 //!
@@ -92,8 +95,8 @@ pub fn candidates_from_outcome(outcome: &MethodOutcome) -> PeerCandidates {
     candidates
 }
 
-/// The production mTLS dialer. Holds this node's [`NodeCert`] (its CA-signed dig-tls identity,
-/// presented as the mutual-TLS client cert) and builds a fresh [`dig_tls::client_config`] per dial.
+/// The production mTLS dialer. Holds this node's [`NodeCert`] (its dig-tls identity, presented as the
+/// mutual-TLS client cert) and builds a fresh [`dig_tls::client_config_spki_pinned`] per dial.
 /// The candidate race is tuned by [`MtlsDialer::happy_eyeballs`], and the local stack it dials from by
 /// [`MtlsDialer::local_stack`].
 ///
@@ -168,8 +171,9 @@ impl MtlsDialer {
     /// Run the mTLS handshake over an already-established byte `stream` (a raced TCP connection, or a
     /// relay byte tunnel), presenting THIS node's [`NodeCert`] and pinning the remote's `peer_id` to
     /// the one the caller asked for. Shared by every tier so a relayed/hole-punched connection is
-    /// authenticated IDENTICALLY to a direct one — same CA chain, same `peer_id` pin, same #1204 BLS
-    /// binding. `remote_addr` is recorded on the connection for observability.
+    /// authenticated IDENTICALLY to a direct one — same SPKI-pinned `peer_id` pin, same rustls
+    /// proof-of-possession, same #1204 BLS binding. `remote_addr` is recorded on the connection for
+    /// observability.
     async fn handshake_over<S>(
         &self,
         peer: &PeerTarget,
@@ -180,11 +184,14 @@ impl MtlsDialer {
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
-        // The rustls client config — DigNetwork-CA chain check + peer_id pin (to the peer we asked
-        // for) + #1204 binding verification — comes ready-made from dig-tls, along with the handles
-        // that capture WHO answered during the handshake.
+        // The rustls client config — SPKI-pinned peer_id verification (to the peer we asked for) +
+        // rustls proof-of-possession + #1204 binding verification, with NO DigNetwork-CA chain
+        // requirement so live §5.2 self-signed peers are accepted — comes ready-made from dig-tls,
+        // along with the handles that capture WHO answered during the handshake. The safe-usage
+        // contract on `client_config_spki_pinned` is satisfied: the dialer ALWAYS pins
+        // `Some(peer.peer_id)`, so a wrong-peer_id leaf is still rejected (authentication preserved).
         let client_tls =
-            dig_tls::client_config(&self.node, Some(peer.peer_id), self.binding_policy)
+            dig_tls::client_config_spki_pinned(&self.node, Some(peer.peer_id), self.binding_policy)
                 .map_err(|e| MethodError::failed(kind, format!("client cert config: {e}")))?;
         let captured = client_tls.captured_peer_id;
         let captured_bls = client_tls.captured_bls;
