@@ -31,18 +31,20 @@ no byte-drift risk). The names below are re-exported from dig-tls for consumer c
 
 - A peer's identity is `peer_id = SHA-256(TLS SubjectPublicKeyInfo DER)`, byte-identical to
   `dig-gossip` and to `dig-tls`. All node-to-node traffic is mutual TLS.
-- The local mTLS identity is a `dig_tls::NodeCert`: a per-peer leaf **signed by the shipped public
-  DigNetwork CA** (dig-tls ships the CA cert + key; the CA key is intentionally public — a shared
-  trust-domain marker, the Chia precedent — so real authentication comes from the `peer_id` pin + the
-  BLS binding, never CA-key secrecy). The dialer **MUST** present this `NodeCert` as the mTLS client
-  certificate. Certificates are NO LONGER self-signed as of 0.6.0 — a peer that presents a leaf that
-  does not chain to the DigNetwork CA **MUST** be rejected. (Migration: consumers regenerate their
-  cert as a CA-signed `NodeCert` on adopt.)
-- The rustls mutual-auth `ClientConfig`/`ServerConfig` — including the DigNetwork-CA chain check, the
-  `peer_id` pin, and the #1204 BLS-binding verification — **MUST** be obtained from
-  `dig_tls::client_config` / `dig_tls::server_config`. The dial **MUST** reject the handshake unless
-  the remote's derived `peer_id` equals the `peer_id` the caller asked to reach, and the verified
-  identity (and any bound BLS pubkey) **MUST** be reported on the returned connection.
+- The local mTLS identity is a `dig_tls::NodeCert` (a per-peer leaf carrying the #1204 BLS-G1
+  binding), which the dialer **MUST** present as the mTLS client certificate.
+- **The auto-dialer authenticates peers by SPKI-pinned mTLS, NOT by a DigNetwork-CA chain (#1422).**
+  Real authentication comes from three checks, none of which requires the peer's leaf to chain to any
+  CA: (1) `peer_id = SHA-256(TLS SPKI DER)` **MUST** equal the `peer_id` the caller asked to reach
+  (the pin); (2) rustls proof-of-possession of the leaf's private key; (3) the #1204 BLS-binding
+  verification. A **self-signed** peer leaf **MUST** be accepted (live §5.2 DIG peers present
+  self-signed / chia-ssl leaves; the DIG-CA-everywhere migration #1378 is deferred), while a leaf
+  whose derived `peer_id` does not match the pinned target **MUST** be rejected.
+- The rustls mutual-auth outbound config — the SPKI-pinned `peer_id` verification, rustls
+  proof-of-possession, and the #1204 BLS-binding verification — **MUST** be obtained from
+  `dig_tls::client_config_spki_pinned` (the dial passes `Some(peer_id)`, never `None`, so the specific
+  peer is always authenticated). The verified identity (and any bound BLS pubkey) **MUST** be reported
+  on the returned connection.
 - The node's PKCS#8 private key is held by `dig_tls::NodeCert` in a zeroizing container so the
   plaintext key bytes are scrubbed on drop; `NodeCert` is deliberately not `Clone` and is shared
   behind an `Arc`, so it is never copied per dial.
@@ -252,8 +254,8 @@ separate: the DATA config (`NatConfig`, `Clone + Debug`) and the LIVE handles (`
   - **Relayed** — a `relayed` `RelayedDialer` handle.
 - If no tier is composable, `connect`/`connect_with_runtime` **MUST** return `NoMethodsEnabled`.
 - Every composed tier — INCLUDING the relayed one — **MUST** run the identical `dig-tls` mTLS
-  (CA-chain check + `peer_id` pin + #1204 BLS binding). A relayed or hole-punched connection **MUST
-  NOT** be weaker than a direct one.
+  (SPKI-pinned `peer_id` verification + rustls proof-of-possession + #1204 BLS binding, §2). A relayed
+  or hole-punched connection **MUST NOT** be weaker than a direct one.
 
 ## 4b. Fast-connect — first-usable transport + live relayed→direct promotion (NORMATIVE)
 

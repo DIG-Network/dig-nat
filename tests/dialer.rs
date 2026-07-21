@@ -1,7 +1,8 @@
 //! Dialer + PeerConnection integration over a real LOOPBACK mTLS server (in-process, no external
 //! network). Proves the production `MtlsDialer` — presenting a dig-tls `NodeCert` and using
-//! `dig_tls::client_config` for the handshake — establishes an mTLS session, verifies the peer_id,
-//! rejects a mismatch, and that the resulting PeerConnection's mux passthroughs work end-to-end.
+//! `dig_tls::client_config_spki_pinned` for the handshake — establishes an mTLS session, verifies the
+//! peer_id (accepting a self-signed / non-DIG-CA peer leaf, §5.2/#1422), rejects a peer_id mismatch,
+//! and that the resulting PeerConnection's mux passthroughs work end-to-end.
 
 mod tls_harness;
 
@@ -21,7 +22,83 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-use tls_harness::test_node;
+use tls_harness::{test_bls_sk, test_node};
+
+/// Stand up a loopback mTLS server whose leaf is signed by a THROWAWAY, NON-DigNetwork CA (a
+/// self-signed §5.2 peer, as live DIG peers present). Its client-verifier still CA-requires the
+/// DigNetwork CA (fine — the dialing `test_node` client IS DIG-CA-signed), so only the SERVER leaf is
+/// foreign. Returns its address + the foreign server's `peer_id`. Mirrors [`spawn_mtls_server`] but
+/// with a foreign-CA leaf, to prove the SPKI-pinned dialer accepts a non-DIG-CA server (#1422).
+async fn spawn_foreign_ca_mtls_server(label: &str) -> (std::net::SocketAddr, PeerId) {
+    let now = time::OffsetDateTime::now_utc();
+    let ca_material = dig_tls::ca::generate_dig_ca(now).expect("mint throwaway foreign CA");
+    let foreign_ca = dig_tls::ca::DigCa::from_pem(&ca_material.cert_pem, &ca_material.key_pem)
+        .expect("load foreign CA");
+    let server = Arc::new(
+        NodeCert::generate_signed_by(&foreign_ca, &test_bls_sk(label), now)
+            .expect("sign leaf under foreign CA"),
+    );
+    let server_id = server.peer_id();
+
+    let server_tls =
+        dig_tls::server_config(&server, BindingPolicy::Off).expect("build server config");
+    let acceptor = TlsAcceptor::from(server_tls.config);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        if let Ok((tcp, _)) = listener.accept().await {
+            if let Ok(tls) = acceptor.accept(tcp).await {
+                let mut session = PeerSession::server(tls);
+                while let Some(mut s) = session.accept_stream().await {
+                    tokio::spawn(async move {
+                        if let Ok(req) = AvailabilityRequest::decode(&mut s).await {
+                            let resp = AvailabilityResponse {
+                                items: req
+                                    .items
+                                    .iter()
+                                    .map(|_| AvailabilityAnswer {
+                                        available: true,
+                                        roots: None,
+                                        total_length: Some(123),
+                                        chunk_count: Some(1),
+                                        complete: Some(true),
+                                    })
+                                    .collect(),
+                            };
+                            let _ = s.write_all(&resp.encode()).await;
+                            let _ = s.shutdown().await;
+                        }
+                    });
+                }
+            }
+        }
+    });
+    (addr, server_id)
+}
+
+/// #1422 — the on-wire fix. Dialing a live-style peer whose leaf is signed by a NON-DigNetwork CA
+/// (a self-signed §5.2 peer) MUST succeed and authenticate the peer by its SPKI-pinned `peer_id`.
+/// Before the dialer adopted `client_config_spki_pinned` this failed with a
+/// `mtls handshake: ... UnknownIssuer` (the CA-chaining verifier rejected the foreign leaf); the
+/// SPKI-pinned dialer accepts it while still pinning the exact peer_id.
+#[tokio::test]
+async fn issue_1422_dials_self_signed_non_dig_ca_peer() {
+    let (addr, foreign_server_id) = spawn_foreign_ca_mtls_server("dialer/foreign-server").await;
+
+    let dialer = MtlsDialer::new(test_node("dialer/client-1422"));
+    let peer = PeerTarget::with_addr(foreign_server_id, addr, "DIG_MAINNET");
+    let outcome = MethodOutcome::single(TraversalKind::Direct, addr);
+
+    let conn = dialer
+        .dial(&peer, &outcome)
+        .await
+        .expect("SPKI-pinned dialer accepts the self-signed non-DIG-CA peer");
+    assert_eq!(
+        conn.peer_id, foreign_server_id,
+        "verified identity == the foreign-CA server's SPKI-derived peer_id"
+    );
+}
 
 /// Stand up a loopback mTLS server that presents `server`'s CA-signed cert (requiring the client's
 /// cert to chain to the DigNetwork CA) and, once connected, runs a yamux SERVER session that answers
