@@ -257,6 +257,34 @@ separate: the DATA config (`NatConfig`, `Clone + Debug`) and the LIVE handles (`
   (SPKI-pinned `peer_id` verification + rustls proof-of-possession + #1204 BLS binding, §2). A relayed
   or hole-punched connection **MUST NOT** be weaker than a direct one.
 
+## 4a. Relayed responder — role negotiation on a relay circuit (NORMATIVE)
+
+A relay circuit (tier-6, RLY-002) is a byte tunnel between two peers; the mTLS handshake carried over
+it **MUST** have exactly ONE client end and ONE server end. The two ends negotiate roles by who
+INITIATED:
+
+- **Initiator = mTLS client.** The peer that opens the tunnel (`RelayStatus::open_tunnel` via the
+  `RelayedDialer` → `MtlsDialer::dial`) runs `PeerSession::client`.
+- **Reservation-holder that RECEIVES the introduced circuit = mTLS server.** When a live reservation
+  receives an inbound RLY-002 `relay_message` from a peer it has NO open outbound tunnel to, that frame
+  is an INTRODUCED circuit (a peer dialing this node over the relay). If — and only if — the holder has
+  enabled the responder path (`RelayStatus::enable_accept`), it **MUST** register a server-role
+  `RelayTunnel` for that peer, deliver the opening frame into it, and surface the tunnel for a consumer
+  to accept via `RelayAcceptor::accept`, which runs `PeerSession::server` behind a `TlsAcceptor`
+  (`dig_tls::server_config_spki_pinned`). The accepted `PeerConnection` reports the connecting peer's
+  VERIFIED `peer_id` + #1204 BLS binding — identical authentication to a direct inbound connection.
+- **Accept is opt-in; unknown-peer frames are otherwise DROPPED.** When the responder path is NOT
+  enabled, an inbound frame from a peer with no open tunnel **MUST** be dropped (the untrusted-relay
+  default). This preserves the pre-existing flood defense for consumers that only dial.
+- **Bounded (untrusted-relay flood defense).** The accept path **MUST** refuse to create a new inbound
+  circuit once the registered-tunnel count reaches `MAX_RELAY_TUNNELS`, and the accept channel is
+  bounded — a full channel drops the newest introduced circuit rather than queueing unboundedly. A
+  hostile relay flooding fabricated `from` ids therefore cannot exhaust memory or spawn unbounded
+  accept tasks.
+
+Without this responder path, both circuit ends acted as TLS client and the handshake deadlocked
+(`got ClientHello when expecting ServerHello`, #1536).
+
 ## 4b. Fast-connect — first-usable transport + live relayed→direct promotion (NORMATIVE)
 
 `connect_fast(peer, node, config, runtime) -> FastPeerConnection` is an ADDITIVE alternate entry point
