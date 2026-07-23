@@ -140,15 +140,17 @@ async fn bytes_tunnel_a_relay_b_over_reservation() {
     let (status_a, task_a) = connect_node(&endpoint, "aaaa").await;
     let (status_b, task_b) = connect_node(&endpoint, "bbbb").await;
 
-    // B opens a tunnel keyed by A so inbound frames from A are routed to it; A opens a tunnel to B.
-    let mut tunnel_b_from_a = status_b.open_tunnel("aaaa", "DIG_MAINNET").unwrap();
-    let tunnel_a_to_b = status_a.open_tunnel("bbbb", "DIG_MAINNET").unwrap();
+    // Each node opens ONE tunnel keyed by the peer. A relay tunnel is BIDIRECTIONAL — the SAME handle
+    // carries both send and recv — so the reverse direction reuses these handles rather than re-opening
+    // the key (the non-clobber guard correctly refuses a duplicate circuit to a peer, #1536).
+    let mut tunnel_b = status_b.open_tunnel("aaaa", "DIG_MAINNET").unwrap();
+    let mut tunnel_a = status_a.open_tunnel("bbbb", "DIG_MAINNET").unwrap();
 
     let sealed = b"NC-1 sealed ciphertext payload".to_vec();
-    tunnel_a_to_b.send(sealed.clone()).unwrap();
+    tunnel_a.send(sealed.clone()).unwrap();
 
     // B receives the exact bytes A sent — tunnelled A→relay→B.
-    let received = tokio::time::timeout(Duration::from_secs(5), tunnel_b_from_a.recv())
+    let received = tokio::time::timeout(Duration::from_secs(5), tunnel_b.recv())
         .await
         .expect("relayed frame arrived at B within the timeout")
         .expect("tunnel yielded a payload");
@@ -157,12 +159,10 @@ async fn bytes_tunnel_a_relay_b_over_reservation() {
         "B received the exact bytes A sent through the relay"
     );
 
-    // And the reverse direction works over the same sockets (bidirectional tunnel).
-    let mut tunnel_a_from_b = status_a.open_tunnel("bbbb", "DIG_MAINNET").unwrap();
-    let tunnel_b_to_a = status_b.open_tunnel("aaaa", "DIG_MAINNET").unwrap();
+    // The reverse direction works over the SAME bidirectional tunnels (no re-open).
     let reply = b"reply from B".to_vec();
-    tunnel_b_to_a.send(reply.clone()).unwrap();
-    let got = tokio::time::timeout(Duration::from_secs(5), tunnel_a_from_b.recv())
+    tunnel_b.send(reply.clone()).unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(5), tunnel_a.recv())
         .await
         .expect("reverse relayed frame arrived at A")
         .expect("tunnel yielded a payload");

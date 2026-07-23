@@ -56,9 +56,7 @@ async fn relayed_dial_preserves_mtls_peer_id_and_bls_binding() {
 
     // Server side: open its tunnel (registers inbound routing BEFORE the client sends ClientHello),
     // then run an mTLS server (Required binding) + yamux server answering one availability query.
-    let server_tunnel = server_status
-        .open_tunnel(&client_hex, NET)
-        .expect("server opens relay tunnel");
+    let server_tunnel = server_status.open_server_tunnel(&client_hex, NET);
     let server_tls = dig_tls::server_config(&server, BindingPolicy::Required)
         .expect("server config")
         .config;
@@ -133,6 +131,107 @@ async fn relayed_dial_preserves_mtls_peer_id_and_bls_binding() {
     assert_eq!(resp.items[0].total_length, Some(77));
 }
 
+/// REGRESSION (#1536): a relay circuit negotiates ROLES — the dialer is the mTLS client, the
+/// reservation-holder that RECEIVES the introduced circuit is the mTLS server — and the handshake
+/// completes. The holder does NOT pre-open a tunnel to the client (in production it cannot know who
+/// will dial it); it only enables the RESPONDER path ([`RelayStatus::enable_accept`]) and serves
+/// whatever introduced circuit surfaces via a [`RelayAcceptor`] (`PeerSession::server`).
+///
+/// Before the fix there was no responder path: the holder's `route_relayed` DROPPED a frame from a
+/// peer with no open tunnel, so the dialer's ClientHello never reached a server-side accept — the
+/// handshake deadlocked (`got ClientHello when expecting ServerHello`; both ends were TLS clients).
+#[tokio::test]
+async fn relayed_connect_negotiates_client_and_server_roles() {
+    use crate::RelayAcceptor;
+
+    let server = test_node("relayed/role-server");
+    let client = test_node("relayed/role-client");
+    let server_id = server.peer_id();
+    let client_id = client.peer_id();
+    let client_hex = client_id.to_hex();
+    let server_hex = server_id.to_hex();
+
+    let (client_status, server_status) = loopback_reservation_pair(&client_hex, &server_hex);
+
+    // Server: enable the responder path (NO pre-opened tunnel), then serve the introduced circuit as
+    // the mTLS SERVER. Report the peer_id it authenticated so the test proves exactly one client +
+    // one server negotiated correctly.
+    let mut inbound = server_status.enable_accept();
+    let acceptor =
+        RelayAcceptor::new(Arc::clone(&server)).with_binding_policy(BindingPolicy::Required);
+    let (served_tx, served_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let tunnel = inbound
+            .recv()
+            .await
+            .expect("introduced circuit surfaces to the acceptor");
+        let mut conn = acceptor
+            .accept(tunnel)
+            .await
+            .expect("server accepts + completes the mTLS handshake");
+        let _ = served_tx.send(conn.peer_id);
+        while let Some(mut s) = conn.session.accept_stream().await {
+            tokio::spawn(async move {
+                if let Ok(req) = AvailabilityRequest::decode(&mut s).await {
+                    let resp = AvailabilityResponse {
+                        items: req
+                            .items
+                            .iter()
+                            .map(|_| AvailabilityAnswer {
+                                available: true,
+                                roots: None,
+                                total_length: Some(42),
+                                chunk_count: Some(1),
+                                complete: Some(true),
+                            })
+                            .collect(),
+                    };
+                    let _ = s.write_all(&resp.encode()).await;
+                    let _ = s.shutdown().await;
+                }
+            });
+        }
+    });
+
+    // Client: dial the relayed tier — runs the mTLS CLIENT (the initiator).
+    let transport = Arc::new(ReservationRelayedTransport::new(
+        Arc::clone(&client_status),
+        RELAY_ENDPOINT.parse().unwrap(),
+    ));
+    let dialer = MtlsDialer::new(Arc::clone(&client))
+        .with_binding_policy(BindingPolicy::Required)
+        .with_relayed_dialer(transport);
+    let peer = PeerTarget::relay_only(server_id, NET);
+    let outcome = MethodOutcome::single(TraversalKind::Relayed, RELAY_ENDPOINT.parse().unwrap());
+
+    let mut conn = tokio::time::timeout(Duration::from_secs(5), dialer.dial(&peer, &outcome))
+        .await
+        .expect("relayed dial completes (no double-ClientHello deadlock)")
+        .expect("relayed dial succeeds");
+    assert_eq!(
+        conn.peer_id, server_id,
+        "client verified the server's peer_id"
+    );
+
+    let served = tokio::time::timeout(Duration::from_secs(5), served_rx)
+        .await
+        .expect("server completed its accept")
+        .expect("server reported the authenticated peer_id");
+    assert_eq!(served, client_id, "server verified the client's peer_id");
+
+    let resp = conn
+        .query_availability(vec![AvailabilityItem {
+            store_id: "cc".repeat(32),
+            root: None,
+            retrieval_key: None,
+        }])
+        .await
+        .expect("availability round-trips over the role-negotiated relay mTLS");
+    assert_eq!(resp.items.len(), 1);
+    assert!(resp.items[0].available);
+    assert_eq!(resp.items[0].total_length, Some(42));
+}
+
 /// A MALICIOUS relay that redirects the client to an IMPOSTOR (labelling the impostor with the honest
 /// peer's routing id) is rejected by mTLS: the client pinned the honest `peer_id`, so the impostor's
 /// cert derives a different id and the handshake fails. This is the security crux — the relay is an
@@ -149,7 +248,7 @@ async fn relayed_dial_rejects_malicious_relay_redirect_to_impostor() {
 
     // The relay labels the impostor's leg with the HONEST peer's routing id (the redirect attack).
     let (client_status, impostor_status) = loopback_reservation_pair(&client_hex, &honest_hex);
-    let imp_tunnel = impostor_status.open_tunnel(&client_hex, NET).unwrap();
+    let imp_tunnel = impostor_status.open_server_tunnel(&client_hex, NET);
     let imp_tls = dig_tls::server_config(&impostor, BindingPolicy::Off)
         .unwrap()
         .config;
@@ -178,6 +277,152 @@ async fn relayed_dial_rejects_malicious_relay_redirect_to_impostor() {
         "relayed handshake rejects the impostor substituted by the relay, got: {}",
         err.reason
     );
+}
+
+/// REGRESSION (#1536 GLARE): two NAT'd peers that BOTH fall to the relay tier and dial EACH OTHER
+/// simultaneously (neither pre-opens) — the common two-NAT'd-peer flywheel case. Without the
+/// deterministic tie-break each side opens a CLIENT tunnel and each side's ClientHello routes into the
+/// OTHER's client session → both ends are TLS clients → the #1536 double-ClientHello deadlock
+/// re-manifests (the dial would hang; this test would time out).
+///
+/// With the tie-break (numerically-LOWER `peer_id` becomes SERVER) the crossed pair resolves to
+/// exactly ONE client + ONE server under this dial ordering: the higher-id side's `dial` completes as
+/// the mTLS client, the lower-id side's `dial` self-cancels and its `RelayAcceptor` serves the circuit
+/// as the mTLS server. A yamux availability query then round-trips over the negotiated session.
+#[tokio::test]
+async fn mutual_simultaneous_relayed_dial_resolves_glare_to_one_client_one_server() {
+    use crate::peer::PeerConnection;
+    use crate::relay::RelayTunnel;
+    use crate::RelayAcceptor;
+    use tokio::sync::mpsc as tokio_mpsc;
+    use tokio::sync::oneshot;
+
+    let node_a = test_node("glare/a");
+    let node_b = test_node("glare/b");
+    let a_id = node_a.peer_id();
+    let b_id = node_b.peer_id();
+    let a_hex = a_id.to_hex();
+    let b_hex = b_id.to_hex();
+
+    let (a_status, b_status) = loopback_reservation_pair(&a_hex, &b_hex);
+
+    // Each side enables the responder path — a real node both dials (the ladder) AND accepts
+    // introduced circuits (a `RelayAcceptor`) at the same time. Whichever side yields to the server
+    // role under the glare tie-break serves here; the other side's acceptor stays idle.
+    let a_inbound = a_status.enable_accept();
+    let b_inbound = b_status.enable_accept();
+
+    // Serve one accepted circuit as the mTLS SERVER, reporting the authenticated client peer_id and
+    // answering one availability query so the round-trip can be proven. Kept alive by the returned
+    // JoinHandle; the loser-of-glare side's oneshot fires, the winner's never does.
+    fn spawn_acceptor(
+        node: Arc<NodeCert>,
+        mut inbound: tokio_mpsc::Receiver<RelayTunnel>,
+    ) -> (
+        oneshot::Receiver<crate::PeerId>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (served_tx, served_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let acceptor = RelayAcceptor::new(node).with_binding_policy(BindingPolicy::Required);
+            let Some(tunnel) = inbound.recv().await else {
+                return;
+            };
+            let Ok(mut conn): Result<PeerConnection, _> = acceptor.accept(tunnel).await else {
+                return;
+            };
+            let _ = served_tx.send(conn.peer_id);
+            while let Some(mut s) = conn.session.accept_stream().await {
+                tokio::spawn(async move {
+                    if let Ok(req) = AvailabilityRequest::decode(&mut s).await {
+                        let resp = AvailabilityResponse {
+                            items: req
+                                .items
+                                .iter()
+                                .map(|_| AvailabilityAnswer {
+                                    available: true,
+                                    roots: None,
+                                    total_length: Some(99),
+                                    chunk_count: Some(1),
+                                    complete: Some(true),
+                                })
+                                .collect(),
+                        };
+                        let _ = s.write_all(&resp.encode()).await;
+                        let _ = s.shutdown().await;
+                    }
+                });
+            }
+        });
+        (served_rx, handle)
+    }
+
+    let (a_served_rx, _a_srv) = spawn_acceptor(Arc::clone(&node_a), a_inbound);
+    let (b_served_rx, _b_srv) = spawn_acceptor(Arc::clone(&node_b), b_inbound);
+
+    // Build each side's relayed dialer over its own reservation.
+    let a_dialer = MtlsDialer::new(Arc::clone(&node_a))
+        .with_binding_policy(BindingPolicy::Required)
+        .with_relayed_dialer(Arc::new(ReservationRelayedTransport::new(
+            Arc::clone(&a_status),
+            RELAY_ENDPOINT.parse().unwrap(),
+        )));
+    let b_dialer = MtlsDialer::new(Arc::clone(&node_b))
+        .with_binding_policy(BindingPolicy::Required)
+        .with_relayed_dialer(Arc::new(ReservationRelayedTransport::new(
+            Arc::clone(&b_status),
+            RELAY_ENDPOINT.parse().unwrap(),
+        )));
+    let a_peer = PeerTarget::relay_only(b_id, NET); // A dials B
+    let b_peer = PeerTarget::relay_only(a_id, NET); // B dials A — simultaneously
+    let outcome = MethodOutcome::single(TraversalKind::Relayed, RELAY_ENDPOINT.parse().unwrap());
+
+    // BOTH dial at once. A deadlock (the un-fixed behavior) would hang here → the timeout fails loudly.
+    let (a_dial, b_dial) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            a_dialer.dial(&a_peer, &outcome),
+            b_dialer.dial(&b_peer, &outcome),
+        )
+    })
+    .await
+    .expect("mutual relayed dial resolves (no glare deadlock)");
+
+    // Exactly ONE side won the client role; the other yielded to server (its dial self-cancelled).
+    let (mut client_conn, expect_client_id, served_rx) = match (a_dial, b_dial) {
+        (Ok(c), Err(_)) => (c, a_id, b_served_rx), // A client, B server
+        (Err(_), Ok(c)) => (c, b_id, a_served_rx), // B client, A server
+        (Ok(_), Ok(_)) => panic!("glare must yield exactly one client, got two"),
+        (Err(ea), Err(eb)) => panic!("both relayed dials failed: {ea:?} / {eb:?}"),
+    };
+
+    // The client verified the SERVER's identity, and the server verified the CLIENT's — one clean
+    // mutually-authenticated mTLS session, not two deadlocked clients.
+    let expect_server_id = if expect_client_id == a_id { b_id } else { a_id };
+    assert_eq!(
+        client_conn.peer_id, expect_server_id,
+        "client verified the yielding peer's server identity"
+    );
+    let served = tokio::time::timeout(Duration::from_secs(5), served_rx)
+        .await
+        .expect("server side completed its accept")
+        .expect("server reported the authenticated client peer_id");
+    assert_eq!(
+        served, expect_client_id,
+        "server verified the winning peer's client identity"
+    );
+
+    // The mux round-trips over the glare-negotiated relay mTLS.
+    let resp = client_conn
+        .query_availability(vec![AvailabilityItem {
+            store_id: "dd".repeat(32),
+            root: None,
+            retrieval_key: None,
+        }])
+        .await
+        .expect("availability round-trips over the glare-resolved relay mTLS");
+    assert_eq!(resp.items.len(), 1);
+    assert!(resp.items[0].available);
+    assert_eq!(resp.items[0].total_length, Some(99));
 }
 
 /// The [`RelayTunnelStream`] adapter round-trips bytes both directions over the loopback relay, and a

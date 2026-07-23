@@ -257,6 +257,72 @@ separate: the DATA config (`NatConfig`, `Clone + Debug`) and the LIVE handles (`
   (SPKI-pinned `peer_id` verification + rustls proof-of-possession + #1204 BLS binding, §2). A relayed
   or hole-punched connection **MUST NOT** be weaker than a direct one.
 
+## 4a. Relayed responder — role negotiation on a relay circuit (NORMATIVE)
+
+A relay circuit (tier-6, RLY-002) is a byte tunnel between two peers; the mTLS handshake carried over
+it **MUST** have exactly ONE client end and ONE server end. The two ends negotiate roles by who
+INITIATED:
+
+- **Initiator = mTLS client.** The peer that opens the tunnel (`RelayStatus::open_tunnel` via the
+  `RelayedDialer` → `MtlsDialer::dial`) runs `PeerSession::client`.
+- **Reservation-holder that RECEIVES the introduced circuit = mTLS server.** When a live reservation
+  receives an inbound RLY-002 `relay_message` from a peer it has NO open outbound tunnel to, that frame
+  is an INTRODUCED circuit (a peer dialing this node over the relay). If — and only if — the holder has
+  enabled the responder path (`RelayStatus::enable_accept`), it **MUST** register a server-role
+  `RelayTunnel` for that peer, deliver the opening frame into it, and surface the tunnel for a consumer
+  to accept via `RelayAcceptor::accept`, which runs `PeerSession::server` behind a `TlsAcceptor`
+  (`dig_tls::server_config_spki_pinned`). The accepted `PeerConnection` reports the connecting peer's
+  VERIFIED `peer_id` + #1204 BLS binding — identical authentication to a direct inbound connection.
+- **Accept is opt-in; unknown-peer frames are otherwise DROPPED.** When the responder path is NOT
+  enabled, an inbound frame from a peer with no open tunnel **MUST** be dropped (the untrusted-relay
+  default). This preserves the pre-existing flood defense for consumers that only dial.
+- **Bounded (untrusted-relay flood defense).** The accept path **MUST** refuse to create a new inbound
+  circuit once the registered-tunnel count reaches `MAX_RELAY_TUNNELS`, and the accept channel is
+  bounded — a full channel drops the newest introduced circuit rather than queueing unboundedly. A
+  hostile relay flooding fabricated `from` ids therefore cannot exhaust memory or spawn unbounded
+  accept tasks.
+- **GLARE — simultaneous mutual dial (NORMATIVE).** Two peers that fall to the relay tier and dial EACH
+  OTHER at the same time both open a client-role tunnel, so each side's ClientHello arrives on a tunnel
+  where it is ALSO the client. This **MUST** be resolved deterministically so exactly one side is the
+  server: **the peer with the numerically-lower `peer_id` (lexicographic compare of the hex
+  `SHA-256(SPKI)` id) becomes the mTLS SERVER.** Both ends compute the same rule from the two ids, so a
+  crossed pair converges to one-client-one-server under ANY frame ordering with NO retry loop. When a
+  ClientHello (a TLS handshake record: content-type `0x16`, handshake type `0x01`) arrives on a
+  client-role tunnel: the lower-id side **MUST** drop its outbound client tunnel and accept the peer's
+  circuit as server (via the responder path above); the higher-id side **MUST** retain its client role
+  and ignore the peer's competing ClientHello (the peer yields and answers with a ServerHello). A
+  ServerHello / application record on a client-role tunnel is the expected response and is routed
+  normally — it is NOT glare. Each tunnel registration carries a monotonic id so a yielded client
+  tunnel's teardown never deregisters the replacement server tunnel under the same peer key.
+- **At most ONE circuit per peer key — non-clobber (NORMATIVE).** A node **MUST NOT** hold two circuits
+  (a client dial AND a server accept) to the same peer simultaneously. Opening a relayed dial to a peer
+  a live circuit already exists for **MUST** be refused (the existing circuit IS the connection), and
+  the introduced-circuit accept path **MUST NOT** overwrite an existing entry. This covers the
+  TIMING-ordered glare variant — a peer's ClientHello arriving BEFORE our own dial to it registers: we
+  accept it as a server, and our subsequent dial to that peer is refused rather than clobbering the
+  server circuit into a conflicting second mTLS session. The per-frame role LOOKUP + any same-frame
+  yield (client-tunnel removal) are performed under a single `tunnels`-lock acquisition; the subsequent
+  server registration re-acquires the lock and re-checks for an existing entry (the non-clobber guard),
+  so a dial that races in between the two regions cannot produce a conflicting second circuit — the
+  registration is abandoned rather than clobbering.
+- **Self / collision guard (NORMATIVE).** A relayed dial whose target equals the local `peer_id`, and an
+  inbound frame stamped with the local `peer_id` (a theoretical SPKI collision, or a hostile relay
+  reflecting our own id), **MUST** be rejected — such a pair has no lower/higher end for the tie-break
+  and would otherwise hang with no server.
+- **Injected-ClientHello availability caveat (SECURITY).** Because an introduced/glare ClientHello is an
+  opaque relayed frame, an untrusted relay CAN inject a fabricated ClientHello on a lower-id node's
+  client tunnel to force it to yield its outbound dial to a server accept that no real peer completes —
+  a selective relayed-dial denial (both legs fail). This never bypasses mTLS identity (the injected
+  circuit authenticates nothing), but it is an availability lever inherent to an untrusted TURN relay.
+  The dial is NOT permanently lost: once the never-completing server circuit is dropped, the peer key
+  frees and a fresh dial may be attempted. Consumers **SHOULD** bound the server-accept handshake with a
+  timeout and re-attempt the outbound dial on failure.
+
+Without a responder path, both circuit ends acted as TLS client and the handshake deadlocked; without
+the deterministic role tie-break + non-clobber, a simultaneous or timing-ordered mutual dial
+re-manifested the same deadlock or spawned two conflicting sessions to one peer
+(`got ClientHello when expecting ServerHello`, #1536).
+
 ## 4b. Fast-connect — first-usable transport + live relayed→direct promotion (NORMATIVE)
 
 `connect_fast(peer, node, config, runtime) -> FastPeerConnection` is an ADDITIVE alternate entry point

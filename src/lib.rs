@@ -63,6 +63,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod accept;
 pub mod config;
 pub mod dialer;
 pub mod error;
@@ -92,6 +93,7 @@ pub use dig_tls::{
     peer_id_from_leaf_cert_der, peer_id_from_tls_spki_der, BindingPolicy, NodeCert, PeerId,
 };
 
+pub use accept::RelayAcceptor;
 pub use config::{NatConfig, NatConfigBuilder};
 pub use error::{MethodError, NatError};
 pub use fast_connect::{connect_fast, FastPeerConnection, FastPeerStream};
@@ -106,6 +108,7 @@ pub use mux::{
     PeerSession, PeerStream, RangeFrame, RangeRequest,
 };
 pub use peer::{PeerConnection, PeerTarget};
+pub use relay::{RelayState, RelayStatus, RelayTunnel};
 pub use relay_descriptor::{verify_relay_descriptor, RelayDescriptor, RelayDescriptorError};
 pub use runtime::{NatRuntime, NatRuntimeBuilder};
 

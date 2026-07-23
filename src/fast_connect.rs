@@ -841,10 +841,9 @@ mod tests {
         let server_hex = server.peer_id().to_hex();
         let (client_status, server_status) = loopback_reservation_pair(&client_hex, &server_hex);
 
-        // Server side: accept the tunnel + serve availability.
-        let server_tunnel = server_status
-            .open_tunnel(&client_hex, NET)
-            .expect("server opens relay tunnel");
+        // Server side: accept the tunnel + serve availability. Uses the SERVER-role opener so an
+        // incoming ClientHello routes straight to the server (not treated as #1536 glare).
+        let server_tunnel = server_status.open_server_tunnel(&client_hex, NET);
         let server_tls = dig_tls::server_config(server, BindingPolicy::Opportunistic)
             .expect("server config")
             .config;

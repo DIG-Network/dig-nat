@@ -74,6 +74,63 @@ pub const MAX_RELAY_PAYLOAD: usize = 1 << 20;
 /// [`MAX_KNOWN_PEERS`] bounded-set philosophy). The RLY-002 `seq` lets the consumer detect the gap.
 const RELAY_TUNNEL_INBOUND_CAP: usize = 256;
 
+/// Upper bound on concurrently-registered relay tunnels (outbound dial + inbound accept combined)
+/// before the RESPONDER path refuses to create a new inbound circuit.
+///
+/// SECURITY: the relay is UNTRUSTED. When the accept path ([`RelayStatus::enable_accept`]) is on, an
+/// inbound RLY-002 frame from an unknown peer creates a server-role tunnel + surfaces an accept — so
+/// an uncapped accept lets a hostile relay flood distinct fabricated `from` ids to spawn unbounded
+/// tunnels/accept-tasks (a memory/task-exhaustion DoS). Beyond this cap the introduced circuit is
+/// DROPPED rather than accepted. 256 is far more concurrent relayed peers than the last-resort tier
+/// ever legitimately carries, yet bounds the worst case to cheap, bounded memory.
+pub const MAX_RELAY_TUNNELS: usize = 256;
+
+/// Bounded capacity of the inbound-accept channel ([`RelayStatus::enable_accept`]). A full channel
+/// means the consumer is not accepting introduced circuits fast enough; the newest is dropped
+/// (bounded backpressure), never queued unboundedly.
+const INBOUND_ACCEPT_CAP: usize = 64;
+
+/// The mTLS role a locally-registered [`RelayTunnel`] runs — the discriminator that resolves the
+/// GLARE / simultaneous-mutual-dial case (#1536). A relay circuit needs exactly ONE mTLS client + ONE
+/// mTLS server; when two NAT'd peers fall to the relay tier and dial EACH OTHER at the same time (the
+/// common two-NAT'd-peer flywheel case), both open a `Client` tunnel and both send a ClientHello —
+/// each ClientHello would route into the OTHER side's client session (double-ClientHello deadlock).
+/// Tagging the tunnel with its role lets [`route_relayed`](RelayStatus::route_relayed) detect that a
+/// ClientHello arrived on a tunnel where WE are also the client (the glare signature) and apply the
+/// deterministic tie-break instead of feeding it to our doomed client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TunnelRole {
+    /// WE initiated the dial — running [`PeerSession::client`](crate::mux::PeerSession::client) over
+    /// this tunnel; inbound frames are the peer's ServerHello / server-side records.
+    Client,
+    /// WE accepted an introduced circuit — running [`PeerSession::server`](crate::mux::PeerSession::server)
+    /// over this tunnel; inbound frames are the dialing peer's client-side records.
+    Server,
+}
+
+/// A registered relayed tunnel: the inbound sink frames are routed into, the mTLS [`TunnelRole`] we
+/// run over it (for the #1536 glare tie-break), and a monotonic `id` distinguishing this registration
+/// from a later one on the SAME peer key. The id matters when the glare tie-break REPLACES our client
+/// tunnel with a server tunnel under the same `from` key: the old client [`RelayTunnel`]'s `Drop`
+/// (fired when its doomed dial fails) must not deregister the NEW server entry, so `close_tunnel` only
+/// removes when the stored id still matches.
+#[derive(Debug)]
+struct TunnelEntry {
+    sink: mpsc::Sender<Vec<u8>>,
+    role: TunnelRole,
+    id: u64,
+}
+
+/// Whether `payload` begins with a TLS handshake record whose first message is a ClientHello — a TLS
+/// record has content-type `0x16` (handshake) at byte 0 and the handshake message type at byte 5
+/// (`0x01` = ClientHello, `0x02` = ServerHello). A rustls client ships its ClientHello flight as the
+/// first `poll_write`, so the first relayed frame from a fresh dialer matches this. Used ONLY to
+/// distinguish a peer's GLARE ClientHello (a competing simultaneous dial) from the ServerHello / app
+/// records expected on a tunnel where we are the client (#1536).
+fn is_tls_client_hello(payload: &[u8]) -> bool {
+    payload.len() >= 6 && payload[0] == 0x16 && payload[5] == 0x01
+}
+
 /// Compute the next reconnect backoff: capped exponential in the number of consecutive failures.
 /// `failures == 0` → base; doubles each failure up to [`MAX_BACKOFF_SECS`]. Pure → unit-tested.
 pub fn backoff_secs(consecutive_failures: u32) -> u64 {
@@ -225,12 +282,31 @@ pub struct RelayStatus {
     /// This node's own `peer_id` (hex), stamped as `from` on every RLY-002 frame the tunnels send.
     /// Set when a session registers; needed because a tunnel is opened from the shared status handle.
     local_peer_id: Mutex<Option<String>>,
+    /// The network id this reservation registered under. Echoed onto an inbound accepted tunnel (the
+    /// RLY-002 frame itself does not carry it). Set alongside [`local_peer_id`] when a session registers.
+    local_network_id: Mutex<Option<String>>,
+    /// Sink that surfaces an INTRODUCED inbound circuit — a frame from a peer with NO open outbound
+    /// tunnel — as a server-role [`RelayTunnel`] for a consumer to accept + serve
+    /// ([`crate::accept::RelayAcceptor`]). `None` (default) = the original untrusted-relay behavior:
+    /// drop an unknown-peer frame. `Some` once a consumer calls [`RelayStatus::enable_accept`].
+    ///
+    /// This is the RESPONDER counterpart to [`open_tunnel`](Self::open_tunnel): a relay circuit needs
+    /// exactly ONE mTLS client + ONE mTLS server. The DIALER calls `open_tunnel` and runs
+    /// `PeerSession::client`; the reservation-HOLDER that RECEIVES the introduced circuit accepts here
+    /// and runs `PeerSession::server`. Without this path both ends acted as TLS client and the
+    /// handshake deadlocked (`got ClientHello when expecting ServerHello`, #1536).
+    inbound_accept: Mutex<Option<mpsc::Sender<RelayTunnel>>>,
     /// Open relayed-transport tunnels, keyed by the REMOTE peer's `peer_id` (hex). An inbound RLY-002
     /// `relay_message` from a peer is routed to its tunnel's inbound channel; a frame from a peer with
     /// no open tunnel is dropped (the untrusted-relay default). Entries are removed on tunnel drop.
-    tunnels: Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>,
+    /// Each entry carries the mTLS [`TunnelRole`] we run over it so `route_relayed` can resolve the
+    /// #1536 simultaneous-mutual-dial glare deterministically.
+    tunnels: Mutex<HashMap<String, TunnelEntry>>,
     /// Monotonic per-node sequence number stamped on outbound RLY-002 frames (ordering/dedup).
     relay_seq: AtomicU64,
+    /// Monotonic id assigned to each tunnel registration so a stale [`RelayTunnel`]'s `Drop` never
+    /// deregisters a NEWER entry under the same peer key (see [`TunnelEntry::id`]; #1536 glare replace).
+    next_tunnel_id: AtomicU64,
 }
 
 impl Default for RelayStatus {
@@ -243,8 +319,11 @@ impl Default for RelayStatus {
             known_peers: Mutex::new(DiscoveredPeers::default()),
             outbound: Mutex::new(None),
             local_peer_id: Mutex::new(None),
+            local_network_id: Mutex::new(None),
+            inbound_accept: Mutex::new(None),
             tunnels: Mutex::new(HashMap::new()),
             relay_seq: AtomicU64::new(0),
+            next_tunnel_id: AtomicU64::new(0),
         }
     }
 }
@@ -362,11 +441,32 @@ impl RelayStatus {
     // `outbound` (drained by the reservation loop's write half), inbound `relay_message` frames are
     // routed by `from` peer_id to the matching tunnel. Available only while the reservation is held.
 
-    /// Install the live session's outbound sink + this node's `peer_id`. Called by `connect_once`
-    /// once registered; cleared by [`clear_transport`](Self::clear_transport) on every drop.
-    fn set_transport(&self, peer_id: &str, outbound: mpsc::UnboundedSender<RelayMessage>) {
+    /// Install the live session's outbound sink + this node's `peer_id` + the registered `network_id`.
+    /// Called by `connect_once` once registered; cleared by [`clear_transport`](Self::clear_transport)
+    /// on every drop.
+    fn set_transport(
+        &self,
+        peer_id: &str,
+        network_id: &str,
+        outbound: mpsc::UnboundedSender<RelayMessage>,
+    ) {
         *self.local_peer_id.lock().unwrap() = Some(peer_id.to_string());
+        *self.local_network_id.lock().unwrap() = Some(network_id.to_string());
         *self.outbound.lock().unwrap() = Some(outbound);
+    }
+
+    /// Enable the RESPONDER (accept) path and return the receiver of INTRODUCED inbound circuits.
+    ///
+    /// A relayed connection needs one mTLS client + one mTLS server. The dialer opens a tunnel and
+    /// runs the client; the reservation-HOLDER calls this once at startup and, for every inbound
+    /// frame from a peer it has no open outbound tunnel to, receives a server-role [`RelayTunnel`]
+    /// here to hand to a [`crate::accept::RelayAcceptor`] (which runs `PeerSession::server`). Until a
+    /// consumer calls this, unknown-peer frames are DROPPED (the untrusted-relay default), so the
+    /// accept path is strictly opt-in. The channel is bounded ([`INBOUND_ACCEPT_CAP`]).
+    pub fn enable_accept(&self) -> mpsc::Receiver<RelayTunnel> {
+        let (tx, rx) = mpsc::channel(INBOUND_ACCEPT_CAP);
+        *self.inbound_accept.lock().unwrap() = Some(tx);
+        rx
     }
 
     /// Tear down the transport on session drop: drop the outbound sink (so tunnel sends fail fast)
@@ -395,23 +495,86 @@ impl RelayStatus {
         if !self.relay_transport_ready() {
             return Err("relay reservation not connected — cannot open relayed tunnel".into());
         }
-        let (tx, rx) = mpsc::channel(RELAY_TUNNEL_INBOUND_CAP);
-        self.tunnels
+        // Self / SPKI-collision guard: a relayed circuit to our OWN peer_id has no lower/higher end
+        // for the glare tie-break, so it could never converge to one-client-one-server — refuse it
+        // (#1536).
+        let local = self
+            .local_peer_id
             .lock()
             .unwrap()
-            .insert(target_peer.to_string(), tx);
-        Ok(RelayTunnel {
+            .clone()
+            .unwrap_or_default();
+        if !local.is_empty() && local == target_peer {
+            return Err("refusing relayed self-dial (target == local peer_id)".into());
+        }
+        // NON-CLOBBER (#1536): if a circuit to this peer already exists — because an introduced
+        // ClientHello made us its SERVER before this dial ran (a timing-ordered glare) — do NOT open a
+        // second, conflicting circuit under the same key. The existing circuit IS the connection; a
+        // duplicate would orphan one role and leave two mTLS sessions racing to one peer. Checked +
+        // inserted under ONE lock so a concurrent `route_relayed` cannot slip a role in between.
+        let mut tunnels = self.tunnels.lock().unwrap();
+        if tunnels.contains_key(target_peer) {
+            return Err("existing relay circuit to peer — not opening a duplicate".into());
+        }
+        // A dialer runs the mTLS client over the tunnel it opens.
+        Ok(self.insert_entry(&mut tunnels, target_peer, network_id, TunnelRole::Client))
+    }
+
+    /// Register a tunnel routing entry for `target_peer` and build its [`RelayTunnel`], overwriting any
+    /// existing entry under the key. Test-only (the `open_server_tunnel` + flood-cap tests use it); the
+    /// production paths ([`open_tunnel`](Self::open_tunnel) + [`accept_introduced`](Self::accept_introduced))
+    /// go through non-clobber checks first.
+    #[cfg(test)]
+    fn register_tunnel(
+        self: &Arc<Self>,
+        target_peer: &str,
+        network_id: &str,
+        role: TunnelRole,
+    ) -> RelayTunnel {
+        let mut tunnels = self.tunnels.lock().unwrap();
+        self.insert_entry(&mut tunnels, target_peer, network_id, role)
+    }
+
+    /// Build a fresh [`RelayTunnel`] for `target_peer` with `role` and insert its entry into the
+    /// already-locked `tunnels` map (assigning a monotonic id so a stale `Drop` never evicts a newer
+    /// registration). The caller holds the lock, so the check-then-insert is atomic — the #1536
+    /// non-clobber + role-race defense.
+    fn insert_entry(
+        self: &Arc<Self>,
+        tunnels: &mut HashMap<String, TunnelEntry>,
+        target_peer: &str,
+        network_id: &str,
+        role: TunnelRole,
+    ) -> RelayTunnel {
+        let (tx, rx) = mpsc::channel(RELAY_TUNNEL_INBOUND_CAP);
+        let id = self.next_tunnel_id.fetch_add(1, Ordering::Relaxed);
+        tunnels.insert(target_peer.to_string(), TunnelEntry { sink: tx, role, id });
+        RelayTunnel {
             target: target_peer.to_string(),
             network_id: network_id.to_string(),
             status: Arc::clone(self),
             inbound: rx,
-        })
+            id,
+        }
     }
 
     /// Route one inbound RLY-002 `relay_message` to its tunnel by `from` peer_id. Oversized payloads
-    /// are dropped (size cap); a frame from a peer with no open tunnel is dropped; a full inbound
-    /// channel drops the frame (backpressure). Returns silently in every drop case (untrusted relay).
-    fn route_relayed(&self, from: &str, payload: Vec<u8>) {
+    /// are dropped (size cap); a frame from a peer with no open tunnel becomes an introduced circuit
+    /// (accepted as a server, or dropped when the responder path is off / a flood cap is hit); a full
+    /// inbound channel drops the frame (backpressure). Returns silently in every drop case (untrusted
+    /// relay).
+    ///
+    /// GLARE (#1536): when a ClientHello arrives on a tunnel where WE are ALSO the client — the peer
+    /// dialed us at the same time we dialed it — a deterministic tie-break makes exactly ONE side the
+    /// server: the numerically-LOWER `peer_id` becomes the server. Both ends compute the same rule, so
+    /// a crossed pair converges to one-client-one-server under ANY frame ordering with no retry loop.
+    /// The TIMING-ordered variant (a peer's ClientHello arrives BEFORE our own dial registers) cannot
+    /// produce a conflicting second circuit either: [`open_tunnel`](Self::open_tunnel) is non-clobber,
+    /// so once we serve a peer our later dial to it is refused. The per-frame role LOOKUP + any
+    /// same-frame yield (client-tunnel removal) happen under a single lock acquisition; the server
+    /// registration in [`accept_introduced`](Self::accept_introduced) re-acquires and re-checks
+    /// (non-clobber), so a dial racing between the two regions is abandoned, never a double-session.
+    fn route_relayed(self: &Arc<Self>, from: &str, payload: Vec<u8>) {
         if payload.len() > MAX_RELAY_PAYLOAD {
             tracing::debug!(
                 from,
@@ -420,17 +583,144 @@ impl RelayStatus {
             );
             return;
         }
-        let sink = self.tunnels.lock().unwrap().get(from).cloned();
-        if let Some(sink) = sink {
-            if sink.try_send(payload).is_err() {
-                tracing::debug!(from, "relayed tunnel inbound full/closed — frame dropped");
+        let local = self
+            .local_peer_id
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_default();
+        // Self / SPKI-collision guard: a frame stamped with our OWN id can never be a real remote peer
+        // (and the tie-break has no lower/higher end for it) — drop it rather than risk a no-server
+        // hang (#1536).
+        if !local.is_empty() && local == from {
+            tracing::debug!("dropping relayed frame stamped with our own peer_id (self/collision)");
+            return;
+        }
+
+        // Decide the action for this frame under ONE tunnels-lock so a concurrent `open_tunnel` cannot
+        // race the role assignment.
+        enum Route {
+            /// Deliver into an existing tunnel's inbound sink.
+            Deliver(mpsc::Sender<Vec<u8>>),
+            /// Drop the frame (we retain our client role, or cannot serve).
+            Ignore,
+            /// Accept as an introduced server-role circuit.
+            Accept,
+        }
+        let route = {
+            let mut tunnels = self.tunnels.lock().unwrap();
+            match tunnels.get(from).map(|e| (e.sink.clone(), e.role, e.id)) {
+                // We are the SERVER for this peer — every frame is the client's; route it.
+                Some((sink, TunnelRole::Server, _)) => Route::Deliver(sink),
+                // We are the CLIENT. A ServerHello / app record is the expected response; a ClientHello
+                // means the peer dialed us at the same time (GLARE).
+                Some((sink, TunnelRole::Client, id)) => {
+                    if !is_tls_client_hello(&payload) {
+                        Route::Deliver(sink)
+                    } else if local.as_str() > from {
+                        // Higher id → WE keep the client role; ignore the peer's competing ClientHello
+                        // (the lower-id peer yields to server and answers with a ServerHello).
+                        tracing::debug!(
+                            from,
+                            "relay glare — retaining client role (peer yields to server)"
+                        );
+                        Route::Ignore
+                    } else if self.inbound_accept.lock().unwrap().is_none() {
+                        // Lower id → should be server, but no responder path is enabled; cannot serve,
+                        // so keep the (doomed) client tunnel and drop rather than tear it down.
+                        tracing::debug!(
+                            from,
+                            "relay glare — should be server but accept path off; dropping"
+                        );
+                        Route::Ignore
+                    } else {
+                        // Lower id → yield to the server role: drop our client tunnel (only if it is
+                        // still ours) and accept the peer's circuit as server below.
+                        if tunnels.get(from).map(|e| e.id) == Some(id) {
+                            tunnels.remove(from);
+                        }
+                        tracing::debug!(from, "relay glare — yielding to server role");
+                        Route::Accept
+                    }
+                }
+                // No circuit yet — an INTRODUCED inbound circuit (a peer dialing us over the relay).
+                None => Route::Accept,
             }
+        };
+
+        match route {
+            Route::Deliver(sink) => {
+                if sink.try_send(payload).is_err() {
+                    tracing::debug!(from, "relayed tunnel inbound full/closed — frame dropped");
+                }
+            }
+            Route::Ignore => {}
+            Route::Accept => self.accept_introduced(from, payload),
         }
     }
 
-    /// Remove a tunnel's routing entry (called on [`RelayTunnel`] drop).
-    fn close_tunnel(&self, target_peer: &str) {
-        self.tunnels.lock().unwrap().remove(target_peer);
+    /// Accept an INTRODUCED inbound circuit from `from` as a server-role tunnel and surface it to the
+    /// consumer's [`RelayAcceptor`](crate::accept::RelayAcceptor) — the RESPONDER path. Gated on: the
+    /// responder path being enabled ([`enable_accept`](Self::enable_accept)), NON-CLOBBER (a circuit
+    /// already under this key is kept, never replaced by a racing registration — the #1536
+    /// double-session defense), and the flood cap ([`MAX_RELAY_TUNNELS`]). The opening frame (the
+    /// dialer's ClientHello) is delivered into the fresh tunnel so the server handshake sees it; a full
+    /// accept channel drops the newest circuit (bounded backpressure).
+    fn accept_introduced(self: &Arc<Self>, from: &str, payload: Vec<u8>) {
+        let Some(accept_tx) = self.inbound_accept.lock().unwrap().clone() else {
+            return;
+        };
+        let network_id = self
+            .local_network_id
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_default();
+        let tunnel = {
+            let mut tunnels = self.tunnels.lock().unwrap();
+            if tunnels.contains_key(from) {
+                // A circuit to this peer already exists (a racing dial claimed the key) — do NOT
+                // clobber it into a conflicting second session.
+                return;
+            }
+            if tunnels.len() >= MAX_RELAY_TUNNELS {
+                tracing::debug!(
+                    from,
+                    "inbound relay accept cap reached — dropping introduced circuit"
+                );
+                return;
+            }
+            self.insert_entry(&mut tunnels, from, &network_id, TunnelRole::Server)
+        };
+        // Deliver the opening frame so the server-side handshake sees the ClientHello.
+        if let Some(sink) = self
+            .tunnels
+            .lock()
+            .unwrap()
+            .get(from)
+            .map(|e| e.sink.clone())
+        {
+            let _ = sink.try_send(payload);
+        }
+        // Hand the server-role tunnel to the consumer to run `PeerSession::server` over. A full/closed
+        // accept channel drops the tunnel here — its `Drop` deregisters the routing.
+        if accept_tx.try_send(tunnel).is_err() {
+            tracing::debug!(
+                from,
+                "inbound accept channel full/closed — dropping introduced circuit"
+            );
+        }
+    }
+
+    /// Remove a tunnel's routing entry (called on [`RelayTunnel`] drop) — but ONLY when the stored
+    /// entry is still THIS registration (`id` matches). A glare tie-break can replace our client
+    /// tunnel with a server tunnel under the same peer key (#1536); the old client tunnel's `Drop`
+    /// must not then evict the newer server entry.
+    fn close_tunnel(&self, target_peer: &str, id: u64) {
+        let mut tunnels = self.tunnels.lock().unwrap();
+        if tunnels.get(target_peer).map(|e| e.id) == Some(id) {
+            tunnels.remove(target_peer);
+        }
     }
 
     /// Whether a relayed tunnel to `target_peer` is currently registered — the test hook fast-connect
@@ -439,6 +729,20 @@ impl RelayStatus {
     #[cfg(test)]
     pub(crate) fn open_tunnel_exists(&self, target_peer: &str) -> bool {
         self.tunnels.lock().unwrap().contains_key(target_peer)
+    }
+
+    /// Test-only: register a SERVER-role tunnel to `target_peer` directly, for tests that drive an mTLS
+    /// SERVER over a hand-wired relay tunnel (the production server path is [`enable_accept`] +
+    /// [`route_relayed`]'s accept branch). A server-role tunnel routes an incoming ClientHello straight
+    /// through instead of treating it as the #1536 glare signal, so these tests mirror a real server
+    /// receiving a dialer's ClientHello.
+    #[cfg(test)]
+    pub(crate) fn open_server_tunnel(
+        self: &Arc<Self>,
+        target_peer: &str,
+        network_id: &str,
+    ) -> RelayTunnel {
+        self.register_tunnel(target_peer, network_id, TunnelRole::Server)
     }
 
     /// A JSON snapshot for a `control.relayStatus`-style RPC. `state` is the canonical truth;
@@ -473,6 +777,9 @@ pub struct RelayTunnel {
     /// Inbound payloads the relay forwarded from `target`, in arrival order (bounded — see
     /// [`RELAY_TUNNEL_INBOUND_CAP`]).
     inbound: mpsc::Receiver<Vec<u8>>,
+    /// This registration's monotonic id — so `Drop` only deregisters when the map still holds THIS
+    /// entry (a glare replace may have superseded it under the same key; #1536).
+    id: u64,
 }
 
 impl RelayTunnel {
@@ -537,7 +844,7 @@ impl RelayTunnel {
 
 impl Drop for RelayTunnel {
     fn drop(&mut self) {
-        self.status.close_tunnel(&self.target);
+        self.status.close_tunnel(&self.target, self.id);
     }
 }
 
@@ -785,7 +1092,7 @@ async fn connect_once(
     // Publish the outbound sink so RLY-002 relayed tunnels can reuse THIS persistent socket. Drained
     // in the select loop below; cleared when the session ends.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<RelayMessage>();
-    status.set_transport(peer_id, out_tx);
+    status.set_transport(peer_id, network_id, out_tx);
 
     // RLY-005: pull the current peer list right away, then again periodically — all over THIS
     // persistent socket, so discovery never requires reopening a connection.
@@ -938,8 +1245,8 @@ pub(crate) fn loopback_reservation_pair(
 
     let (a_tx, mut a_rx) = mpsc::unbounded_channel::<RelayMessage>();
     let (b_tx, mut b_rx) = mpsc::unbounded_channel::<RelayMessage>();
-    a.set_transport(a_id, a_tx);
-    b.set_transport(b_id, b_tx);
+    a.set_transport(a_id, DEFAULT_NETWORK_ID, a_tx);
+    b.set_transport(b_id, DEFAULT_NETWORK_ID, b_tx);
 
     // Drain a's outbound → forward into b (route by `from`), and symmetrically b → a. This is the
     // relay's forwarding role, in-process.
@@ -1099,5 +1406,205 @@ mod tests {
 
         assert_eq!(winner.conn, v6, "IPv6 preferred when both are viable");
         assert_eq!(winner.family, Family::V6);
+    }
+
+    /// Build a `Connected` status with a live (dummy) outbound sink + local identity, so
+    /// `route_relayed`'s introduced-circuit path can run without a real relay socket.
+    fn connected_status(local_id: &str) -> Arc<RelayStatus> {
+        let status = RelayStatus::new();
+        status.set_connected(1);
+        let (out_tx, _out_rx) = mpsc::unbounded_channel::<RelayMessage>();
+        status.set_transport(local_id, DEFAULT_NETWORK_ID, out_tx);
+        // These tests exercise the introduced-circuit ROUTING (register/accept/drop), which never uses
+        // the outbound sink, so the receiver may drop at end of scope — the sink stays `Some`.
+        status
+    }
+
+    /// SECURITY (accept OFF): with NO responder path enabled, an introduced RLY-002 frame from an
+    /// unknown peer is DROPPED — no tunnel is created and nothing is surfaced. This is the
+    /// untrusted-relay default: a node that never opted into accepting relayed circuits cannot be made
+    /// to spawn one by a hostile relay.
+    #[test]
+    fn introduced_frame_dropped_when_accept_disabled() {
+        let status = connected_status("00aa");
+        // A ClientHello-shaped frame from a peer we hold NO tunnel to — the introduced-circuit trigger.
+        status.route_relayed("ffbb", vec![0x16, 0x03, 0x01, 0x00, 0x05, 0x01, 0, 0, 0, 0]);
+        assert!(
+            !status.open_tunnel_exists("ffbb"),
+            "no tunnel surfaced for an introduced circuit while accept is off"
+        );
+        assert_eq!(
+            status.tunnels.lock().unwrap().len(),
+            0,
+            "accept-off drops the introduced circuit entirely"
+        );
+    }
+
+    /// SECURITY (flood defense, tunnel cap): once [`MAX_RELAY_TUNNELS`] tunnels are open, a further
+    /// introduced circuit from a new peer is DROPPED rather than registered — a hostile relay flooding
+    /// distinct fabricated `from` ids cannot spawn unbounded server tunnels/accept-tasks.
+    #[test]
+    fn introduced_circuit_dropped_at_max_tunnels_cap() {
+        let status = connected_status("00aa");
+        let mut accept_rx = status.enable_accept();
+        // Saturate the tunnel table at the cap (held open by the returned RelayTunnels).
+        let mut held = Vec::new();
+        for i in 0..MAX_RELAY_TUNNELS {
+            held.push(status.register_tunnel(
+                &format!("peer{i:05}"),
+                DEFAULT_NETWORK_ID,
+                TunnelRole::Server,
+            ));
+        }
+        assert_eq!(status.tunnels.lock().unwrap().len(), MAX_RELAY_TUNNELS);
+
+        status.route_relayed("overflowpeer", vec![1, 2, 3]);
+        assert!(
+            !status.open_tunnel_exists("overflowpeer"),
+            "an introduced circuit beyond the tunnel cap is dropped, not registered"
+        );
+        assert_eq!(
+            status.tunnels.lock().unwrap().len(),
+            MAX_RELAY_TUNNELS,
+            "tunnel count never grows past the cap"
+        );
+        assert!(
+            accept_rx.try_recv().is_err(),
+            "the capped circuit is never surfaced to the acceptor"
+        );
+        drop(held);
+    }
+
+    /// SECURITY (flood defense, accept channel): when the bounded inbound-accept channel
+    /// ([`INBOUND_ACCEPT_CAP`]) is full — the consumer is not accepting fast enough — a further
+    /// introduced circuit is DROPPED (its freshly-registered tunnel is torn down), bounded
+    /// backpressure rather than unbounded queueing.
+    #[test]
+    fn introduced_circuit_dropped_when_accept_channel_full() {
+        let status = connected_status("00aa");
+        let mut accept_rx = status.enable_accept();
+        // Fill the accept channel to capacity WITHOUT draining it — each surfaced circuit occupies one
+        // slot and keeps its server tunnel registered (the RelayTunnel lives in the channel).
+        for i in 0..INBOUND_ACCEPT_CAP {
+            status.route_relayed(&format!("in{i:05}"), vec![9, 9, 9]);
+        }
+        assert_eq!(
+            status.tunnels.lock().unwrap().len(),
+            INBOUND_ACCEPT_CAP,
+            "each surfaced circuit registered exactly one server tunnel"
+        );
+
+        // One more: the accept channel is full → the tunnel is registered then immediately dropped,
+        // so its routing is deregistered and nothing new is surfaced.
+        status.route_relayed("overflow", vec![9, 9, 9]);
+        assert!(
+            !status.open_tunnel_exists("overflow"),
+            "an introduced circuit is dropped when the accept channel is full"
+        );
+
+        let mut surfaced = 0;
+        while accept_rx.try_recv().is_ok() {
+            surfaced += 1;
+        }
+        assert_eq!(
+            surfaced, INBOUND_ACCEPT_CAP,
+            "exactly the channel capacity surfaced — never the overflow circuit"
+        );
+    }
+
+    /// REGRESSION (#1536 glare, TIMING order): a peer's ClientHello arrives BEFORE our own dial to it
+    /// registers. We accept it as a server; our later dial to the SAME peer MUST then be refused
+    /// (non-clobber) so no conflicting second circuit / double mTLS session is created. This is the
+    /// deeper ordering the first tie-break missed (role was decided by who-registered-first).
+    #[test]
+    fn clienthello_before_local_dial_does_not_double_register() {
+        let status = connected_status("bbbb");
+        let mut accept_rx = status.enable_accept();
+
+        // The peer's introduced ClientHello arrives first → we accept it as a server-role circuit.
+        status.route_relayed("aaaa", vec![0x16, 0x03, 0x01, 0x00, 0x05, 0x01, 0, 0, 0, 0]);
+        assert!(status.open_tunnel_exists("aaaa"));
+        let _server_tunnel = accept_rx
+            .try_recv()
+            .expect("introduced circuit surfaced as a server");
+
+        // Our own dial to that peer now must be REFUSED — the existing circuit is the connection.
+        let dial = status.open_tunnel("aaaa", DEFAULT_NETWORK_ID);
+        assert!(
+            dial.is_err(),
+            "a second dial to a peer we already serve is refused (no double-session)"
+        );
+        assert_eq!(
+            status.tunnels.lock().unwrap().len(),
+            1,
+            "exactly one circuit per peer — never a conflicting client+server pair"
+        );
+    }
+
+    /// REGRESSION (#1536 equal-id): a relayed self-dial, or a frame stamped with our OWN peer_id
+    /// (theoretical SPKI collision / a hostile relay reflecting our id), has no lower/higher end for
+    /// the tie-break — it MUST be rejected outright, never producing a no-server hang.
+    #[test]
+    fn self_dial_and_self_stamped_frame_rejected() {
+        let status = connected_status("cccc");
+        assert!(
+            status.open_tunnel("cccc", DEFAULT_NETWORK_ID).is_err(),
+            "a relayed self-dial (target == local id) is refused"
+        );
+
+        let mut accept_rx = status.enable_accept();
+        status.route_relayed("cccc", vec![0x16, 0x03, 0x01, 0x00, 0x05, 0x01, 0, 0, 0, 0]);
+        assert!(
+            !status.open_tunnel_exists("cccc"),
+            "a frame stamped with our own id is dropped, never registered"
+        );
+        assert!(
+            accept_rx.try_recv().is_err(),
+            "a self-stamped frame is never surfaced as an accept"
+        );
+    }
+
+    /// SECURITY (#1536 relay-injected-ClientHello DoS): an untrusted relay can inject a bogus
+    /// ClientHello on a lower-id node's client tunnel to force it to yield its outbound dial to a
+    /// server accept that no real peer completes. mTLS identity is never bypassed, but the outbound
+    /// dial MUST NOT be permanently lost — once the bogus (never-completing) server circuit is dropped,
+    /// the peer key frees and a fresh dial is possible.
+    #[test]
+    fn injected_clienthello_yield_does_not_permanently_block_redial() {
+        // local id "00aa" is numerically lower than the peer "ffff", so we are the yield-to-server side.
+        let status = connected_status("00aa");
+        let mut accept_rx = status.enable_accept();
+
+        let client_tunnel = status
+            .open_tunnel("ffff", DEFAULT_NETWORK_ID)
+            .expect("outbound relayed dial opens");
+        assert!(status.open_tunnel_exists("ffff"));
+
+        // The relay injects a bogus ClientHello with from=ffff → glare on our client tunnel → we (the
+        // lower id) yield: drop the client tunnel, surface a server accept.
+        status.route_relayed("ffff", vec![0x16, 0x03, 0x01, 0x00, 0x05, 0x01, 0, 0, 0, 0]);
+        let server_tunnel = accept_rx
+            .try_recv()
+            .expect("the injected ClientHello yielded a server accept");
+
+        // The original outbound dial is cancelled; dropping its handle must NOT evict the newer server
+        // entry (generation-id guard).
+        drop(client_tunnel);
+        assert!(
+            status.open_tunnel_exists("ffff"),
+            "the server circuit survives the cancelled client dial's drop"
+        );
+
+        // The bogus circuit completes no handshake; once its tunnel is dropped the key frees...
+        drop(server_tunnel);
+        assert!(
+            !status.open_tunnel_exists("ffff"),
+            "dropping the never-completing server circuit releases the peer key"
+        );
+        // ...and a fresh dial is possible — no permanent lockout from the injected frame.
+        assert!(
+            status.open_tunnel("ffff", DEFAULT_NETWORK_ID).is_ok(),
+            "a fresh outbound dial succeeds after the bogus injection is cleaned up"
+        );
     }
 }
