@@ -4,13 +4,10 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
-## [0.11.0] - 2026-07-22
+## [0.11.0] - 2026-07-23
 
-### Features
-- **dig-nat:** Relayed responder path — a reservation-holder ACCEPTS an introduced relay circuit and
-  runs the mTLS server (`RelayAcceptor` + `RelayStatus::enable_accept`), so a relay circuit has one
-  TLS client + one TLS server. Fixes the tier-6 role inversion that deadlocked relayed connect with
-  `got ClientHello when expecting ServerHello` (#1536, #1532 Defect 2).
+### Bug Fixes
+- **dig-nat:** Relayed responder path — accept introduced circuits as mTLS server (#1536) (#14)
 
 ## [0.10.0] - 2026-07-21
 
