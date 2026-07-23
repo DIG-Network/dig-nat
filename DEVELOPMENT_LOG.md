@@ -75,9 +75,13 @@ Three things make it robust under ALL orderings:
    circuit (client OR server) IS the connection. This kills the timing-ordered double-session: once we
    serve a peer, our later dial to it is refused instead of clobbering. The accept path is likewise
    non-clobber (never overwrites an existing entry).
-2. **Decide the role under ONE tunnels-lock.** The get-role → (deliver | ignore | yield+accept) decision
-   must be atomic against a concurrent `open_tunnel`, or a dial can slip a client entry in between the
-   read and the yield.
+2. **Take the per-frame role lookup + yield under one lock; let non-clobber cover the seam.** The
+   get-role → (deliver | ignore | yield-remove-client) decision runs under a single `tunnels`-lock
+   acquisition. The follow-on server registration (`accept_introduced`) re-acquires the lock and
+   re-checks for an existing entry, so the yield→accept transition spans TWO lock regions — that is
+   benign because the re-check is non-clobber: a dial that races in between abandons the server register
+   rather than clobbering into a double-session. (Don't be misled into thinking it's one atomic region;
+   the safety comes from non-clobber, not from a single critical section across remove+reinsert.)
 3. **Self / SPKI-collision guard.** A dial to our own id, or an inbound frame stamped with our own id
    (a hostile relay can reflect it), has no lower/higher end for the tie-break → must be rejected, not
    left to hang with no server.

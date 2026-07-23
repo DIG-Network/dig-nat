@@ -300,8 +300,11 @@ INITIATED:
   the introduced-circuit accept path **MUST NOT** overwrite an existing entry. This covers the
   TIMING-ordered glare variant — a peer's ClientHello arriving BEFORE our own dial to it registers: we
   accept it as a server, and our subsequent dial to that peer is refused rather than clobbering the
-  server circuit into a conflicting second mTLS session. The role decision + registration are performed
-  under one lock so a concurrent dial cannot race a role in.
+  server circuit into a conflicting second mTLS session. The per-frame role LOOKUP + any same-frame
+  yield (client-tunnel removal) are performed under a single `tunnels`-lock acquisition; the subsequent
+  server registration re-acquires the lock and re-checks for an existing entry (the non-clobber guard),
+  so a dial that races in between the two regions cannot produce a conflicting second circuit — the
+  registration is abandoned rather than clobbering.
 - **Self / collision guard (NORMATIVE).** A relayed dial whose target equals the local `peer_id`, and an
   inbound frame stamped with the local `peer_id` (a theoretical SPKI collision, or a hostile relay
   reflecting our own id), **MUST** be rejected — such a pair has no lower/higher end for the tie-break

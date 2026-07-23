@@ -570,8 +570,10 @@ impl RelayStatus {
     /// a crossed pair converges to one-client-one-server under ANY frame ordering with no retry loop.
     /// The TIMING-ordered variant (a peer's ClientHello arrives BEFORE our own dial registers) cannot
     /// produce a conflicting second circuit either: [`open_tunnel`](Self::open_tunnel) is non-clobber,
-    /// so once we serve a peer our later dial to it is refused. The role decision runs under ONE
-    /// tunnels-lock so a concurrent dial cannot race it.
+    /// so once we serve a peer our later dial to it is refused. The per-frame role LOOKUP + any
+    /// same-frame yield (client-tunnel removal) happen under a single lock acquisition; the server
+    /// registration in [`accept_introduced`](Self::accept_introduced) re-acquires and re-checks
+    /// (non-clobber), so a dial racing between the two regions is abandoned, never a double-session.
     fn route_relayed(self: &Arc<Self>, from: &str, payload: Vec<u8>) {
         if payload.len() > MAX_RELAY_PAYLOAD {
             tracing::debug!(
