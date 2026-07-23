@@ -59,3 +59,32 @@ Test gotcha: tests that pre-open a tunnel via `open_tunnel` and then run an mTLS
 misfire, because `open_tunnel` tags the entry `Client` and the incoming ClientHello is read as glare.
 Production servers never do this (they use `enable_accept`); the tests need a Server-role opener
 (`open_server_tunnel`, test-only) to mirror a real server receiving a dialer's ClientHello.
+
+## Relay glare, part 2 — the tie-break alone is not enough; role must be non-clobber + decided under one lock
+
+The first #1536 glare fix applied the lower-id-is-server tie-break only on the existing-client-tunnel
+path, which silently assumed both client tunnels register BEFORE either ClientHello arrives. A deeper
+race breaks that: if peer A's ClientHello reaches B BEFORE B's own dial to A registers, B accepts A as
+server (introduced-circuit path, no tunnel yet); B then dials A and the unconditional `register_tunnel`
+insert CLOBBERS B's own server entry → an orphaned server accept task PLUS a client dialer under the same
+key → two conflicting mTLS sessions to one peer → TLS error/hang. Role was effectively decided by
+who-registered-first (timing), not by peer_id.
+
+Three things make it robust under ALL orderings:
+1. **Non-clobber `open_tunnel`.** Refuse a dial to a peer a circuit already exists for — the existing
+   circuit (client OR server) IS the connection. This kills the timing-ordered double-session: once we
+   serve a peer, our later dial to it is refused instead of clobbering. The accept path is likewise
+   non-clobber (never overwrites an existing entry).
+2. **Decide the role under ONE tunnels-lock.** The get-role → (deliver | ignore | yield+accept) decision
+   must be atomic against a concurrent `open_tunnel`, or a dial can slip a client entry in between the
+   read and the yield.
+3. **Self / SPKI-collision guard.** A dial to our own id, or an inbound frame stamped with our own id
+   (a hostile relay can reflect it), has no lower/higher end for the tie-break → must be rejected, not
+   left to hang with no server.
+
+Untrusted-relay caveat worth remembering: since the glare ClientHello is an opaque relayed frame, a
+relay can INJECT a bogus 0x16..0x01 frame on a lower-id node's client tunnel to force it to yield its
+real outbound dial to a server accept nothing completes — a selective relayed-dial DoS. mTLS identity is
+never bypassed (the bogus circuit authenticates nothing), and the dial is not permanently lost (dropping
+the dead server circuit frees the peer key for a re-dial), but consumers should bound the server-accept
+with a timeout and re-dial on failure. It is an availability property inherent to an untrusted TURN relay.

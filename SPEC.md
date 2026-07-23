@@ -294,9 +294,30 @@ INITIATED:
   ServerHello / application record on a client-role tunnel is the expected response and is routed
   normally — it is NOT glare. Each tunnel registration carries a monotonic id so a yielded client
   tunnel's teardown never deregisters the replacement server tunnel under the same peer key.
+- **At most ONE circuit per peer key — non-clobber (NORMATIVE).** A node **MUST NOT** hold two circuits
+  (a client dial AND a server accept) to the same peer simultaneously. Opening a relayed dial to a peer
+  a live circuit already exists for **MUST** be refused (the existing circuit IS the connection), and
+  the introduced-circuit accept path **MUST NOT** overwrite an existing entry. This covers the
+  TIMING-ordered glare variant — a peer's ClientHello arriving BEFORE our own dial to it registers: we
+  accept it as a server, and our subsequent dial to that peer is refused rather than clobbering the
+  server circuit into a conflicting second mTLS session. The role decision + registration are performed
+  under one lock so a concurrent dial cannot race a role in.
+- **Self / collision guard (NORMATIVE).** A relayed dial whose target equals the local `peer_id`, and an
+  inbound frame stamped with the local `peer_id` (a theoretical SPKI collision, or a hostile relay
+  reflecting our own id), **MUST** be rejected — such a pair has no lower/higher end for the tie-break
+  and would otherwise hang with no server.
+- **Injected-ClientHello availability caveat (SECURITY).** Because an introduced/glare ClientHello is an
+  opaque relayed frame, an untrusted relay CAN inject a fabricated ClientHello on a lower-id node's
+  client tunnel to force it to yield its outbound dial to a server accept that no real peer completes —
+  a selective relayed-dial denial (both legs fail). This never bypasses mTLS identity (the injected
+  circuit authenticates nothing), but it is an availability lever inherent to an untrusted TURN relay.
+  The dial is NOT permanently lost: once the never-completing server circuit is dropped, the peer key
+  frees and a fresh dial may be attempted. Consumers **SHOULD** bound the server-accept handshake with a
+  timeout and re-attempt the outbound dial on failure.
 
 Without a responder path, both circuit ends acted as TLS client and the handshake deadlocked; without
-the glare tie-break, a simultaneous mutual dial re-manifested the same deadlock
+the deterministic role tie-break + non-clobber, a simultaneous or timing-ordered mutual dial
+re-manifested the same deadlock or spawned two conflicting sessions to one peer
 (`got ClientHello when expecting ServerHello`, #1536).
 
 ## 4b. Fast-connect — first-usable transport + live relayed→direct promotion (NORMATIVE)
