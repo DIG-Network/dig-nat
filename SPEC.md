@@ -281,8 +281,22 @@ INITIATED:
   bounded — a full channel drops the newest introduced circuit rather than queueing unboundedly. A
   hostile relay flooding fabricated `from` ids therefore cannot exhaust memory or spawn unbounded
   accept tasks.
+- **GLARE — simultaneous mutual dial (NORMATIVE).** Two peers that fall to the relay tier and dial EACH
+  OTHER at the same time both open a client-role tunnel, so each side's ClientHello arrives on a tunnel
+  where it is ALSO the client. This **MUST** be resolved deterministically so exactly one side is the
+  server: **the peer with the numerically-lower `peer_id` (lexicographic compare of the hex
+  `SHA-256(SPKI)` id) becomes the mTLS SERVER.** Both ends compute the same rule from the two ids, so a
+  crossed pair converges to one-client-one-server under ANY frame ordering with NO retry loop. When a
+  ClientHello (a TLS handshake record: content-type `0x16`, handshake type `0x01`) arrives on a
+  client-role tunnel: the lower-id side **MUST** drop its outbound client tunnel and accept the peer's
+  circuit as server (via the responder path above); the higher-id side **MUST** retain its client role
+  and ignore the peer's competing ClientHello (the peer yields and answers with a ServerHello). A
+  ServerHello / application record on a client-role tunnel is the expected response and is routed
+  normally — it is NOT glare. Each tunnel registration carries a monotonic id so a yielded client
+  tunnel's teardown never deregisters the replacement server tunnel under the same peer key.
 
-Without this responder path, both circuit ends acted as TLS client and the handshake deadlocked
+Without a responder path, both circuit ends acted as TLS client and the handshake deadlocked; without
+the glare tie-break, a simultaneous mutual dial re-manifested the same deadlock
 (`got ClientHello when expecting ServerHello`, #1536).
 
 ## 4b. Fast-connect — first-usable transport + live relayed→direct promotion (NORMATIVE)
