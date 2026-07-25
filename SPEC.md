@@ -393,6 +393,12 @@ re-manifested the same deadlock or spawned two conflicting sessions to one peer
   (`PeerConnection::open_stream`), byte-range streams (`PeerConnection::open_range_stream`,
   `dig.fetchRange`), and availability pre-checks (`PeerConnection::query_availability`,
   `dig.getAvailability`). Field names + wire shapes conform to the L7 peer-network spec.
+- A `dig.fetchRange` stream carries a `RangeRequest` preamble followed by `RangeFrame`s, each a
+  `u32`-BE length-prefixed JSON body. A frame's `bytes` field **MUST** be the **base64** encoding of
+  that window's ciphertext — the canonical `dig.fetchRange` frame wire
+  (`dig_rpc_protocol::types::RangeFrame`), identical to what the DIG node's peer serve path emits. A
+  reader **MUST** also accept a JSON byte ARRAY for `bytes` (the pre-0.11.2 dig-nat encoding) so a
+  mixed-version peer still decodes.
 
 ## 5a. Persistent relay reservation + discovery (NORMATIVE)
 

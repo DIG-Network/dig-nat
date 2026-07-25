@@ -149,3 +149,67 @@ fn relay_peer_info_field_names() {
         assert!(v.get(key).is_some(), "missing wire field {key}");
     }
 }
+
+// -- RangeFrame `bytes` — base64, the canonical `dig.fetchRange` frame wire (#1586) ---------------
+
+/// A `dig.fetchRange` frame as the CANONICAL producer serves it: `bytes` is a **base64 string**
+/// (`dig_rpc_protocol::types::RangeFrame` — "this window's ciphertext, base64"; the dig-node peer
+/// serve path emits exactly this shape). dig-nat's [`RangeFrame`] MUST decode it to the raw
+/// ciphertext.
+///
+/// Regression for the #1586 read-leg blocker: `bytes` was declared `#[serde(with = "serde_bytes")]`,
+/// which over JSON reads a string as its literal UTF-8 characters — so a 1-byte window arrived as the
+/// 4 characters of its base64 (`"AA=="`), the reassembler rejected the frame with "range frame
+/// overflows expected length 1", and the download aborted before any bytes were read.
+#[test]
+fn range_frame_bytes_decode_from_the_canonical_base64_wire() {
+    let wire = serde_json::json!({
+        "offset": 0,
+        "length": 3,
+        "bytes": "AAEC",
+        "complete": true,
+        "total_length": 3,
+        "chunk_lens": [3],
+        "chunk_index": 0,
+        "root": "ab".repeat(32),
+    });
+    let frame: dig_nat::RangeFrame = serde_json::from_value(wire).expect("canonical frame decodes");
+    assert_eq!(
+        frame.bytes,
+        vec![0u8, 1, 2],
+        "`bytes` is base64 of the ciphertext window, not its literal characters"
+    );
+    assert_eq!(frame.total_length, Some(3));
+}
+
+/// The frame SERIALIZES back to the same canonical base64-string wire, so a dig-nat-produced frame is
+/// interchangeable with the node's hand-built one (one wire, both directions).
+#[test]
+fn range_frame_bytes_serialize_as_base64() {
+    let frame = dig_nat::RangeFrame {
+        offset: 0,
+        length: 3,
+        bytes: vec![0, 1, 2],
+        complete: true,
+        total_length: None,
+        chunk_lens: None,
+        chunk_index: None,
+        inclusion_proof: None,
+        root: None,
+    };
+    let v = serde_json::to_value(&frame).expect("frame serializes");
+    assert_eq!(v["bytes"], serde_json::json!("AAEC"));
+    let back: dig_nat::RangeFrame = serde_json::from_value(v).expect("round-trips");
+    assert_eq!(back, frame);
+}
+
+/// Backwards compatibility: a frame produced by an OLDER dig-nat (`bytes` as a JSON byte ARRAY) still
+/// decodes — the reader is tolerant of both encodings, so a mixed-version peer is never dropped.
+#[test]
+fn range_frame_bytes_still_decode_from_the_legacy_array_wire() {
+    let wire = serde_json::json!({
+        "offset": 0, "length": 3, "bytes": [0, 1, 2], "complete": true,
+    });
+    let frame: dig_nat::RangeFrame = serde_json::from_value(wire).expect("legacy frame decodes");
+    assert_eq!(frame.bytes, vec![0u8, 1, 2]);
+}

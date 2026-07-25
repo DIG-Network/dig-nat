@@ -13,7 +13,7 @@
 # the others so the ordering/fallback strategy is tested with mock methods regardless.
 [package]
 name = "dig-nat"
-version = "0.11.1"
+version = "0.11.2"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -62,8 +62,9 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Efficient byte-array (de)serialization for RangeFrame ciphertext payloads.
-serde_bytes = "0.11"
+# `RangeFrame` ciphertext windows travel as base64 on the JSON frame wire (the canonical
+# `dig.fetchRange` encoding every producer emits — see `mux::base64_bytes`).
+base64 = "0.22"
 
 # Stream multiplexing over the single mTLS byte stream: many cheap concurrent logical streams
 # (no head-of-line blocking) so several transfers — e.g. different byte ranges of a resource — run
