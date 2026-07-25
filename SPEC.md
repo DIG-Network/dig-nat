@@ -166,6 +166,19 @@ The behaviour `dig-nat` INHERITS from `dig-ip` (its structural guarantees, teste
 - The established connection's reported remote address (`PeerConnection::remote_addr`) reflects the
   candidate (and therefore family) actually used.
 
+### 3.3a Self-dial refusal — the transport chokepoint (NORMATIVE, #1590 / #836)
+
+`MtlsDialer::dial` is the single method EVERY peer dial funnels through (Direct, every port-mapping
+tier, hole-punch, AND relayed). It **MUST**, before racing any candidate or opening any tunnel, refuse
+a dial whose `PeerTarget::peer_id` equals the local node's own identity (`NodeCert::peer_id()`),
+returning a `MethodError` whose reason contains `"self-dial"`, on **ALL** kinds — not only the relayed
+tier. Keying the refusal on the verified `peer_id` (not on an address, which can collide via a
+server-reflexive candidate) makes it deterministic and independent of candidate ordering: a provider
+record for our own node — or one that carries our own reflexive address — can never cause the fetch
+transport to dial itself, so the download orchestrator falls through to a real holder provider. This
+subsumes and complements the relay-layer relayed self-dial refusal (§4c, #1536), which still applies as
+defense-in-depth for a circuit opened by other paths.
+
 ### 3.4 Per-method address-family notes
 
 - **STUN (RFC 5389)** parses BOTH `FAMILY_IPV4` and `FAMILY_IPV6` XOR-MAPPED-ADDRESS attributes;
@@ -257,7 +270,57 @@ separate: the DATA config (`NatConfig`, `Clone + Debug`) and the LIVE handles (`
   (SPKI-pinned `peer_id` verification + rustls proof-of-possession + #1204 BLS binding, §2). A relayed
   or hole-punched connection **MUST NOT** be weaker than a direct one.
 
-## 4a. Relayed responder — role negotiation on a relay circuit (NORMATIVE)
+## 4b. Fast-connect — first-usable transport + live relayed→direct promotion (NORMATIVE)
+
+`connect_fast(peer, node, config, runtime) -> FastPeerConnection` is an ADDITIVE alternate entry point
+alongside `connect`/`connect_with_runtime` (which are UNCHANGED). Where `connect` returns ONE connection
+over the first tier that lands, `connect_fast` returns the first-USABLE transport immediately AND
+promotes to a better (direct) one in the background when it lands and proves itself — without
+interrupting in-flight work.
+
+- **Start:** `connect_fast` **MUST** launch, concurrently, (a) a relayed dial over the held reservation
+  (iff `runtime` wired a `RelayedDialer`) and (b) the DIRECT traversal ladder race — the full ladder
+  MINUS the relayed tier (`Direct → Upnp → NatPmp → Pcp → HolePunch`, via `connect_with_strategy`). It
+  **MUST** return a `FastPeerConnection` as soon as EITHER lands (first-usable-path). A NAT'd peer whose
+  relay lands first is returned relayed-active with the direct ladder still racing; a public peer whose
+  direct dial wins outright is returned direct-active and the relay is never used. It returns
+  `AllMethodsFailed` iff both attempts fail (`NoMethodsEnabled` if neither tier could be composed).
+- **No stream migration (route-new + drain-old):** a live logical stream **MUST NOT** migrate transports.
+  The active transport is an atomically-swappable slot; `open_stream` loads the CURRENT slot and opens
+  there, so only NEW streams route to a promoted transport. An in-flight stream **MUST** complete on the
+  transport it started on. This is correct because the peer API is a factory of short-lived,
+  request-scoped streams with no cross-stream ordering contract — so no read-quiesce/flush is needed and
+  there is no loss/reorder/duplication (the byte path is never swapped under a live `yamux` session,
+  which is transport-bound).
+- **Promotion gate (conservative — SECURITY-CRITICAL):** a direct path **MUST** be promoted only when ALL
+  hold: (1) the direct-tier mTLS handshake completed with the `peer_id` pin verified; (2) IDENTITY
+  EQUALITY — the direct connection's `peer_id` AND its #1204 BLS pubkey EQUAL the relayed transport's
+  (the invariant that makes swapping transports "to the same peer" safe); (3) ONE successful application
+  round-trip over the direct session (an empty `query_availability(vec![])` probe), proving real
+  bidirectional mux traffic (a NAT mapping can complete TLS then blackhole). The gate-3 probe **MUST**
+  succeed within `NatConfig::per_method_timeout`; a probe that errors OR times out is a gate FAILURE that
+  fails closed (no promotion, stay relayed), so a post-TLS blackhole cannot hang promotion indefinitely.
+  A path that fails ANY gate **MUST** be refused and the connection stays relayed. Promotion **MUST NOT**
+  occur on handshake-completion alone.
+- **Promote + drain:** on a passed gate the active slot is swapped to the direct transport atomically
+  (`current_method()` flips to `Direct`; subscribers are notified). The swapped-out relayed slot **MUST**
+  be held until its in-flight streams finish OR a bounded grace cap (`NatConfig::fast_connect_grace`,
+  default 5s) elapses, then dropped. Dropping the relayed slot releases ONLY the per-peer `RelayTunnel`;
+  it **MUST NOT** tear down the node's persistent relay reservation (§5a).
+- **Failure modes:** (a) direct never lands → stay relayed indefinitely (usable), reservation intact;
+  (b) a promoted direct transport that dies → fall back by re-establishing a relayed session (the
+  reservation is still held), flipping `current_method()` back to `Relayed`; a lone death re-dials
+  immediately, but a FLAPPING transport (re-dial succeeds then instantly dies) is paced by a
+  capped-exponential backoff that resets once a re-established session is held stably, so a hostile/broken
+  peer cannot drive an unbounded re-dial busy-loop; (c) a relay drop while still
+  relayed → the existing reservation reconnect/backoff (§5a) applies.
+- **mTLS + NC-1:** the session does not survive the swap and need not — `peer_id = SHA-256(TLS SPKI DER)`
+  is transport-bound and the direct path runs its OWN mTLS to the SAME `peer_id`; identity-equality
+  (gate 2) is the invariant. NC-1 payload sealing sits ABOVE dig-nat keyed to the peer's BLS pubkey
+  (identical across transports) and is unaffected by a transport swap. This introduces NO wire change
+  (same RLY-002 relayed wire, same mTLS, same `peer_id` derivation).
+
+## 4c. Relayed responder — role negotiation on a relay circuit (NORMATIVE)
 
 A relay circuit (tier-6, RLY-002) is a byte tunnel between two peers; the mTLS handshake carried over
 it **MUST** have exactly ONE client end and ONE server end. The two ends negotiate roles by who
@@ -322,56 +385,6 @@ Without a responder path, both circuit ends acted as TLS client and the handshak
 the deterministic role tie-break + non-clobber, a simultaneous or timing-ordered mutual dial
 re-manifested the same deadlock or spawned two conflicting sessions to one peer
 (`got ClientHello when expecting ServerHello`, #1536).
-
-## 4b. Fast-connect — first-usable transport + live relayed→direct promotion (NORMATIVE)
-
-`connect_fast(peer, node, config, runtime) -> FastPeerConnection` is an ADDITIVE alternate entry point
-alongside `connect`/`connect_with_runtime` (which are UNCHANGED). Where `connect` returns ONE connection
-over the first tier that lands, `connect_fast` returns the first-USABLE transport immediately AND
-promotes to a better (direct) one in the background when it lands and proves itself — without
-interrupting in-flight work.
-
-- **Start:** `connect_fast` **MUST** launch, concurrently, (a) a relayed dial over the held reservation
-  (iff `runtime` wired a `RelayedDialer`) and (b) the DIRECT traversal ladder race — the full ladder
-  MINUS the relayed tier (`Direct → Upnp → NatPmp → Pcp → HolePunch`, via `connect_with_strategy`). It
-  **MUST** return a `FastPeerConnection` as soon as EITHER lands (first-usable-path). A NAT'd peer whose
-  relay lands first is returned relayed-active with the direct ladder still racing; a public peer whose
-  direct dial wins outright is returned direct-active and the relay is never used. It returns
-  `AllMethodsFailed` iff both attempts fail (`NoMethodsEnabled` if neither tier could be composed).
-- **No stream migration (route-new + drain-old):** a live logical stream **MUST NOT** migrate transports.
-  The active transport is an atomically-swappable slot; `open_stream` loads the CURRENT slot and opens
-  there, so only NEW streams route to a promoted transport. An in-flight stream **MUST** complete on the
-  transport it started on. This is correct because the peer API is a factory of short-lived,
-  request-scoped streams with no cross-stream ordering contract — so no read-quiesce/flush is needed and
-  there is no loss/reorder/duplication (the byte path is never swapped under a live `yamux` session,
-  which is transport-bound).
-- **Promotion gate (conservative — SECURITY-CRITICAL):** a direct path **MUST** be promoted only when ALL
-  hold: (1) the direct-tier mTLS handshake completed with the `peer_id` pin verified; (2) IDENTITY
-  EQUALITY — the direct connection's `peer_id` AND its #1204 BLS pubkey EQUAL the relayed transport's
-  (the invariant that makes swapping transports "to the same peer" safe); (3) ONE successful application
-  round-trip over the direct session (an empty `query_availability(vec![])` probe), proving real
-  bidirectional mux traffic (a NAT mapping can complete TLS then blackhole). The gate-3 probe **MUST**
-  succeed within `NatConfig::per_method_timeout`; a probe that errors OR times out is a gate FAILURE that
-  fails closed (no promotion, stay relayed), so a post-TLS blackhole cannot hang promotion indefinitely.
-  A path that fails ANY gate **MUST** be refused and the connection stays relayed. Promotion **MUST NOT**
-  occur on handshake-completion alone.
-- **Promote + drain:** on a passed gate the active slot is swapped to the direct transport atomically
-  (`current_method()` flips to `Direct`; subscribers are notified). The swapped-out relayed slot **MUST**
-  be held until its in-flight streams finish OR a bounded grace cap (`NatConfig::fast_connect_grace`,
-  default 5s) elapses, then dropped. Dropping the relayed slot releases ONLY the per-peer `RelayTunnel`;
-  it **MUST NOT** tear down the node's persistent relay reservation (§5a).
-- **Failure modes:** (a) direct never lands → stay relayed indefinitely (usable), reservation intact;
-  (b) a promoted direct transport that dies → fall back by re-establishing a relayed session (the
-  reservation is still held), flipping `current_method()` back to `Relayed`; a lone death re-dials
-  immediately, but a FLAPPING transport (re-dial succeeds then instantly dies) is paced by a
-  capped-exponential backoff that resets once a re-established session is held stably, so a hostile/broken
-  peer cannot drive an unbounded re-dial busy-loop; (c) a relay drop while still
-  relayed → the existing reservation reconnect/backoff (§5a) applies.
-- **mTLS + NC-1:** the session does not survive the swap and need not — `peer_id = SHA-256(TLS SPKI DER)`
-  is transport-bound and the direct path runs its OWN mTLS to the SAME `peer_id`; identity-equality
-  (gate 2) is the invariant. NC-1 payload sealing sits ABOVE dig-nat keyed to the peer's BLS pubkey
-  (identical across transports) and is unaffected by a transport swap. This introduces NO wire change
-  (same RLY-002 relayed wire, same mTLS, same `peer_id` derivation).
 
 ## 5. Transport surface
 
