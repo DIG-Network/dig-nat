@@ -132,8 +132,9 @@ pub struct RangeFrame {
     pub offset: u64,
     /// This frame's byte length.
     pub length: u64,
-    /// The raw ciphertext bytes.
-    #[serde(with = "serde_bytes")]
+    /// The raw ciphertext bytes. On the wire they are **base64** (`base64_bytes`) — the canonical
+    /// `dig.fetchRange` frame encoding every producer emits.
+    #[serde(with = "base64_bytes")]
     pub bytes: Vec<u8>,
     /// Whether this is the final frame of the range.
     pub complete: bool,
@@ -153,6 +154,59 @@ pub struct RangeFrame {
     /// (first frame only) the generation root (64-hex) the inclusion proof is against.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
+}
+
+/// Serde for [`RangeFrame::bytes`]: **base64** on the wire, raw `Vec<u8>` in Rust.
+///
+/// The `dig.fetchRange` frame is JSON, and the canonical wire type
+/// (`dig_rpc_protocol::types::RangeFrame`, "this window's ciphertext, base64") — and every real
+/// producer, including the dig-node peer serve path — encodes the window as a base64 STRING. Reading
+/// it with `serde_bytes` instead yielded the string's literal characters, so a served window arrived
+/// as its own base64 text and the reassembler rejected the frame (#1586, the read-leg blocker).
+///
+/// Deserialization is tolerant: a base64 string (canonical) OR a byte array (what an older dig-nat
+/// emitted) both decode, so a mixed-version peer is never dropped.
+mod base64_bytes {
+    use base64::Engine as _;
+    use serde::de::{SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        d.deserialize_any(Base64OrArray)
+    }
+
+    struct Base64OrArray;
+
+    impl<'de> Visitor<'de> for Base64OrArray {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("base64-encoded ciphertext (or a legacy byte array)")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            base64::engine::general_purpose::STANDARD
+                .decode(v)
+                .map_err(|e| E::custom(format!("range frame bytes are not valid base64: {e}")))
+        }
+
+        fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+            Ok(v.to_vec())
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or_default());
+            while let Some(b) = seq.next_element::<u8>()? {
+                out.push(b);
+            }
+            Ok(out)
+        }
+    }
 }
 
 impl AvailabilityRequest {
