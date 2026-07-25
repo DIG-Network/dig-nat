@@ -274,6 +274,23 @@ impl Dialer for MtlsDialer {
     ) -> Result<PeerConnection, MethodError> {
         let kind = outcome.kind;
 
+        // SELF-DIAL CHOKEPOINT (#1590 / #836 read-leg). Every peer dial — Direct, every port-mapping
+        // tier, hole-punch, AND relayed — funnels through this one method, so this is the single place
+        // that can refuse dialing our OWN identity on ALL kinds deterministically. Without it the
+        // guard was RELAYED-ONLY (relay.rs), leaving a Direct self-candidate reachable: a provider
+        // record for our own node (or one carrying our own server-reflexive address) let the fetch
+        // transport race a Direct candidate that resolves to us, ordering-dependently — the
+        // intermittent read-leg self-dial. Refusing here, keyed on the verified `peer_id` the caller
+        // pinned (not on an address that could collide), kills it regardless of candidate ordering and
+        // lets the orchestrator fall through to a REAL holder provider. Preserves the relay.rs #1536
+        // relayed self-dial refusal (this fires first for every tier).
+        if peer.peer_id == self.node.peer_id() {
+            return Err(MethodError::failed(
+                kind,
+                "refusing self-dial (target peer_id == local peer_id)",
+            ));
+        }
+
         // The relayed tier is not an IP dial — it carries mTLS over a relay byte tunnel. Every other
         // tier (direct / mapping / hole-punch) yields dialable IP candidates and dials them directly.
         if kind == TraversalKind::Relayed {
@@ -311,4 +328,97 @@ impl Dialer for MtlsDialer {
 fn classify_tls_error(kind: TraversalKind, e: &std::io::Error) -> MethodError {
     let msg = e.to_string();
     MethodError::failed(kind, format!("mtls handshake: {msg}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::method::MethodOutcome;
+    use crate::peer::PeerTarget;
+    use std::net::SocketAddr;
+
+    /// A real (but disposable) CA-signed [`NodeCert`] whose `peer_id()` we then target, minted from a
+    /// BLS secret deterministically derived from a fixed label (never a literal keypair — keeps
+    /// CodeQL's hard-coded-crypto-value scan happy; matches dig-tls's + dig-download's test convention).
+    fn node_cert() -> Arc<NodeCert> {
+        use sha2::{Digest, Sha256};
+        let seed: [u8; 32] = Sha256::digest(b"dig-nat/dialer/self-dial-test").into();
+        let bls_sk = dig_tls::bls::SecretKey::from_seed(&seed);
+        Arc::new(NodeCert::generate_signed(&bls_sk).unwrap())
+    }
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    // #1590 / #836 read-leg regression. The self-dial CHOKEPOINT: a dial whose target `peer_id` is
+    // OUR OWN identity must be refused on EVERY tier, deterministically, BEFORE any candidate is
+    // raced — so it can never depend on candidate ordering (the intermittency the e2e showed). RED
+    // before the guard (a Direct outcome raced the self candidates and failed with a *connect* error,
+    // not a self-dial refusal); GREEN after.
+
+    #[tokio::test]
+    async fn direct_dial_to_own_peer_id_is_refused_before_racing_candidates() {
+        let node = node_cert();
+        let dialer = MtlsDialer::new(node.clone());
+        // Target OUR OWN peer_id — a self provider record. The candidate set carries a self-reflexive
+        // address in BOTH positions to prove ordering never matters: the guard fires on `peer_id`
+        // first, so no candidate is ever dialed.
+        let self_peer = PeerTarget::with_addrs(
+            node.peer_id(),
+            vec![addr("127.0.0.1:1"), addr("[::1]:1")],
+            "DIG_MAINNET",
+        );
+        let outcome = MethodOutcome::candidates(
+            TraversalKind::Direct,
+            vec![addr("127.0.0.1:1"), addr("[::1]:1")],
+        );
+        let err = dialer.dial(&self_peer, &outcome).await.unwrap_err();
+        assert!(
+            err.reason.contains("self-dial"),
+            "a Direct dial to our own peer_id must be refused as a self-dial, got: {}",
+            err.reason
+        );
+
+        // Reversed candidate order — same deterministic refusal (ordering-independent).
+        let outcome_rev = MethodOutcome::candidates(
+            TraversalKind::Direct,
+            vec![addr("[::1]:1"), addr("127.0.0.1:1")],
+        );
+        let err_rev = dialer.dial(&self_peer, &outcome_rev).await.unwrap_err();
+        assert!(err_rev.reason.contains("self-dial"), "{}", err_rev.reason);
+    }
+
+    #[tokio::test]
+    async fn relayed_dial_to_own_peer_id_is_refused_at_the_chokepoint() {
+        // The relayed tier is refused at the SAME chokepoint (no relay data-plane needed to reach the
+        // refusal), so the guard covers ALL kinds uniformly — consistent with relay.rs's #1536 guard.
+        let node = node_cert();
+        let dialer = MtlsDialer::new(node.clone());
+        let self_peer = PeerTarget::relay_only(node.peer_id(), "DIG_MAINNET");
+        let outcome = MethodOutcome::candidates(TraversalKind::Relayed, vec![]);
+        let err = dialer.dial(&self_peer, &outcome).await.unwrap_err();
+        assert!(err.reason.contains("self-dial"), "{}", err.reason);
+    }
+
+    #[tokio::test]
+    async fn dial_to_a_different_peer_id_is_not_refused_as_self() {
+        // A dial to a DIFFERENT peer (a real holder) must NOT be swallowed by the self guard — it
+        // proceeds to the real dial (here it fails with a connect/handshake error against a dead
+        // loopback port, NOT a self-dial refusal), so the orchestrator reaches the holder :9444.
+        let node = node_cert();
+        let dialer = MtlsDialer::new(node.clone());
+        let holder = PeerTarget::with_addr(
+            dig_tls::PeerId::from_bytes([0x5A; 32]),
+            addr("127.0.0.1:1"),
+            "DIG_MAINNET",
+        );
+        let outcome = MethodOutcome::candidates(TraversalKind::Direct, vec![addr("127.0.0.1:1")]);
+        let err = dialer.dial(&holder, &outcome).await.unwrap_err();
+        assert!(
+            !err.reason.contains("self-dial"),
+            "a dial to a different peer must not be refused as a self-dial, got: {}",
+            err.reason
+        );
+    }
 }
