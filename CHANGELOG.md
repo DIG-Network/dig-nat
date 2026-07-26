@@ -13,9 +13,18 @@ This project adheres to [Semantic Versioning](https://semver.org) and
   frame no conforming receiver may accept; an infallible encoder cannot report that (#1640).
 
 ### Bug Fixes
-- **mux:** refuse over-cap frames at the sender instead of at the receiver, and publish the payload
-  ceiling as `MAX_RANGE_FRAME_PAYLOAD` (32 KiB) + `MAX_FRAMED_BODY` (64 KiB) so serve paths split on
-  the real per-frame limit rather than a per-request window (#1640)
+- **mux:** refuse over-cap frames at the sender instead of at the receiver, and publish the frame
+  limits as `MAX_FRAMED_BODY` (64 KiB), `MAX_RANGE_FRAME_PAYLOAD` (32 KiB) and
+  `MAX_FIRST_FRAME_CHUNK_LENS` (2891) so no consumer has to hardcode or re-derive them (#1640)
+
+### Known Limitations
+- **mux:** a resource above about 2,891 chunks (~180 MiB at the canonical 64 KiB chunk target) has no
+  conforming first frame: its `chunk_lens` array pushes the frame past `MAX_FRAMED_BODY`, so `encode`
+  refuses it. No payload size helps past ~9,133 chunks, where the metadata alone fills the body, so this
+  is a wire-shape matter rather than a constant to re-tune: the resource-scaling metadata (`chunk_lens`,
+  `inclusion_proof`) moves to a paged prologue sent once per range stream, whose shape lands in 0.13.0
+  (`SPEC.md` §5.1.1). Until then such a range hard-fails loudly at the sender rather than corrupting a
+  read at the receiver.
 
 ## [0.11.2] - 2026-07-25
 

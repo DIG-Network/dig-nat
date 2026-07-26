@@ -402,14 +402,16 @@ re-manifested the same deadlock or spawned two conflicting sessions to one peer
 
 ### 5.1 Frame size limits (NORMATIVE)
 
-Two constants bound every length-prefixed frame on a peer stream. Both are exported
-(`dig_nat::MAX_FRAMED_BODY`, `dig_nat::MAX_RANGE_FRAME_PAYLOAD`) and are **shared byte-identical wire
-values**: every implementation of DIG peer framing **MUST** use these exact numbers.
+Three constants bound every length-prefixed frame on a peer stream. All are exported
+(`dig_nat::MAX_FRAMED_BODY`, `dig_nat::MAX_RANGE_FRAME_PAYLOAD`,
+`dig_nat::MAX_FIRST_FRAME_CHUNK_LENS`) and are **shared byte-identical wire values**: every
+implementation of DIG peer framing **MUST** use these exact numbers.
 
 | constant | value | bounds |
 |---|---|---|
 | `MAX_FRAMED_BODY` | `65536` (64 KiB) | the JSON body of ANY framed message, after the `u32`-BE prefix |
 | `MAX_RANGE_FRAME_PAYLOAD` | `32768` (32 KiB) | the raw `RangeFrame.bytes` length a single frame may carry |
+| `MAX_FIRST_FRAME_CHUNK_LENS` | `2891` | `chunk_lens` entries that are GUARANTEED to fit on a first frame alongside a ceiling-sized payload |
 
 - A receiver **MUST** reject a length prefix greater than `MAX_FRAMED_BODY` with an `InvalidData`
   error, without allocating the announced length.
@@ -417,20 +419,47 @@ values**: every implementation of DIG peer framing **MUST** use these exact numb
   the governing invariant, and it is symmetric by construction: encoding **MUST** fail, at the sender,
   when the serialized body would exceed `MAX_FRAMED_BODY` or when `RangeFrame.bytes` exceeds
   `MAX_RANGE_FRAME_PAYLOAD`. It **MUST NOT** silently produce such a frame.
-- A serving peer **MUST** therefore split a requested range into frames of at most
-  `MAX_RANGE_FRAME_PAYLOAD` raw bytes each. A per-request *window* (how much one `RangeRequest` may
-  ask for) is a separate, larger quantity and is **NOT** a valid per-frame size.
 - `MAX_RANGE_FRAME_PAYLOAD` is deliberately **conservative, not exact-fit**. `bytes` travels base64
   (4 bytes out per 3 in), so 32 KiB of payload occupies 43,692 body bytes, leaving 21,844 bytes of the
   64 KiB body for the JSON keys and the first frame's verification metadata — `root`, `total_length`,
   `chunk_index`, the base64 `inclusion_proof`, and the whole resource's `chunk_lens` array, whose size
   scales with the RESOURCE rather than the frame. An implementation **MUST NOT** raise the payload
   ceiling toward the base64-only bound of ~48 KiB: the residual allowance is what keeps a first frame
-  with a large chunk table decodable.
+  with a chunk table decodable.
+- That allowance is finite, and `MAX_FIRST_FRAME_CHUNK_LENS` is where it ends: **2,891** entries, with
+  every entry at the 256 KiB maximum chunk length (six decimal digits — the worst case per entry, since
+  the array's JSON size depends on entry width as well as count). About 180 MiB of resource at the
+  canonical 64 KiB FastCDC target chunk size, about 45 MiB at the 16 KiB minimum.
 
 Testability: a payload of `MAX_RANGE_FRAME_PAYLOAD + 1` **MUST** fail to encode; a payload of exactly
-`MAX_RANGE_FRAME_PAYLOAD` carrying a several-thousand-entry `chunk_lens` array and an inclusion proof
-**MUST** encode and **MUST** decode unchanged.
+`MAX_RANGE_FRAME_PAYLOAD` carrying exactly `MAX_FIRST_FRAME_CHUNK_LENS` six-digit `chunk_lens` entries
+plus an inclusion proof **MUST** encode and **MUST** decode unchanged; one entry beyond that **MUST**
+fail to encode.
+
+#### 5.1.1 Splitting a range into frames (NORMATIVE)
+
+- A serving peer **MUST** split a requested range into frames of at most `MAX_RANGE_FRAME_PAYLOAD` raw
+  `bytes` each. A per-request *window* — how much one `RangeRequest` may ask for — is a separate and
+  larger quantity, and is **NOT** a valid per-frame size.
+- The resource-scaling verification metadata — `chunk_lens` and `inclusion_proof`, whose size is a
+  function of the RESOURCE rather than of the frame — belongs on the first frame or on a paged prologue
+  sent once per range stream. It **MUST NOT** be repeated on every frame. The fixed-size identity
+  fields (`root`, `total_length`, and `chunk_index` where the window is chunk-aligned) are unaffected.
+- **The paged-prologue wire shape is defined in 0.13.0.** At this version a range whose `chunk_lens`
+  array exceeds `MAX_FIRST_FRAME_CHUNK_LENS` has no representable first frame, so `encode` refuses it
+  and the range hard-fails LOUDLY at the sender rather than corrupting a read at the receiver. That is
+  the intended behaviour of this version, not an oversight: `digstore-host` permits
+  `MAX_MODULE_BYTES` = 256 MiB (about 4,096 chunks at the 64 KiB target) and dig-download accepts
+  `MAX_MODULE_CHUNK_COUNT` = 1,048,576, so such resources exist and are served only from 0.13.0 onward.
+- An implementation **MUST NOT** work around that limit locally — not by raising `MAX_FRAMED_BODY`
+  (a RECEIVER bound: no sender may exceed it until every receiver is deployed, and no finite cap holds
+  a million entries without abandoning the bounded-allocation property the cap exists for), not by
+  truncating `chunk_lens` (it is a DECRYPT input; per-chunk AES-256-GCM-SIV needs the whole array, and
+  a reader rejects any array whose sum ≠ `total_length`), and not by emitting an unverified frame. Each
+  would be a silent wire divergence, which is the class of defect §5.1 exists to close.
+- A conforming sender **SHOULD** serialize-and-check its frame before writing, so the serve path does
+  not *depend* on the encoder's refusal to stay correct. The refusal in §5.1 is the backstop, not the
+  mechanism.
 
 ## 5a. Persistent relay reservation + discovery (NORMATIVE)
 

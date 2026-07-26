@@ -38,6 +38,41 @@ Two lessons worth generalizing:
    puts 2048 integers on it. An exact-fit constant passes an over-cap-refused test and still overflows
    in production, so the worst-case-metadata test is the one that actually holds the number in place.
 
+
+### Postscript: two things the review gate caught, both the same mistake one level up
+
+**Merging this crate did not fix the bug on the wire.** dig-node does not use dig-nat's framing at all
+— `crates/dig-node-core/src/peer.rs` has its own `write_framed` (uncapped) and its own read cap written
+as the literal `64 * 1024`, with a comment saying it mirrors dig-nat's constant. So the identical
+asymmetry exists there independently, and correcting the oversized window constants does not close it.
+Tracked as #1645. The generalizable point: when a bound is duplicated as a literal in a second
+implementation, fixing the original changes nothing on the wire, and the comment claiming the two agree
+is the only thing holding them together. That comment is not a mechanism.
+
+**The headroom argument was wrong, and it was wrong the same way twice.** The first version of this fix
+justified a 32 KiB payload ceiling by claiming the residual ~21 KiB covered the metadata "with room to
+spare". It does not. Serializing the real frame gives a hard bound of **2,891** `chunk_lens` entries —
+about 180 MiB of resource at the canonical chunk size — while `digstore-host` already permits 256 MiB
+modules and dig-download accepts a million chunks. So a *permitted* resource has no conforming first
+frame at all, and past ~9,133 entries the metadata alone fills the body regardless of payload. Refusal
+turns into denial: correct, loud, and still a hard failure on exactly the content sizes the fix existed
+to unblock. That is a wire-shape conflict between #1577 and a bounded body, not a constant to re-tune.
+
+Both errors were premises, not arithmetic. The first assumed 256 KiB chunks when the canonical FastCDC
+target is 64 KiB. The second, found while fixing the first, assumed a chunk length's decimal width
+without stating it — the array's JSON size depends on entry WIDTH as much as entry COUNT, so the bound
+is 3,373 at five digits and 2,891 at six. Published constants must therefore name their worst case
+explicitly, and a derived bound should be *measured against the real serializer* and published as a
+NUMBER: a formula left for the next reader is a formula whose premises are re-guessed.
+
+And the tell was in the test file both times. The fixture used a comfortable 2,048 entries, so it could
+only ever confirm that the allowance was adequate for 2,048 entries — never that it was adequate. **A
+bound needs a test at the bound, from both sides**: at the published value it must fit, at one past it
+must refuse. Pinned that way, exactly one value passes and the constant cannot drift. Choosing a
+fixture from convenience rather than from the protocol's limit is precisely what hid #1640 itself, where
+the e2e proofs served 20 KB and 27 KB against a ~48 KiB ceiling.
+
+
 ## yamux is transport-bound → a live transport swap happens at the STREAM-ROUTING layer, not the byte layer
 
 `yamux::Connection` runs over ONE mTLS byte stream and owns that stream's framing/windowing state; you
