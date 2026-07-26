@@ -66,7 +66,7 @@ async fn spawn_foreign_ca_mtls_server(label: &str) -> (std::net::SocketAddr, Pee
                                     })
                                     .collect(),
                             };
-                            let _ = s.write_all(&resp.encode()).await;
+                            let _ = s.write_all(&resp.encode().unwrap()).await;
                             let _ = s.shutdown().await;
                         }
                     });
@@ -132,7 +132,7 @@ async fn spawn_mtls_server(server: &Arc<NodeCert>) -> (std::net::SocketAddr, Pee
                                     })
                                     .collect(),
                             };
-                            let _ = s.write_all(&resp.encode()).await;
+                            let _ = s.write_all(&resp.encode().unwrap()).await;
                             let _ = s.shutdown().await;
                         }
                     });

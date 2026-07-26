@@ -2,6 +2,42 @@
 
 Durable, non-obvious realizations from developing dig-nat. Context, not a change diary.
 
+## Owning both sides of a framing contract is exactly when you enforce it on only one side
+
+dig-nat defined `encode_framed` and `decode_framed` twelve lines apart in one file and, for its whole
+life, capped only the decoder. `decode_framed` rejected any body over `MAX_FRAMED_BODY` (64 KiB);
+`encode_framed` wrote a `u32` prefix and the body with no check, and could not have failed if it wanted
+to — it returned `Vec<u8>` and `.expect()`ed on serialization. So the crate handed every serving peer a
+loaded gun: emit a frame that no conforming receiver is permitted to accept, and watch the error appear
+on someone else's machine as `InvalidData("control message too large")` with no mention of size.
+
+Downstream, `dig-node` split its serve paths on a 3 MiB request WINDOW because nothing told it the
+per-FRAME limit was 64 KiB of body — about 48 KiB of raw payload once `bytes` is base64'd, less again
+once the first frame's `chunk_lens`/proof metadata is attached. Every read of a resource above roughly
+48 KiB therefore failed at the reader. The read-leg e2e proofs that "passed" had served 20,477 and
+27,067 bytes: both single-frame, both under the ceiling, neither capable of noticing.
+
+**Why no test caught it, precisely.** The framing tests round-tripped small fixtures, and the transport
+tests used in-process mocks. Both properties held for small payloads, and neither test could fail
+because the bug was not a wrong VALUE — it was a missing BOUND, and a bound is only observable at a
+scale the fixtures never reached. A symmetric round-trip is structurally blind here: it feeds the
+decoder exactly what the encoder produced, so an encoder that produces something illegal and a decoder
+that would reject it never meet.
+
+Two lessons worth generalizing:
+
+1. **When one module owns both sides of a wire contract, the asymmetry is more likely, not less.** Two
+   separately-authored implementations negotiate the limit explicitly because neither trusts the other.
+   One implementation "knows" its own encoder is fine. Enforce every receiver-side bound on the sender
+   too, and make the sender's failure LOUD and LOCAL — a send-site error naming the constant is worth
+   more than the check itself.
+2. **A size limit needs a test at the limit, and the limit must be published.** The fix exports
+   `MAX_FRAMED_BODY` and `MAX_RANGE_FRAME_PAYLOAD` so no consumer has to guess or hardcode `64 * 1024`
+   (dig-node had). The ceiling is deliberately 32 KiB rather than the base64-only bound of ~48 KiB,
+   because the first frame's metadata scales with the RESOURCE — a 512 MiB resource at 256 KiB chunks
+   puts 2048 integers on it. An exact-fit constant passes an over-cap-refused test and still overflows
+   in production, so the worst-case-metadata test is the one that actually holds the number in place.
+
 ## yamux is transport-bound → a live transport swap happens at the STREAM-ROUTING layer, not the byte layer
 
 `yamux::Connection` runs over ONE mTLS byte stream and owns that stream's framing/windowing state; you

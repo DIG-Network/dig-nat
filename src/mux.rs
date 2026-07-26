@@ -211,7 +211,7 @@ mod base64_bytes {
 
 impl AvailabilityRequest {
     /// Serialize as a `u32` big-endian length prefix + JSON body (the uniform control framing).
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
         encode_framed(self)
     }
     /// Read + decode an [`AvailabilityRequest`] from `r` (the peer/serving side).
@@ -222,7 +222,7 @@ impl AvailabilityRequest {
 
 impl AvailabilityResponse {
     /// Serialize as a `u32` big-endian length prefix + JSON body.
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
         encode_framed(self)
     }
     /// Read + decode an [`AvailabilityResponse`] from `r` (the requesting side).
@@ -251,7 +251,7 @@ impl RangeRequest {
 
     /// Serialize as a `u32` big-endian length prefix + JSON body — the preamble a peer reads to learn
     /// the resource + range before streaming the frames.
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
         encode_framed(self)
     }
     /// Read + decode a [`RangeRequest`] preamble from `r` (the serving side of a range stream).
@@ -262,7 +262,30 @@ impl RangeRequest {
 
 impl RangeFrame {
     /// Serialize as a `u32` big-endian length prefix + JSON body (one framed frame on the stream).
-    pub fn encode(&self) -> Vec<u8> {
+    ///
+    /// Fails with [`io::ErrorKind::InvalidData`] if [`bytes`](Self::bytes) exceeds
+    /// [`MAX_RANGE_FRAME_PAYLOAD`], or if the serialized body exceeds [`MAX_FRAMED_BODY`] for any
+    /// other reason (an unusually large `chunk_lens` table or proof). A serving peer therefore cannot
+    /// emit a frame [`decode`](Self::decode) is required to reject: it splits its resource on
+    /// [`MAX_RANGE_FRAME_PAYLOAD`] or it learns about it here, at the send site, with the ceiling
+    /// named in the error.
+    ///
+    /// The payload is checked separately from the body because the body check alone is too weak: a
+    /// payload well over the ceiling still fits in [`MAX_FRAMED_BODY`] once base64'd when the frame
+    /// carries no metadata, so it would encode here and then overflow the moment the same span rode a
+    /// FIRST frame with a chunk table attached — a size-dependent, intermittent failure. One explicit
+    /// ceiling on `bytes` makes the limit the same for every frame.
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
+        if self.bytes.len() > MAX_RANGE_FRAME_PAYLOAD {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "RangeFrame payload {} exceeds MAX_RANGE_FRAME_PAYLOAD {MAX_RANGE_FRAME_PAYLOAD}; \
+                     split the range into ceiling-sized frames",
+                    self.bytes.len()
+                ),
+            ));
+        }
         encode_framed(self)
     }
     /// Read + decode one [`RangeFrame`] from `r`. Returns `Ok(None)` at clean end-of-stream (the
@@ -272,18 +295,66 @@ impl RangeFrame {
     }
 }
 
-/// Maximum length-prefixed control/preamble body — guards against a malicious length prefix forcing
-/// a huge allocation.
-const MAX_FRAMED_BODY: usize = 64 * 1024;
+/// Maximum length-prefixed frame BODY, in bytes — the one number both sides of the framing contract
+/// obey. A decoder rejects a longer body (guarding against a malicious length prefix forcing a huge
+/// allocation) and, since #1640, an encoder refuses to produce one, so a sender can never emit a
+/// frame a conforming receiver is required to reject.
+///
+/// This is a **shared byte-identical wire constant**: any second implementation of DIG peer framing
+/// — including `dig-node`'s own `write_framed`/`read_framed` — MUST use this exact value.
+pub const MAX_FRAMED_BODY: usize = 64 * 1024;
+
+/// Maximum raw [`RangeFrame::bytes`] length, in bytes, that a single frame may carry — the number a
+/// serving peer splits a resource on. **32 KiB.**
+///
+/// ## Why it is not ~48 KiB
+///
+/// `bytes` travels base64 (4 output bytes per 3 input bytes), so [`MAX_FRAMED_BODY`] of body would
+/// hold at most ~48 KiB of raw payload *if the payload were the only thing in the frame*. It is not.
+/// The frame is JSON and, per #1577, the FIRST frame of every range additionally carries `root`,
+/// `total_length`, `chunk_index`, a base64 `inclusion_proof`, and **the entire `chunk_lens` array of
+/// the whole resource** — whose size is driven by the RESOURCE, not by the frame. A 512 MiB resource
+/// at 256 KiB chunks puts 2048 decimal integers on that first frame.
+///
+/// So the ceiling is deliberately CONSERVATIVE rather than exact-fit:
+///
+/// | component | budget |
+/// |---|---|
+/// | base64 of 32 KiB of `bytes` | 43,692 B |
+/// | remaining allowance for JSON keys + `chunk_lens` + proof + root | 21,844 B |
+/// | **total** | **65,536 B** = [`MAX_FRAMED_BODY`] |
+///
+/// The ~21 KiB allowance covers a several-thousand-entry chunk table plus a proof with room to spare.
+/// **Resist tightening it.** An exact-fit constant satisfies a naive round-trip test and then
+/// overflows in production on the first resource with a large chunk table — which is precisely the
+/// class of defect #1640 was. If the metadata ever grows again, this allowance absorbs it silently
+/// instead of failing a real read.
+pub const MAX_RANGE_FRAME_PAYLOAD: usize = 32 * 1024;
 
 /// Serialize `value` as a `u32` big-endian length prefix + JSON body — the uniform framing for every
-/// small control message on a stream (availability + range preambles).
-fn encode_framed<T: Serialize>(value: &T) -> Vec<u8> {
-    let body = serde_json::to_vec(value).expect("control message serializes");
+/// control message on a stream (availability + range preambles, and the range frames themselves).
+///
+/// Fails with [`io::ErrorKind::InvalidData`] if the body would exceed [`MAX_FRAMED_BODY`]. That check
+/// is the whole point: the decoders below MUST reject such a body, so producing one is a bug at the
+/// SENDER and belongs at the sender's call site — not as an opaque `InvalidData` surfacing on some
+/// remote peer's read.
+fn encode_framed<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
+    let body =
+        serde_json::to_vec(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if body.len() > MAX_FRAMED_BODY {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "framed body {} exceeds MAX_FRAMED_BODY {MAX_FRAMED_BODY}; split the payload on \
+                 MAX_RANGE_FRAME_PAYLOAD ({MAX_RANGE_FRAME_PAYLOAD})",
+                body.len()
+            ),
+        ));
+    }
     let mut out = Vec::with_capacity(4 + body.len());
     out.extend_from_slice(&(body.len() as u32).to_be_bytes());
     out.extend_from_slice(&body);
-    out
+    Ok(out)
 }
 
 /// Read + decode a length-prefixed JSON control message from `r`, bounded by [`MAX_FRAMED_BODY`].
@@ -474,7 +545,7 @@ impl PeerSession {
     /// range downloads — open one of these per (peer, range) and read them concurrently.
     pub async fn open_range_stream(&mut self, req: &RangeRequest) -> io::Result<PeerStream> {
         let mut stream = self.open_stream().await?;
-        stream.write_all(&req.encode()).await?;
+        stream.write_all(&req.encode()?).await?;
         stream.flush().await?;
         Ok(stream)
     }
@@ -491,7 +562,7 @@ impl PeerSession {
     ) -> io::Result<AvailabilityResponse> {
         let req = AvailabilityRequest { items };
         let mut stream = self.open_stream().await?;
-        stream.write_all(&req.encode()).await?;
+        stream.write_all(&req.encode()?).await?;
         stream.flush().await?;
         AvailabilityResponse::decode(&mut stream).await
     }

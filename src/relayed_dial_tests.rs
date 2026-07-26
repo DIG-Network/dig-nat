@@ -81,7 +81,7 @@ async fn relayed_dial_preserves_mtls_peer_id_and_bls_binding() {
                             })
                             .collect(),
                     };
-                    let _ = s.write_all(&resp.encode()).await;
+                    let _ = s.write_all(&resp.encode().unwrap()).await;
                     let _ = s.shutdown().await;
                 }
             });
@@ -186,7 +186,7 @@ async fn relayed_connect_negotiates_client_and_server_roles() {
                             })
                             .collect(),
                     };
-                    let _ = s.write_all(&resp.encode()).await;
+                    let _ = s.write_all(&resp.encode().unwrap()).await;
                     let _ = s.shutdown().await;
                 }
             });
@@ -348,7 +348,7 @@ async fn mutual_simultaneous_relayed_dial_resolves_glare_to_one_client_one_serve
                                 })
                                 .collect(),
                         };
-                        let _ = s.write_all(&resp.encode()).await;
+                        let _ = s.write_all(&resp.encode().unwrap()).await;
                         let _ = s.shutdown().await;
                     }
                 });

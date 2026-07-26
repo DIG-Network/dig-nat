@@ -4,6 +4,19 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.12.0] - 2026-07-26
+
+### BREAKING CHANGES
+- **mux:** `AvailabilityRequest::encode`, `AvailabilityResponse::encode`, `RangeRequest::encode` and
+  `RangeFrame::encode` now return `io::Result<Vec<u8>>` instead of `Vec<u8>`. Add `?`/`.unwrap()` at
+  call sites. The framing previously capped DECODE at 64 KiB but not ENCODE, so a sender could emit a
+  frame no conforming receiver may accept; an infallible encoder cannot report that (#1640).
+
+### Bug Fixes
+- **mux:** refuse over-cap frames at the sender instead of at the receiver, and publish the payload
+  ceiling as `MAX_RANGE_FRAME_PAYLOAD` (32 KiB) + `MAX_FRAMED_BODY` (64 KiB) so serve paths split on
+  the real per-frame limit rather than a per-request window (#1640)
+
 ## [0.11.2] - 2026-07-25
 
 ### Bug Fixes

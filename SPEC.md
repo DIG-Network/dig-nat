@@ -400,6 +400,38 @@ re-manifested the same deadlock or spawned two conflicting sessions to one peer
   reader **MUST** also accept a JSON byte ARRAY for `bytes` (the pre-0.11.2 dig-nat encoding) so a
   mixed-version peer still decodes.
 
+### 5.1 Frame size limits (NORMATIVE)
+
+Two constants bound every length-prefixed frame on a peer stream. Both are exported
+(`dig_nat::MAX_FRAMED_BODY`, `dig_nat::MAX_RANGE_FRAME_PAYLOAD`) and are **shared byte-identical wire
+values**: every implementation of DIG peer framing **MUST** use these exact numbers.
+
+| constant | value | bounds |
+|---|---|---|
+| `MAX_FRAMED_BODY` | `65536` (64 KiB) | the JSON body of ANY framed message, after the `u32`-BE prefix |
+| `MAX_RANGE_FRAME_PAYLOAD` | `32768` (32 KiB) | the raw `RangeFrame.bytes` length a single frame may carry |
+
+- A receiver **MUST** reject a length prefix greater than `MAX_FRAMED_BODY` with an `InvalidData`
+  error, without allocating the announced length.
+- **A conforming sender MUST NOT emit a frame a conforming receiver is required to reject.** This is
+  the governing invariant, and it is symmetric by construction: encoding **MUST** fail, at the sender,
+  when the serialized body would exceed `MAX_FRAMED_BODY` or when `RangeFrame.bytes` exceeds
+  `MAX_RANGE_FRAME_PAYLOAD`. It **MUST NOT** silently produce such a frame.
+- A serving peer **MUST** therefore split a requested range into frames of at most
+  `MAX_RANGE_FRAME_PAYLOAD` raw bytes each. A per-request *window* (how much one `RangeRequest` may
+  ask for) is a separate, larger quantity and is **NOT** a valid per-frame size.
+- `MAX_RANGE_FRAME_PAYLOAD` is deliberately **conservative, not exact-fit**. `bytes` travels base64
+  (4 bytes out per 3 in), so 32 KiB of payload occupies 43,692 body bytes, leaving 21,844 bytes of the
+  64 KiB body for the JSON keys and the first frame's verification metadata — `root`, `total_length`,
+  `chunk_index`, the base64 `inclusion_proof`, and the whole resource's `chunk_lens` array, whose size
+  scales with the RESOURCE rather than the frame. An implementation **MUST NOT** raise the payload
+  ceiling toward the base64-only bound of ~48 KiB: the residual allowance is what keeps a first frame
+  with a large chunk table decodable.
+
+Testability: a payload of `MAX_RANGE_FRAME_PAYLOAD + 1` **MUST** fail to encode; a payload of exactly
+`MAX_RANGE_FRAME_PAYLOAD` carrying a several-thousand-entry `chunk_lens` array and an inclusion proof
+**MUST** encode and **MUST** decode unchanged.
+
 ## 5a. Persistent relay reservation + discovery (NORMATIVE)
 
 A node behind NAT holds a CONSTANT registered connection to the relay (`run_relay_connection`) — its

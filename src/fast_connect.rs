@@ -222,7 +222,7 @@ impl FastPeerConnection {
     /// then the caller reads [`RangeFrame`](crate::mux::RangeFrame)s).
     pub async fn open_range_stream(&self, req: &RangeRequest) -> std::io::Result<FastPeerStream> {
         let mut stream = self.open_stream().await?;
-        stream.write_all(&req.encode()).await?;
+        stream.write_all(&req.encode()?).await?;
         stream.flush().await?;
         Ok(stream)
     }
@@ -235,7 +235,7 @@ impl FastPeerConnection {
     ) -> std::io::Result<AvailabilityResponse> {
         let mut stream = self.open_stream().await?;
         stream
-            .write_all(&AvailabilityRequest { items }.encode())
+            .write_all(&AvailabilityRequest { items }.encode()?)
             .await?;
         stream.flush().await?;
         AvailabilityResponse::decode(&mut stream).await
@@ -731,7 +731,11 @@ mod tests {
                                 })
                                 .collect(),
                         };
-                        let _ = s.write_all(&resp.encode()).await;
+                        let _ = s
+                            .write_all(
+                                &resp.encode().expect("availability response fits one frame"),
+                            )
+                            .await;
                         let _ = s.shutdown().await;
                     }
                 });
@@ -1029,7 +1033,8 @@ mod tests {
             &AvailabilityRequest {
                 items: vec![avail_item()],
             }
-            .encode(),
+            .encode()
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -1343,7 +1348,8 @@ mod tests {
             &AvailabilityRequest {
                 items: vec![avail_item()],
             }
-            .encode(),
+            .encode()
+            .unwrap(),
         )
         .await
         .unwrap();
