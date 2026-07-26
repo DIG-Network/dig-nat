@@ -186,17 +186,7 @@ fn range_frame_bytes_decode_from_the_canonical_base64_wire() {
 /// interchangeable with the node's hand-built one (one wire, both directions).
 #[test]
 fn range_frame_bytes_serialize_as_base64() {
-    let frame = dig_nat::RangeFrame {
-        offset: 0,
-        length: 3,
-        bytes: vec![0, 1, 2],
-        complete: true,
-        total_length: None,
-        chunk_lens: None,
-        chunk_index: None,
-        inclusion_proof: None,
-        root: None,
-    };
+    let frame = dig_nat::RangeFrame::data(0, vec![0, 1, 2]).with_complete(true);
     let v = serde_json::to_value(&frame).expect("frame serializes");
     assert_eq!(v["bytes"], serde_json::json!("AAEC"));
     let back: dig_nat::RangeFrame = serde_json::from_value(v).expect("round-trips");
@@ -212,4 +202,132 @@ fn range_frame_bytes_still_decode_from_the_legacy_array_wire() {
     });
     let frame: dig_nat::RangeFrame = serde_json::from_value(wire).expect("legacy frame decodes");
     assert_eq!(frame.bytes, vec![0u8, 1, 2]);
+}
+
+/// §5.1 backwards compatibility for the 0.13.0 prologue fields: a NEWER reader parses an OLDER message
+/// with each new field absent, and a message that sets none of them serializes byte-identically to the
+/// 0.12.0 wire. Both directions matter — a mixed-version peer must never be dropped for a field it does
+/// not know about.
+#[test]
+fn the_prologue_fields_are_additive_in_both_directions() {
+    // An older sender's frame: no chunk_count, no chunk_lens_offset.
+    let old_wire = serde_json::json!({
+        "offset": 0, "length": 3, "bytes": "AAEC", "complete": true,
+        "total_length": 3, "chunk_lens": [3], "chunk_index": 0, "root": "ab".repeat(32),
+    });
+    let parsed: dig_nat::RangeFrame =
+        serde_json::from_value(old_wire).expect("a 0.12.0 frame must still decode");
+    assert_eq!(parsed.chunk_count, None);
+    assert_eq!(parsed.chunk_lens_offset, None);
+
+    // And a frame that sets neither omits them entirely, so an older reader sees its own wire.
+    let plain = serde_json::to_value(dig_nat::RangeFrame::data(0, vec![0, 1, 2])).unwrap();
+    assert!(plain.get("chunk_count").is_none());
+    assert!(plain.get("chunk_lens_offset").is_none());
+
+    // Same for the request field.
+    let old_req = serde_json::json!({ "store_id": "ab".repeat(32), "length": 16 });
+    let req: dig_nat::RangeRequest =
+        serde_json::from_value(old_req).expect("a 0.12.0 request must still decode");
+    assert_eq!(req.skip_layout, None);
+    assert!(
+        serde_json::to_value(dig_nat::RangeRequest::capsule("ab".repeat(32), 0, 16))
+            .unwrap()
+            .get("skip_layout")
+            .is_none()
+    );
+}
+
+/// The prologue fields carry their values across the wire under the field names `SPEC.md` publishes —
+/// a paged frame is located by `chunk_lens_offset` against a total of `chunk_count`, and a client that
+/// already holds the layout says so with `skip_layout`.
+#[test]
+fn a_paged_prologue_frame_round_trips_under_the_published_field_names() {
+    let page = dig_nat::RangeFrame::data(4096, vec![7, 7, 7])
+        .with_identity("cd".repeat(32), 1_000_000, 4_000)
+        .with_chunk_lens_page(2_048, vec![262_144; 3])
+        .with_chunk_index(2_048)
+        .with_inclusion_proof("cHJvb2Y=");
+
+    let v = serde_json::to_value(&page).expect("frame serializes");
+    assert_eq!(v["chunk_count"], 4_000);
+    assert_eq!(v["chunk_lens_offset"], 2_048);
+    assert_eq!(v["root"], "cd".repeat(32));
+    assert_eq!(
+        serde_json::from_value::<dig_nat::RangeFrame>(v).expect("frame round-trips"),
+        page
+    );
+
+    let req = dig_nat::RangeRequest::resource("ab".repeat(32), "cd".repeat(32), 0, 16)
+        .with_root("ef".repeat(32))
+        .with_skip_layout(true);
+    let rv = serde_json::to_value(&req).expect("request serializes");
+    assert_eq!(rv["skip_layout"], true);
+    assert_eq!(rv["root"], "ef".repeat(32));
+    assert_eq!(
+        serde_json::from_value::<dig_nat::RangeRequest>(rv).expect("request round-trips"),
+        req
+    );
+}
+
+/// An availability answer built through its constructors carries every optional field under its
+/// published name, and `unavailable()` states exactly one thing — no other field is meaningful when the
+/// peer does not hold the item.
+#[test]
+fn availability_answers_serialize_under_the_published_field_names() {
+    let held = dig_nat::AvailabilityAnswer::available()
+        .with_roots(vec!["ab".repeat(32)])
+        .with_total_length(4_096)
+        .with_chunk_count(2)
+        .with_complete(true);
+    let v = serde_json::to_value(&held).expect("answer serializes");
+    assert_eq!(v["available"], true);
+    assert_eq!(v["roots"][0], "ab".repeat(32));
+    assert_eq!(v["total_length"], 4_096);
+    assert_eq!(v["chunk_count"], 2);
+    assert_eq!(v["complete"], true);
+
+    let missing = serde_json::to_value(dig_nat::AvailabilityAnswer::unavailable()).unwrap();
+    assert_eq!(missing["available"], false);
+    assert_eq!(missing.as_object().map(serde_json::Map::len), Some(1));
+
+    let item = serde_json::to_value(
+        dig_nat::AvailabilityItem::store("ab".repeat(32)).with_retrieval_key("cd".repeat(32)),
+    )
+    .unwrap();
+    assert_eq!(item["retrieval_key"], "cd".repeat(32));
+    assert!(item.get("root").is_none(), "an unset root is omitted");
+}
+
+/// A chunk-aligned CONTINUATION frame states its `chunk_index` and carries NO prologue set — the shape
+/// `SPEC.md` §5.1.1 requires of every frame after the first.
+///
+/// `chunk_index` used to be settable only as a parameter of `with_inclusion_proof`, so this shape was
+/// unreachable through the API: a caller had to repeat a once-per-stream proof (a §5.1.1 MUST NOT, and
+/// 4,096 B per frame against a budget with zero slack) or reach around the constructors and assign the
+/// public field. It is the ONE field every reader wants on every frame, so the API had to express it
+/// alone. The assertions below are on the absent fields as much as the present one: stating alignment
+/// must not drag the resource-scaling set along with it.
+#[test]
+fn a_chunk_aligned_continuation_frame_states_its_index_without_a_proof() {
+    let continuation = dig_nat::RangeFrame::data(32_768, vec![4, 5, 6])
+        .with_identity("ab".repeat(32), 1_000_000, 4_000)
+        .with_chunk_index(512);
+
+    assert_eq!(continuation.chunk_index, Some(512));
+    assert_eq!(
+        continuation.inclusion_proof, None,
+        "a continuation frame must be able to state alignment WITHOUT repeating the proof"
+    );
+    assert_eq!(continuation.chunk_lens, None);
+    assert_eq!(continuation.chunk_lens_offset, None);
+
+    let v = serde_json::to_value(&continuation).expect("frame serializes");
+    assert_eq!(v["chunk_index"], 512);
+    assert!(v.get("inclusion_proof").is_none());
+    assert!(v.get("chunk_lens").is_none());
+    assert!(
+        continuation.encode().is_ok(),
+        "the identity-only continuation shape must encode"
+    );
 }

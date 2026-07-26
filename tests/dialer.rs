@@ -53,19 +53,17 @@ async fn spawn_foreign_ca_mtls_server(label: &str) -> (std::net::SocketAddr, Pee
                 while let Some(mut s) = session.accept_stream().await {
                     tokio::spawn(async move {
                         if let Ok(req) = AvailabilityRequest::decode(&mut s).await {
-                            let resp = AvailabilityResponse {
-                                items: req
-                                    .items
+                            let resp = AvailabilityResponse::new(
+                                req.items
                                     .iter()
-                                    .map(|_| AvailabilityAnswer {
-                                        available: true,
-                                        roots: None,
-                                        total_length: Some(123),
-                                        chunk_count: Some(1),
-                                        complete: Some(true),
+                                    .map(|_| {
+                                        AvailabilityAnswer::available()
+                                            .with_total_length(123)
+                                            .with_chunk_count(1)
+                                            .with_complete(true)
                                     })
                                     .collect(),
-                            };
+                            );
                             let _ = s.write_all(&resp.encode().unwrap()).await;
                             let _ = s.shutdown().await;
                         }
@@ -119,19 +117,17 @@ async fn spawn_mtls_server(server: &Arc<NodeCert>) -> (std::net::SocketAddr, Pee
                 while let Some(mut s) = session.accept_stream().await {
                     tokio::spawn(async move {
                         if let Ok(req) = AvailabilityRequest::decode(&mut s).await {
-                            let resp = AvailabilityResponse {
-                                items: req
-                                    .items
+                            let resp = AvailabilityResponse::new(
+                                req.items
                                     .iter()
-                                    .map(|_| AvailabilityAnswer {
-                                        available: true,
-                                        roots: None,
-                                        total_length: Some(123),
-                                        chunk_count: Some(1),
-                                        complete: Some(true),
+                                    .map(|_| {
+                                        AvailabilityAnswer::available()
+                                            .with_total_length(123)
+                                            .with_chunk_count(1)
+                                            .with_complete(true)
                                     })
                                     .collect(),
-                            };
+                            );
                             let _ = s.write_all(&resp.encode().unwrap()).await;
                             let _ = s.shutdown().await;
                         }
@@ -162,11 +158,7 @@ async fn dial_success_verifies_identity_and_muxes() {
     assert_eq!(conn.method, TraversalKind::Direct);
 
     let resp = conn
-        .query_availability(vec![AvailabilityItem {
-            store_id: "aa".repeat(32),
-            root: None,
-            retrieval_key: None,
-        }])
+        .query_availability(vec![AvailabilityItem::store("aa".repeat(32))])
         .await
         .expect("availability over mTLS");
     assert_eq!(resp.items.len(), 1);

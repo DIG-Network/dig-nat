@@ -402,23 +402,32 @@ re-manifested the same deadlock or spawned two conflicting sessions to one peer
 
 ### 5.1 Frame size limits (NORMATIVE)
 
-Three constants bound every length-prefixed frame on a peer stream. All are exported
-(`dig_nat::MAX_FRAMED_BODY`, `dig_nat::MAX_RANGE_FRAME_PAYLOAD`,
-`dig_nat::MAX_FIRST_FRAME_CHUNK_LENS`) and are **shared byte-identical wire values**: every
-implementation of DIG peer framing **MUST** use these exact numbers.
+Five constants bound every length-prefixed frame on a peer stream. All are exported at the crate root
+(`dig_nat::MAX_FRAMED_BODY`, `dig_nat::MAX_RANGE_FRAME_PAYLOAD`, `dig_nat::MAX_INCLUSION_PROOF_B64`,
+`dig_nat::MAX_CHUNK_LENS_PER_FRAME`, `dig_nat::MAX_FIRST_FRAME_CHUNK_LENS`) and are **shared
+byte-identical wire values**: every implementation of DIG peer framing **MUST** use these exact
+numbers. Each is readable through its documented path — a bound a consumer cannot read is prose, not a
+contract.
 
 | constant | value | bounds |
 |---|---|---|
 | `MAX_FRAMED_BODY` | `65536` (64 KiB) | the JSON body of ANY framed message, after the `u32`-BE prefix |
 | `MAX_RANGE_FRAME_PAYLOAD` | `32768` (32 KiB) | the raw `RangeFrame.bytes` length a single frame may carry |
-| `MAX_FIRST_FRAME_CHUNK_LENS` | `2486` | `chunk_lens` entries GUARANTEED to fit on a first frame with every co-occurring field at ITS maximum |
+| `MAX_INCLUSION_PROOF_B64` | `4096` | the base64 `RangeFrame.inclusion_proof` length — a 96-level merkle path |
+| `MAX_CHUNK_LENS_PER_FRAME` | `2048` | `chunk_lens` entries a SENDER puts on one frame before it pages the prologue |
+| `MAX_FIRST_FRAME_CHUNK_LENS` | `2486` | `chunk_lens` entries GUARANTEED to fit on one frame with every co-occurring field at ITS maximum |
 
 - A receiver **MUST** reject a length prefix greater than `MAX_FRAMED_BODY` with an `InvalidData`
   error, without allocating the announced length.
 - **A conforming sender MUST NOT emit a frame a conforming receiver is required to reject.** This is
   the governing invariant, and it is symmetric by construction: encoding **MUST** fail, at the sender,
-  when the serialized body would exceed `MAX_FRAMED_BODY` or when `RangeFrame.bytes` exceeds
-  `MAX_RANGE_FRAME_PAYLOAD`. It **MUST NOT** silently produce such a frame.
+  when the serialized body would exceed `MAX_FRAMED_BODY`, when `RangeFrame.bytes` exceeds
+  `MAX_RANGE_FRAME_PAYLOAD`, or when `RangeFrame.inclusion_proof` exceeds `MAX_INCLUSION_PROOF_B64`.
+  It **MUST NOT** silently produce such a frame. Each refusal **MUST** name the constant it enforces:
+  `MAX_INCLUSION_PROOF_B64` is *premise 2* of `MAX_FIRST_FRAME_CHUNK_LENS`, and a premise only a test
+  believes is not a bound. A resource whose proof exceeds the cap has NO conforming range stream at
+  all; the holder **MUST** answer a structured `RANGE_METADATA_UNREPRESENTABLE` error and stream no
+  frames, rather than emit metadata a reader cannot verify.
 - `MAX_RANGE_FRAME_PAYLOAD` is deliberately **conservative, not exact-fit**. `bytes` travels base64
   (4 bytes out per 3 in), so 32 KiB of payload occupies 43,692 body bytes, leaving 21,844 bytes of the
   64 KiB body for the JSON keys and the first frame's verification metadata — `root`, `total_length`,
@@ -430,47 +439,97 @@ implementation of DIG peer framing **MUST** use these exact numbers.
   A conforming implementation **MUST** derive that figure against **every** co-occurring maximum
   simultaneously, and **MUST** state each one wherever the figure is published:
   1. the payload at `MAX_RANGE_FRAME_PAYLOAD` (32,768 B raw, 43,692 B base64);
-  2. the `inclusion_proof` at `MAX_INCLUSION_PROOF_B64` = 4,096 B;
+  2. the `inclusion_proof` at `MAX_INCLUSION_PROOF_B64` = 4,096 B (published AND encoder-enforced);
   3. every `chunk_lens` entry at its widest legal decimal form — a chunk may be 256 KiB, so six digits;
   4. every `u64` scalar at max width (20 digits): `offset`, `length`, `total_length`, `chunk_index`,
-     and the 0.13.0 `chunk_count` + `chunk_lens_offset`.
+     `chunk_count`, and `chunk_lens_offset`. Deliberately stricter than the protocol-tight widths —
+     a bound that depends on a scalar happening to be small carries a fifth implicit premise.
 
-  The figure is derived on the **0.13.0** field set (the prologue fields cost a measured 76 B) so it
-  does not move when they land; the 0.12.0 field set admits 2,496 at the same maxima. About 155 MiB of
-  resource at the canonical 64 KiB FastCDC target chunk size, about 38 MiB at the 16 KiB minimum.
+  Measured on the 0.13.0 field set — the real struct, including `chunk_count` and `chunk_lens_offset` —
+  a frame at exactly 2,486 entries with all four maxima held simultaneously serializes to **65,536 B**:
+  the cap exactly, with ZERO slack. One entry more is 65,543 B. The figure was pre-derived against these
+  fields before they landed and is therefore UNCHANGED by 0.13.0. About 155 MiB of resource at the
+  canonical 64 KiB FastCDC target chunk size, about 38 MiB at the 16 KiB minimum.
+
+  Because the slack is zero, **any** further field added to `RangeFrame` moves this number, and the
+  both-sides pin below is the only thing that will say so. That is why the pin is normative rather than
+  advisory.
 
   A figure derived with any one of those maxima left implicit comes out **too generous**, which is the
   unsafe direction — it licenses a conforming sender to emit a frame the receiver must reject, the exact
   defect §5.1 exists to close. Such a figure **MUST** be treated as a defect, not a rounding difference.
 - `MAX_FIRST_FRAME_CHUNK_LENS` is **not** the sender's paging threshold and **MUST NOT** be used as
-  one. `MAX_CHUNK_LENS_PER_FRAME` = 2,048 is where a 0.13.0 serve path begins paging the prologue
-  (62,470 B at the same maxima); `MAX_FIRST_FRAME_CHUNK_LENS` is the hard arithmetic ceiling. The gap
-  between them is deliberate margin.
+  one. `MAX_CHUNK_LENS_PER_FRAME` = 2,048 is where a serve path begins paging the prologue — a full
+  page at the same maxima measures **62,470 B**, leaving **3,066 B** (438 entries) of margin below the
+  body cap — while `MAX_FIRST_FRAME_CHUNK_LENS` is the hard arithmetic ceiling. Two numbers doing two
+  different jobs; the gap between them is the only margin the budget has, and an implementation
+  **MUST NOT** collapse one into the other.
 
 Testability — the bound **MUST** be pinned from BOTH sides, because a bound checked only from below can
 only confirm itself: a payload of `MAX_RANGE_FRAME_PAYLOAD + 1` **MUST** fail to encode; a frame at
 exactly `MAX_FIRST_FRAME_CHUNK_LENS` entries with **all four maxima above held simultaneously** **MUST**
 fit within `MAX_FRAMED_BODY` and **MUST** decode unchanged; and one entry beyond that **MUST NOT** fit.
+`MAX_INCLUSION_PROOF_B64` **MUST** be pinned the same way — a proof of exactly the cap encodes, one byte
+more is refused — and a body of exactly `MAX_FRAMED_BODY` **MUST** encode while one byte more **MUST**
+be refused, since the caps are inclusive.
 Every co-occurring field **MUST** be at its own published cap in those fixtures — a fixture that
 quietly shrinks one field (a narrow proof, a small scalar) measures a narrower frame than the protocol
-permits and will certify a too-generous bound.
+permits and will certify a too-generous bound. The over-cap proof fixture **MUST** use an entry count
+comfortably BELOW the bound, so that the refusal can only be attributed to the proof.
+
+The bounds **MUST** be derived by SERIALIZING the real struct. Four historical derivations of
+`MAX_FIRST_FRAME_CHUNK_LENS` were wrong, every one of them arithmetic in prose, and every one wrong in
+the too-generous direction.
 
 #### 5.1.1 Splitting a range into frames (NORMATIVE)
 
 - A serving peer **MUST** split a requested range into frames of at most `MAX_RANGE_FRAME_PAYLOAD` raw
   `bytes` each. A per-request *window* — how much one `RangeRequest` may ask for — is a separate and
   larger quantity, and is **NOT** a valid per-frame size.
-- The resource-scaling verification metadata — `chunk_lens` and `inclusion_proof`, whose size is a
-  function of the RESOURCE rather than of the frame — belongs on the first frame or on a paged prologue
-  sent once per range stream. It **MUST NOT** be repeated on every frame. The fixed-size identity
-  fields (`root`, `total_length`, and `chunk_index` where the window is chunk-aligned) are unaffected.
-- **The paged-prologue wire shape is defined in 0.13.0.** At this version a range whose `chunk_lens`
-  array exceeds `MAX_FIRST_FRAME_CHUNK_LENS` has no representable first frame, so `encode` refuses it
-  and the range hard-fails LOUDLY at the sender rather than corrupting a read at the receiver. That is
-  the intended behaviour of this version, not an oversight: `digstore-host` permits
-  `MAX_MODULE_BYTES` = 256 MiB (about 4,096 chunks at the 64 KiB target) and dig-download accepts
-  `MAX_MODULE_CHUNK_COUNT` = 1,048,576, so such resources exist and are served only from 0.13.0 onward.
-- An implementation **MUST NOT** work around that limit locally — not by raising `MAX_FRAMED_BODY`
+- Range-frame metadata **splits by whether it scales with the resource**:
+  - the **fixed-size identity set** — `root`, `total_length`, `chunk_count` (plus `chunk_index` where the
+    window is chunk-aligned) — rides **every** frame. It costs a bounded number of bytes and it is what
+    lets a reader reject a wrong-generation or wrong-layout holder the moment a frame arrives.
+  - the **resource-scaling set** — `chunk_lens` and `inclusion_proof`, whose size is a function of the
+    RESOURCE rather than of the frame — is sent **once per range stream**, on the first frame or across a
+    paged prologue, located by `chunk_lens_offset`. It **MUST NOT** be repeated on later frames: on a
+    later frame `chunk_lens` was only a redundant equality check on an array the client already held.
+
+##### The paged prologue (NORMATIVE)
+
+- A sender **MUST NOT** put more than `MAX_CHUNK_LENS_PER_FRAME` entries of `chunk_lens` on one frame.
+  A layout larger than that **MUST** be sent as a **paged prologue**: successive frames each carrying at
+  most that many entries, each stamped with the `chunk_lens_offset` at which its page begins.
+- Every frame carrying a `chunk_lens` page **MUST** state `chunk_lens_offset`, and every frame of the
+  stream **MUST** state `chunk_count` — the total number of entries the reassembled array has. A reader
+  places each page at its stated offset and holds the complete layout once it has `chunk_count` entries.
+  An absent `chunk_lens_offset` means the page begins at entry 0, which is the single-frame layout and
+  the pre-0.13.0 shape.
+- Pages **MUST** tile the array exactly, without gaps or overlap, and the reassembled array's entries
+  **MUST** sum to `total_length`. `chunk_lens` is a **DECRYPT** input, not a verify input: per-chunk
+  AES-256-GCM-SIV needs the WHOLE array, and a reader rejects any array whose sum differs from
+  `total_length`. A partial layout is therefore unusable, never partially useful.
+- A reader **MUST** bound the layout it accumulates by `chunk_count`, and `chunk_count` by the
+  consumer's own `MAX_MODULE_CHUNK_COUNT` — a hostile sender **MUST NOT** be able to force unbounded
+  allocation by announcing a huge count or by sending pages beyond it.
+- A client that already holds the commitment for this `root` **SHOULD** set `RangeRequest.skip_layout`,
+  and a holder honouring it omits the resource-scaling set entirely (the identity set is **NOT**
+  suppressed). `skip_layout` absent or `false` preserves the pre-0.13.0 behaviour, so a holder that does
+  not understand the field is never broken by it — it simply sends metadata the client discards.
+- The whole ecosystem's permitted sizes are now representable: `digstore-host`'s `MAX_MODULE_BYTES` of
+  256 MiB (about 4,096 chunks at the 64 KiB target) and dig-download's `MAX_MODULE_CHUNK_COUNT` of
+  1,048,576 both ride a paged prologue. The ONE unrepresentable input is an `inclusion_proof` whose
+  base64 exceeds `MAX_INCLUSION_PROOF_B64`; see §5.1.
+
+##### Wire compatibility of these fields (NORMATIVE)
+
+- `chunk_count`, `chunk_lens_offset` and `skip_layout` are **additive** (§5.1 backwards compatibility):
+  an older reader ignores them, and a newer reader parses an older message with each absent.
+- The `dig.getAvailability` and `dig.fetchRange` types are `#[non_exhaustive]` and are built through
+  their constructors, never through a struct literal. The consequence is deliberate and worth stating:
+  **every future additive field on these types is a PATCH, not a minor or a major** — a consumer's code
+  keeps compiling — which is why the 0.13.0 consumer cascade does not have to repeat.
+- An implementation **MUST NOT** work around the proof cap locally — not by raising `MAX_FRAMED_BODY`
   (a RECEIVER bound: no sender may exceed it until every receiver is deployed, and no finite cap holds
   a million entries without abandoning the bounded-allocation property the cap exists for), not by
   truncating `chunk_lens` (it is a DECRYPT input; per-chunk AES-256-GCM-SIV needs the whole array, and
