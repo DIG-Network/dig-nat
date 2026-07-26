@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.13.0] - 2026-07-26
+
+### Features
+- **mux:** Paged range-metadata prologue wire + published/enforced proof cap (0.13.0) (#18)
+
 ## [0.12.0] - 2026-07-26
 
 ### Bug Fixes
