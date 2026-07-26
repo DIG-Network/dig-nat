@@ -211,7 +211,7 @@ mod base64_bytes {
 
 impl AvailabilityRequest {
     /// Serialize as a `u32` big-endian length prefix + JSON body (the uniform control framing).
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
         encode_framed(self)
     }
     /// Read + decode an [`AvailabilityRequest`] from `r` (the peer/serving side).
@@ -222,7 +222,7 @@ impl AvailabilityRequest {
 
 impl AvailabilityResponse {
     /// Serialize as a `u32` big-endian length prefix + JSON body.
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
         encode_framed(self)
     }
     /// Read + decode an [`AvailabilityResponse`] from `r` (the requesting side).
@@ -251,7 +251,7 @@ impl RangeRequest {
 
     /// Serialize as a `u32` big-endian length prefix + JSON body — the preamble a peer reads to learn
     /// the resource + range before streaming the frames.
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
         encode_framed(self)
     }
     /// Read + decode a [`RangeRequest`] preamble from `r` (the serving side of a range stream).
@@ -262,7 +262,30 @@ impl RangeRequest {
 
 impl RangeFrame {
     /// Serialize as a `u32` big-endian length prefix + JSON body (one framed frame on the stream).
-    pub fn encode(&self) -> Vec<u8> {
+    ///
+    /// Fails with [`io::ErrorKind::InvalidData`] if [`bytes`](Self::bytes) exceeds
+    /// [`MAX_RANGE_FRAME_PAYLOAD`], or if the serialized body exceeds [`MAX_FRAMED_BODY`] for any
+    /// other reason (an unusually large `chunk_lens` table or proof). A serving peer therefore cannot
+    /// emit a frame [`decode`](Self::decode) is required to reject: it splits its resource on
+    /// [`MAX_RANGE_FRAME_PAYLOAD`] or it learns about it here, at the send site, with the ceiling
+    /// named in the error.
+    ///
+    /// The payload is checked separately from the body because the body check alone is too weak: a
+    /// payload well over the ceiling still fits in [`MAX_FRAMED_BODY`] once base64'd when the frame
+    /// carries no metadata, so it would encode here and then overflow the moment the same span rode a
+    /// FIRST frame with a chunk table attached — a size-dependent, intermittent failure. One explicit
+    /// ceiling on `bytes` makes the limit the same for every frame.
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
+        if self.bytes.len() > MAX_RANGE_FRAME_PAYLOAD {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "RangeFrame payload {} exceeds MAX_RANGE_FRAME_PAYLOAD {MAX_RANGE_FRAME_PAYLOAD}; \
+                     split the range into ceiling-sized frames",
+                    self.bytes.len()
+                ),
+            ));
+        }
         encode_framed(self)
     }
     /// Read + decode one [`RangeFrame`] from `r`. Returns `Ok(None)` at clean end-of-stream (the
@@ -272,18 +295,148 @@ impl RangeFrame {
     }
 }
 
-/// Maximum length-prefixed control/preamble body — guards against a malicious length prefix forcing
-/// a huge allocation.
-const MAX_FRAMED_BODY: usize = 64 * 1024;
+/// Maximum length-prefixed frame BODY, in bytes — the one number both sides of the framing contract
+/// obey. A decoder rejects a longer body (guarding against a malicious length prefix forcing a huge
+/// allocation) and, since #1640, an encoder refuses to produce one, so a sender can never emit a
+/// frame a conforming receiver is required to reject.
+///
+/// This is a **shared byte-identical wire constant**: any second implementation of DIG peer framing
+/// — including `dig-node`'s own `write_framed`/`read_framed` — MUST use this exact value.
+pub const MAX_FRAMED_BODY: usize = 64 * 1024;
+
+/// Maximum raw [`RangeFrame::bytes`] length, in bytes, that a single frame may carry — the number a
+/// serving peer splits a resource on. **32 KiB.**
+///
+/// ## Why it is not ~48 KiB
+///
+/// `bytes` travels base64 (4 output bytes per 3 input bytes), so [`MAX_FRAMED_BODY`] of body would
+/// hold at most ~48 KiB of raw payload *if the payload were the only thing in the frame*. It is not.
+/// The frame is JSON and, per #1577, the FIRST frame of every range additionally carries `root`,
+/// `total_length`, `chunk_index`, a base64 `inclusion_proof`, and **the entire `chunk_lens` array of
+/// the whole resource** — whose size is driven by the RESOURCE, not by the frame.
+///
+/// So the ceiling is deliberately CONSERVATIVE rather than exact-fit:
+///
+/// | component | budget |
+/// |---|---|
+/// | base64 of 32 KiB of `bytes` | 43,692 B |
+/// | remaining allowance for JSON keys + `chunk_lens` + proof + root | 21,844 B |
+/// | **total** | **65,536 B** = [`MAX_FRAMED_BODY`] |
+///
+/// **Resist tightening it.** An exact-fit constant satisfies a naive round-trip test and then
+/// overflows in production on the first resource with a large chunk table — which is precisely the
+/// class of defect #1640 was.
+///
+/// ## The allowance does NOT cover every permitted resource
+///
+/// It is bounded, and the bound is [`MAX_FIRST_FRAME_CHUNK_LENS`] — read that before assuming this
+/// ceiling makes any legal range answerable. It does not.
+pub const MAX_RANGE_FRAME_PAYLOAD: usize = 32 * 1024;
+
+/// The largest `chunk_lens` array, in entries, that is GUARANTEED to fit on a first frame: **2,486**.
+///
+/// ## The four maxima this is derived against — all of them, simultaneously
+///
+/// Read these before using or changing the number. The same budget has been derived wrong three times,
+/// each time because ONE of these stayed implicit, and each time in the UNSAFE direction — too
+/// generous, which lets a conforming sender emit a frame the receiver must reject, i.e. exactly the
+/// defect #1640 exists to close.
+///
+/// 1. **Payload at its cap** — [`MAX_RANGE_FRAME_PAYLOAD`] (32,768 B raw → 43,692 B base64).
+/// 2. **Inclusion proof at its cap** — `MAX_INCLUSION_PROOF_B64` = 4,096 B. *(The 2,891 figure this
+///    constant replaces held the proof at ~1,400 B, so it only fit a small-proof frame: at 2,891
+///    entries the body is 64,199 B with no proof, 65,223 B at a 1,024 B proof, and 68,295 B at the
+///    real cap.)*
+/// 3. **Entries at their maximum decimal WIDTH** — a chunk may legally be 256 KiB, and `chunk_lens` is
+///    JSON decimal, so a worst-case entry is SIX digits. *(The 3,373 figure assumed five, from a wrong
+///    premise that the chunker targets 256 KiB; it is FastCDC target **64 KiB**, min 16 KiB, max
+///    256 KiB — `digs crates/digstore-chunker/src/config.rs`.)*
+/// 4. **Every `u64` scalar at max width, including the 0.13.0 ones** — `offset`, `length`,
+///    `total_length`, `chunk_index`,
+///    `chunk_count`, `chunk_lens_offset`, each at 20 digits. Deliberately stricter than the
+///    protocol-tight widths (`length` ≤ 32,768 is 5 digits, `chunk_index` and `chunk_count`
+///    ≤ 1,048,576 are 7). That slack is given up on purpose: a bound that depends on a scalar
+///    happening to be small is a bound with a fifth implicit premise. Holding `chunk_count` at 7
+///    digits rather than 20 is worth 13 B — very nearly two entries — which is exactly the size of
+///    mistake this rule exists to prevent.
+///
+/// Derived on the **0.13.0 field set** — including the `chunk_count` + `chunk_lens_offset` prologue
+/// fields, which cost a measured 76 B — so the number does not have to move when they land. On today's
+/// 0.12.0 fields the same maxima allow 2,496; publishing the smaller figure keeps it valid across both.
+///
+/// ## Measured, never argued
+///
+/// Every figure here comes from serializing the real struct. Bodies at the four maxima, by entry
+/// width, on the 0.13.0 field set:
+///
+/// | `chunk_lens` entries | 5-digit entries | 6-digit entries |
+/// |---|---|---|
+/// | 2,048 | 60,422 B | 62,470 B |
+/// | **2,486** | 63,050 B | **65,536 B — the bound, exactly at the cap** |
+/// | 2,487 | 63,056 B | 65,543 B (over by 7) |
+/// | 2,495 | 63,104 B | 65,599 B (over by 63) |
+/// | 2,891 | 65,480 B | 68,371 B (over by 2,835) |
+/// | 4,096 | 72,710 B | 76,806 B |
+///
+/// At five-digit entries 2,900 would fit, but that is a property of the DATA, not of the protocol —
+/// never rely on it.
+///
+/// In resource terms 2,486 entries is about **155 MiB** at the 64 KiB target chunk size and about
+/// **38 MiB** at the 16 KiB minimum.
+///
+/// ## Not the same number as the sender's paging threshold
+///
+/// `MAX_CHUNK_LENS_PER_FRAME` = 2,048 is the 0.13.0 SENDER threshold — where a serve path starts
+/// paging the prologue (62,470 B at these same maxima). This constant is the hard ARITHMETIC ceiling.
+/// Two numbers doing two different jobs, and **the gap between them is deliberate margin**; do not
+/// collapse one into the other.
+///
+/// ## Known limitation — a permitted resource can have NO conforming first frame (#1640)
+///
+/// The ecosystem already permits resources past this bound: `digstore-host` sets
+/// `MAX_MODULE_BYTES = 256 MiB` (~4,096 chunks at the 64 KiB target — the last row above), and
+/// dig-download accepts up to `MAX_MODULE_CHUNK_COUNT = 1,048,576`. For such a resource a holder that
+/// splits on [`MAX_RANGE_FRAME_PAYLOAD`] produces a first frame [`RangeFrame::encode`] must refuse —
+/// and **surrendering the payload entirely stops helping at 8,727 entries**, where the metadata ALONE
+/// fills the body (measured at these same maxima, on the 0.13.0 field set).
+///
+/// So this is NOT a constant to re-tune: no value of [`MAX_RANGE_FRAME_PAYLOAD`] fixes it. The
+/// resolution is a wire-shape change — the resource-scaling metadata (`chunk_lens`, `inclusion_proof`)
+/// moves off every frame and onto the first frame or a paged prologue sent once per range stream — and
+/// **that shape lands in 0.13.0**. Until then a range past this bound hard-fails at the SENDER rather
+/// than corrupting a read at the receiver, which is the correct half of the trade.
+///
+/// Do NOT work around it locally: raising [`MAX_FRAMED_BODY`] is a RECEIVER bound (no sender may exceed
+/// it until every receiver is deployed, and no finite cap holds `MAX_MODULE_CHUNK_COUNT` = 1,048,576
+/// entries without abandoning the bounded-allocation property the cap exists for), and truncating
+/// `chunk_lens` is not an option either — it is a DECRYPT input, since per-chunk AES-256-GCM-SIV needs
+/// the whole array and a reader rejects any array whose sum differs from `total_length`.
+pub const MAX_FIRST_FRAME_CHUNK_LENS: usize = 2_486;
 
 /// Serialize `value` as a `u32` big-endian length prefix + JSON body — the uniform framing for every
-/// small control message on a stream (availability + range preambles).
-fn encode_framed<T: Serialize>(value: &T) -> Vec<u8> {
-    let body = serde_json::to_vec(value).expect("control message serializes");
+/// control message on a stream (availability + range preambles, and the range frames themselves).
+///
+/// Fails with [`io::ErrorKind::InvalidData`] if the body would exceed [`MAX_FRAMED_BODY`]. That check
+/// is the whole point: the decoders below MUST reject such a body, so producing one is a bug at the
+/// SENDER and belongs at the sender's call site — not as an opaque `InvalidData` surfacing on some
+/// remote peer's read.
+fn encode_framed<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
+    let body =
+        serde_json::to_vec(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if body.len() > MAX_FRAMED_BODY {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "framed body {} exceeds MAX_FRAMED_BODY {MAX_FRAMED_BODY}; split the payload on \
+                 MAX_RANGE_FRAME_PAYLOAD ({MAX_RANGE_FRAME_PAYLOAD})",
+                body.len()
+            ),
+        ));
+    }
     let mut out = Vec::with_capacity(4 + body.len());
     out.extend_from_slice(&(body.len() as u32).to_be_bytes());
     out.extend_from_slice(&body);
-    out
+    Ok(out)
 }
 
 /// Read + decode a length-prefixed JSON control message from `r`, bounded by [`MAX_FRAMED_BODY`].
@@ -474,7 +627,7 @@ impl PeerSession {
     /// range downloads — open one of these per (peer, range) and read them concurrently.
     pub async fn open_range_stream(&mut self, req: &RangeRequest) -> io::Result<PeerStream> {
         let mut stream = self.open_stream().await?;
-        stream.write_all(&req.encode()).await?;
+        stream.write_all(&req.encode()?).await?;
         stream.flush().await?;
         Ok(stream)
     }
@@ -491,7 +644,7 @@ impl PeerSession {
     ) -> io::Result<AvailabilityResponse> {
         let req = AvailabilityRequest { items };
         let mut stream = self.open_stream().await?;
-        stream.write_all(&req.encode()).await?;
+        stream.write_all(&req.encode()?).await?;
         stream.flush().await?;
         AvailabilityResponse::decode(&mut stream).await
     }

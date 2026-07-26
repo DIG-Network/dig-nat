@@ -2,6 +2,99 @@
 
 Durable, non-obvious realizations from developing dig-nat. Context, not a change diary.
 
+## Owning both sides of a framing contract is exactly when you enforce it on only one side
+
+dig-nat defined `encode_framed` and `decode_framed` twelve lines apart in one file and, for its whole
+life, capped only the decoder. `decode_framed` rejected any body over `MAX_FRAMED_BODY` (64 KiB);
+`encode_framed` wrote a `u32` prefix and the body with no check, and could not have failed if it wanted
+to — it returned `Vec<u8>` and `.expect()`ed on serialization. So the crate handed every serving peer a
+loaded gun: emit a frame that no conforming receiver is permitted to accept, and watch the error appear
+on someone else's machine as `InvalidData("control message too large")` with no mention of size.
+
+Downstream, `dig-node` split its serve paths on a 3 MiB request WINDOW because nothing told it the
+per-FRAME limit was 64 KiB of body — about 48 KiB of raw payload once `bytes` is base64'd, less again
+once the first frame's `chunk_lens`/proof metadata is attached. Every read of a resource above roughly
+48 KiB therefore failed at the reader. The read-leg e2e proofs that "passed" had served 20,477 and
+27,067 bytes: both single-frame, both under the ceiling, neither capable of noticing.
+
+**Why no test caught it, precisely.** The framing tests round-tripped small fixtures, and the transport
+tests used in-process mocks. Both properties held for small payloads, and neither test could fail
+because the bug was not a wrong VALUE — it was a missing BOUND, and a bound is only observable at a
+scale the fixtures never reached. A symmetric round-trip is structurally blind here: it feeds the
+decoder exactly what the encoder produced, so an encoder that produces something illegal and a decoder
+that would reject it never meet.
+
+Two lessons worth generalizing:
+
+1. **When one module owns both sides of a wire contract, the asymmetry is more likely, not less.** Two
+   separately-authored implementations negotiate the limit explicitly because neither trusts the other.
+   One implementation "knows" its own encoder is fine. Enforce every receiver-side bound on the sender
+   too, and make the sender's failure LOUD and LOCAL — a send-site error naming the constant is worth
+   more than the check itself.
+2. **A size limit needs a test at the limit, and the limit must be published.** The fix exports
+   `MAX_FRAMED_BODY` and `MAX_RANGE_FRAME_PAYLOAD` so no consumer has to guess or hardcode `64 * 1024`
+   (dig-node had). The ceiling is deliberately 32 KiB rather than the base64-only bound of ~48 KiB,
+   because the first frame's metadata scales with the RESOURCE — a 512 MiB resource at 256 KiB chunks
+   puts 2048 integers on it. An exact-fit constant passes an over-cap-refused test and still overflows
+   in production, so the worst-case-metadata test is the one that actually holds the number in place.
+
+
+### Postscript: two things the review gate caught, both the same mistake one level up
+
+**Merging this crate did not fix the bug on the wire.** dig-node does not use dig-nat's framing at all
+— `crates/dig-node-core/src/peer.rs` has its own `write_framed` (uncapped) and its own read cap written
+as the literal `64 * 1024`, with a comment saying it mirrors dig-nat's constant. So the identical
+asymmetry exists there independently, and correcting the oversized window constants does not close it.
+Tracked as #1645. The generalizable point: when a bound is duplicated as a literal in a second
+implementation, fixing the original changes nothing on the wire, and the comment claiming the two agree
+is the only thing holding them together. That comment is not a mechanism.
+
+**The headroom argument was wrong, and it was wrong the same way FOUR TIMES.** The number of
+`chunk_lens` entries that fits on a first frame was derived wrong at every attempt, and each attempt
+failed for the same structural reason: **one co-occurring maximum stayed implicit, and the answer came
+out too generous.**
+
+| attempt | implicit premise | figure | reality at all maxima |
+|---|---|---|---|
+| 1 | chunk SIZE (assumed 256 KiB chunks → 5-digit entries) | 3,373 | 68,909 B |
+| 2 | entry WIDTH fixed, but PROOF size implicit (~1,400 B, cap is 4,096) | 2,891 | 68,371 B |
+| 3 | proof fixed, but `chunk_count` held at 7 digits not 20 | 2,487 | 65,543 B |
+| 4 | none — all four maxima held simultaneously | **2,486** | 65,536 B, exactly at the cap |
+
+Every error was in the **unsafe direction**, and that is not a coincidence: leaving a maximum implicit
+means measuring a *narrower* frame than the protocol permits, so the bound always comes out too large,
+and a too-large sender bound licenses exactly the defect being fixed — a conforming sender emitting a
+frame the receiver must reject. An error in the safe direction merely wastes a few entries; this class
+of error reintroduces the bug.
+
+The rules that fall out, and they are cheap:
+
+- **Publish the NUMBER, and beside it name EVERY maximum it was derived against.** Not a formula: a
+  formula is a formula whose premises get re-guessed. Four premises here — payload at its cap, proof at
+  its cap, entries at their widest legal decimal form, every `u64` scalar at max width.
+- **Hold every co-occurring field at ITS OWN cap in the fixture.** A fixture with a narrow proof or a
+  small scalar measures a narrower frame than the protocol permits and will certify a too-generous
+  bound. This is the same failure as the 2,048-entry "worst case" and as the sub-48 KiB e2e fixture that
+  hid #1640 itself.
+- **Pin the bound from BOTH sides.** At the value it must fit; one past it must not. A bound checked
+  only from below can only ever confirm itself. Pinned both ways, exactly one value passes — raising it
+  to 2,487, 2,495 or 2,891 fails the upper pin, lowering it to 2,048 fails the lower pin.
+- **Settle these by SERIALIZING the real struct, never by arithmetic in prose.** Three of the four wrong
+  answers came from reasoning about byte counts in sentences. Where a field does not exist yet (the
+  0.13.0 prologue), measure it with a mirror struct rather than adding a byte count to a comment.
+- **Derive against the FUTURE field set when it is known.** 2,486 is computed on the 0.13.0 fields so it
+  never has to move; the current fields would have allowed 2,496.
+
+Also worth separating: `MAX_FIRST_FRAME_CHUNK_LENS` = 2,486 is the hard arithmetic ceiling, while
+`MAX_CHUNK_LENS_PER_FRAME` = 2,048 is the sender's paging threshold. Both are correct, they do different
+jobs, and the gap between them is deliberate margin. Collapsing a safety margin into an exact ceiling is
+how a system ends up operating with none.
+
+A blunter way to say all of it: the refusal invariant in this crate is what surfaced the whole
+collision. A guard that fails loudly at the sender turned four silent wrong numbers into four caught
+ones.
+
+
 ## yamux is transport-bound → a live transport swap happens at the STREAM-ROUTING layer, not the byte layer
 
 `yamux::Connection` runs over ONE mTLS byte stream and owns that stream's framing/windowing state; you

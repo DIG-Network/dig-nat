@@ -91,8 +91,8 @@ async fn range_stream_delivers_exact_range_as_frames() {
                     inclusion_proof: None,
                     root: None,
                 };
-                let _ = s.write_all(&f1.encode()).await;
-                let _ = s.write_all(&f2.encode()).await;
+                let _ = s.write_all(&f1.encode().unwrap()).await;
+                let _ = s.write_all(&f2.encode().unwrap()).await;
                 let _ = s.shutdown().await;
             });
         }
@@ -153,7 +153,7 @@ async fn concurrent_range_fetches_across_peers_reassemble() {
                         inclusion_proof: Some("cHJvb2Y=".into()),
                         root: Some("00".repeat(32)),
                     };
-                    let _ = s.write_all(&frame.encode()).await;
+                    let _ = s.write_all(&frame.encode().unwrap()).await;
                     let _ = s.shutdown().await;
                 });
             }
@@ -222,7 +222,7 @@ async fn availability_precheck_reports_per_item() {
                     })
                     .collect();
                 let resp = AvailabilityResponse { items: answers };
-                let _ = s.write_all(&resp.encode()).await;
+                let _ = s.write_all(&resp.encode().unwrap()).await;
                 let _ = s.shutdown().await;
             });
         }
@@ -260,7 +260,7 @@ async fn framed_messages_round_trip_and_match_spec_shape() {
         offset: 42,
         length: 4096,
     };
-    let mut cursor = std::io::Cursor::new(req.encode());
+    let mut cursor = std::io::Cursor::new(req.encode().unwrap());
     assert_eq!(RangeRequest::decode(&mut cursor).await.unwrap(), req);
 
     // Spec field names: store_id, retrieval_key, offset, length; `capsule:false`/`root:None` omitted.
@@ -278,7 +278,7 @@ async fn framed_messages_round_trip_and_match_spec_shape() {
             retrieval_key: Some("cc".repeat(32)),
         }],
     };
-    let mut c2 = std::io::Cursor::new(avail.encode());
+    let mut c2 = std::io::Cursor::new(avail.encode().unwrap());
     assert_eq!(AvailabilityRequest::decode(&mut c2).await.unwrap(), avail);
     let av = serde_json::to_value(&avail).unwrap();
     assert_eq!(av["items"][0]["store_id"], "aa".repeat(32));

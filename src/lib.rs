@@ -105,7 +105,7 @@ pub use method::upnp::{IgdGateway, RealIgd, UpnpMethod};
 pub use method::{TraversalKind, TraversalMethod};
 pub use mux::{
     AvailabilityAnswer, AvailabilityItem, AvailabilityRequest, AvailabilityResponse, ClosedHandle,
-    PeerSession, PeerStream, RangeFrame, RangeRequest,
+    PeerSession, PeerStream, RangeFrame, RangeRequest, MAX_FRAMED_BODY, MAX_RANGE_FRAME_PAYLOAD,
 };
 pub use peer::{PeerConnection, PeerTarget};
 pub use relay::{RelayState, RelayStatus, RelayTunnel};
