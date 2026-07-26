@@ -49,28 +49,50 @@ Tracked as #1645. The generalizable point: when a bound is duplicated as a liter
 implementation, fixing the original changes nothing on the wire, and the comment claiming the two agree
 is the only thing holding them together. That comment is not a mechanism.
 
-**The headroom argument was wrong, and it was wrong the same way twice.** The first version of this fix
-justified a 32 KiB payload ceiling by claiming the residual ~21 KiB covered the metadata "with room to
-spare". It does not. Serializing the real frame gives a hard bound of **2,891** `chunk_lens` entries —
-about 180 MiB of resource at the canonical chunk size — while `digstore-host` already permits 256 MiB
-modules and dig-download accepts a million chunks. So a *permitted* resource has no conforming first
-frame at all, and past ~9,133 entries the metadata alone fills the body regardless of payload. Refusal
-turns into denial: correct, loud, and still a hard failure on exactly the content sizes the fix existed
-to unblock. That is a wire-shape conflict between #1577 and a bounded body, not a constant to re-tune.
+**The headroom argument was wrong, and it was wrong the same way FOUR TIMES.** The number of
+`chunk_lens` entries that fits on a first frame was derived wrong at every attempt, and each attempt
+failed for the same structural reason: **one co-occurring maximum stayed implicit, and the answer came
+out too generous.**
 
-Both errors were premises, not arithmetic. The first assumed 256 KiB chunks when the canonical FastCDC
-target is 64 KiB. The second, found while fixing the first, assumed a chunk length's decimal width
-without stating it — the array's JSON size depends on entry WIDTH as much as entry COUNT, so the bound
-is 3,373 at five digits and 2,891 at six. Published constants must therefore name their worst case
-explicitly, and a derived bound should be *measured against the real serializer* and published as a
-NUMBER: a formula left for the next reader is a formula whose premises are re-guessed.
+| attempt | implicit premise | figure | reality at all maxima |
+|---|---|---|---|
+| 1 | chunk SIZE (assumed 256 KiB chunks → 5-digit entries) | 3,373 | 68,909 B |
+| 2 | entry WIDTH fixed, but PROOF size implicit (~1,400 B, cap is 4,096) | 2,891 | 68,371 B |
+| 3 | proof fixed, but `chunk_count` held at 7 digits not 20 | 2,487 | 65,543 B |
+| 4 | none — all four maxima held simultaneously | **2,486** | 65,536 B, exactly at the cap |
 
-And the tell was in the test file both times. The fixture used a comfortable 2,048 entries, so it could
-only ever confirm that the allowance was adequate for 2,048 entries — never that it was adequate. **A
-bound needs a test at the bound, from both sides**: at the published value it must fit, at one past it
-must refuse. Pinned that way, exactly one value passes and the constant cannot drift. Choosing a
-fixture from convenience rather than from the protocol's limit is precisely what hid #1640 itself, where
-the e2e proofs served 20 KB and 27 KB against a ~48 KiB ceiling.
+Every error was in the **unsafe direction**, and that is not a coincidence: leaving a maximum implicit
+means measuring a *narrower* frame than the protocol permits, so the bound always comes out too large,
+and a too-large sender bound licenses exactly the defect being fixed — a conforming sender emitting a
+frame the receiver must reject. An error in the safe direction merely wastes a few entries; this class
+of error reintroduces the bug.
+
+The rules that fall out, and they are cheap:
+
+- **Publish the NUMBER, and beside it name EVERY maximum it was derived against.** Not a formula: a
+  formula is a formula whose premises get re-guessed. Four premises here — payload at its cap, proof at
+  its cap, entries at their widest legal decimal form, every `u64` scalar at max width.
+- **Hold every co-occurring field at ITS OWN cap in the fixture.** A fixture with a narrow proof or a
+  small scalar measures a narrower frame than the protocol permits and will certify a too-generous
+  bound. This is the same failure as the 2,048-entry "worst case" and as the sub-48 KiB e2e fixture that
+  hid #1640 itself.
+- **Pin the bound from BOTH sides.** At the value it must fit; one past it must not. A bound checked
+  only from below can only ever confirm itself. Pinned both ways, exactly one value passes — raising it
+  to 2,487, 2,495 or 2,891 fails the upper pin, lowering it to 2,048 fails the lower pin.
+- **Settle these by SERIALIZING the real struct, never by arithmetic in prose.** Three of the four wrong
+  answers came from reasoning about byte counts in sentences. Where a field does not exist yet (the
+  0.13.0 prologue), measure it with a mirror struct rather than adding a byte count to a comment.
+- **Derive against the FUTURE field set when it is known.** 2,486 is computed on the 0.13.0 fields so it
+  never has to move; the current fields would have allowed 2,496.
+
+Also worth separating: `MAX_FIRST_FRAME_CHUNK_LENS` = 2,486 is the hard arithmetic ceiling, while
+`MAX_CHUNK_LENS_PER_FRAME` = 2,048 is the sender's paging threshold. Both are correct, they do different
+jobs, and the gap between them is deliberate margin. Collapsing a safety margin into an exact ceiling is
+how a system ends up operating with none.
+
+A blunter way to say all of it: the refusal invariant in this crate is what surfaced the whole
+collision. A guard that fails loudly at the sender turned four silent wrong numbers into four caught
+ones.
 
 
 ## yamux is transport-bound → a live transport swap happens at the STREAM-ROUTING layer, not the byte layer

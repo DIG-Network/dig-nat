@@ -15,12 +15,12 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ### Bug Fixes
 - **mux:** refuse over-cap frames at the sender instead of at the receiver, and publish the frame
   limits as `MAX_FRAMED_BODY` (64 KiB), `MAX_RANGE_FRAME_PAYLOAD` (32 KiB) and
-  `MAX_FIRST_FRAME_CHUNK_LENS` (2891) so no consumer has to hardcode or re-derive them (#1640)
+  `MAX_FIRST_FRAME_CHUNK_LENS` (2486) so no consumer has to hardcode or re-derive them (#1640)
 
 ### Known Limitations
-- **mux:** a resource above about 2,891 chunks (~180 MiB at the canonical 64 KiB chunk target) has no
+- **mux:** a resource above 2,486 chunks (~155 MiB at the canonical 64 KiB chunk target) has no
   conforming first frame: its `chunk_lens` array pushes the frame past `MAX_FRAMED_BODY`, so `encode`
-  refuses it. No payload size helps past ~9,133 chunks, where the metadata alone fills the body, so this
+  refuses it. No payload size helps past 8,727 chunks, where the metadata alone fills the body, so this
   is a wire-shape matter rather than a constant to re-tune: the resource-scaling metadata (`chunk_lens`,
   `inclusion_proof`) moves to a paged prologue sent once per range stream, whose shape lands in 0.13.0
   (`SPEC.md` §5.1.1). Until then such a range hard-fails loudly at the sender rather than corrupting a

@@ -28,27 +28,66 @@ fn data_frame(offset: u64, payload: Vec<u8>) -> RangeFrame {
     }
 }
 
-/// A FIRST frame carrying the #1577 verification metadata for a resource of `chunk_count` chunks.
+/// The published cap on a base64 `inclusion_proof`. Every fixture below holds it HERE, at its cap.
 ///
-/// The entry COUNT is the parameter on purpose. The metadata's size is driven by the resource, not by
-/// the frame, so the only meaningful fixture size is the one derived from the protocol's own bound —
-/// [`MAX_FIRST_FRAME_CHUNK_LENS`]. An earlier version of this file used a convenient 2,048 entries —
-/// comfortably inside the bound, and therefore incapable of showing that the allowance did not in fact
-/// cover every permitted resource. That is what let a wrong premise about chunk size survive review.
-/// Same lesson as the sub-48 KiB e2e fixture that hid #1640 itself: choose the fixture from the
-/// protocol's limit, never from what is convenient.
-fn first_frame(payload: Vec<u8>, chunk_count: usize) -> RangeFrame {
+/// The 2,891-entry figure this file used to assert was derived with a ~1,400-byte proof, so it was the
+/// bound for a *small-proof* frame while the protocol permits four times that. A fixture that quietly
+/// shrinks one co-occurring field turns a real worst case into a narrow one.
+const MAX_INCLUSION_PROOF_B64: usize = 4096;
+
+/// A FIRST frame carrying the #1577 verification metadata for a resource of `chunk_count` chunks, with
+/// a `proof_len`-byte inclusion proof.
+///
+/// Both sizes are parameters ON PURPOSE, and callers pass the published caps. The metadata's size is
+/// driven by the resource rather than the frame, so the only meaningful fixture is the one derived from
+/// the protocol's own limits. Earlier versions of this file used a convenient 2,048 entries and then a
+/// convenient 1,400-byte proof; each sat comfortably inside the real bound and so could only ever
+/// confirm the allowance was adequate *for that fixture*. Same lesson as the sub-48 KiB e2e fixture
+/// that hid #1640 itself: choose fixtures from the protocol's limits, never from what is convenient.
+fn first_frame(payload: Vec<u8>, chunk_count: usize, proof_len: usize) -> RangeFrame {
     RangeFrame {
-        // Every entry at the 256 KiB FastCDC maximum: six decimal digits, the widest a chunk length
-        // can legally be. The array's JSON size depends on entry WIDTH as much as on entry count, and
-        // deriving the bound at a narrower width is the second wrong premise this test guards against.
+        // Every entry at the 256 KiB FastCDC maximum: six decimal digits, the widest a chunk length can
+        // legally be. The array's JSON size depends on entry WIDTH as much as on entry count.
         chunk_lens: Some(vec![262_144; chunk_count]),
-        chunk_index: Some(0),
-        total_length: Some(256 * 1024 * 1024),
-        inclusion_proof: Some("A".repeat(1400)),
+        // Every u64 scalar at max width, matching how the constant was derived — a bound that relies on
+        // a scalar happening to be small carries a hidden premise.
+        chunk_index: Some(u64::MAX),
+        total_length: Some(u64::MAX),
+        inclusion_proof: Some("A".repeat(proof_len)),
         root: Some("ab".repeat(32)),
+        offset: u64::MAX,
+        length: u64::MAX,
         ..data_frame(0, payload)
     }
+}
+
+/// Mirrors `RangeFrame`'s serialized shape plus the two 0.13.0 prologue fields, used ONLY to measure
+/// how many bytes those fields will cost.
+///
+/// [`MAX_FIRST_FRAME_CHUNK_LENS`] is derived on the 0.13.0 field set so it never has to move when the
+/// prologue lands, which means a test on today's fields must reserve that difference or it would accept
+/// a constant that is correct today and wrong in one release. Measured by serializing, not asserted as
+/// a byte count in a comment — an arithmetic claim in prose is how this number went wrong three times.
+#[derive(serde::Serialize)]
+struct V013Fields {
+    chunk_count: u64,
+    chunk_lens_offset: u64,
+}
+
+/// The bytes the 0.13.0 prologue fields add to a frame body, measured.
+fn v013_reservation() -> usize {
+    let fields = V013Fields {
+        chunk_count: u64::MAX,
+        chunk_lens_offset: u64::MAX,
+    };
+    // `{"a":1,"b":2}` -> the two `"key":value` pairs plus the two commas joining them into a frame.
+    serde_json::to_vec(&fields).unwrap().len() - "{}".len() + ",".len()
+}
+
+/// The body `frame` serializes to, plus the 0.13.0 reservation — the number the published bound is
+/// derived against.
+fn body_with_v013_reservation(frame: &RangeFrame) -> usize {
+    serde_json::to_vec(frame).unwrap().len() + v013_reservation()
 }
 
 /// Assert `encoded` was refused, without dumping tens of kilobytes of frame into the panic message
@@ -89,44 +128,50 @@ async fn encode_refuses_a_payload_above_the_published_ceiling() {
     );
 }
 
-/// The ceiling must hold for the WORST-CASE frame, not the empty one: a full-size payload PLUS the
-/// largest `chunk_lens` table the published bound claims fits, PLUS an inclusion proof, still encodes
-/// and still decodes. An exact-fit payload ceiling derived from base64 expansion alone passes the
-/// previous test and fails this one.
+/// UPPER PIN on [`MAX_FIRST_FRAME_CHUNK_LENS`]: at the published bound, with ALL FOUR maxima held
+/// simultaneously — full payload, full proof, six-digit entries, max-width `u64` scalars — the frame
+/// fits inside [`MAX_FRAMED_BODY`] *and* still fits once the 0.13.0 prologue fields are added.
+///
+/// Raising the constant fails here. Every too-generous figure in this number's history is caught by
+/// this one test: 2,495 lands at 65,586 B, 2,891 at 68,358 B, 3,373 further still.
 #[tokio::test]
-async fn a_ceiling_payload_at_the_published_chunk_bound_still_decodes() {
+async fn the_published_chunk_bound_fits_with_every_field_at_its_maximum() {
     let frame = first_frame(
         vec![9u8; MAX_RANGE_FRAME_PAYLOAD],
         MAX_FIRST_FRAME_CHUNK_LENS,
+        MAX_INCLUSION_PROOF_B64,
     );
 
-    let wire = frame
-        .encode()
-        .expect("a payload at the ceiling must encode");
+    let budget = body_with_v013_reservation(&frame);
     assert!(
-        wire.len() - 4 <= MAX_FRAMED_BODY,
-        "worst-case body {} exceeds the decode cap {MAX_FRAMED_BODY} — the ceiling is fitted too \
-         tightly to leave room for per-frame metadata",
-        wire.len() - 4
+        budget <= MAX_FRAMED_BODY,
+        "at the published bound of {MAX_FIRST_FRAME_CHUNK_LENS} entries the worst-case body is          {budget} B, over the {MAX_FRAMED_BODY} B cap — the constant is too generous, which is the          UNSAFE direction: a conforming sender would emit a frame the receiver must reject"
     );
 
+    // And it is not merely arithmetic — the real encoder accepts it and the real decoder returns it.
+    let wire = frame.encode().expect("the bound must be encodable today");
     let decoded = decode_all(wire).await.expect("the receiver must accept it");
     assert_eq!(decoded, vec![frame]);
 }
 
-/// [`MAX_FIRST_FRAME_CHUNK_LENS`] is published as an EXACT bound, so one entry past it must refuse.
-/// Together with the test above this pins the number from both sides — a published bound that is only
-/// checked from below can drift upward unnoticed, which is how the previous 2,048-entry fixture let a
-/// too-generous claim stand.
+/// LOWER PIN on [`MAX_FIRST_FRAME_CHUNK_LENS`]: one entry past the bound does NOT fit.
+///
+/// Together with the test above this pins the constant from both sides, so exactly one value passes and
+/// it cannot drift. Lowering it fails here — the old convenient 2,048 fixture lands at 62,457 B, well
+/// inside the cap. A bound checked only from below can only ever confirm itself.
 #[tokio::test]
-async fn one_chunk_entry_past_the_published_bound_is_refused() {
+async fn one_chunk_entry_past_the_published_bound_does_not_fit() {
     let frame = first_frame(
         vec![9u8; MAX_RANGE_FRAME_PAYLOAD],
         MAX_FIRST_FRAME_CHUNK_LENS + 1,
+        MAX_INCLUSION_PROOF_B64,
     );
 
-    let err = expect_refusal(frame.encode(), "one entry past the published chunk bound");
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    let budget = body_with_v013_reservation(&frame);
+    assert!(
+        budget > MAX_FRAMED_BODY,
+        "one entry past the published bound still fits at {budget} B — the constant is lower than the          real ceiling, so it is not the bound it claims to be"
+    );
 }
 
 /// The KNOWN LIMITATION, asserted rather than left implicit (#1640): a resource the ecosystem already
@@ -145,12 +190,17 @@ async fn a_permitted_256_mebibyte_module_has_no_conforming_first_frame_yet() {
     assert!(chunks_in_256_mib > MAX_FIRST_FRAME_CHUNK_LENS);
 
     expect_refusal(
-        first_frame(vec![9u8; MAX_RANGE_FRAME_PAYLOAD], chunks_in_256_mib).encode(),
+        first_frame(
+            vec![9u8; MAX_RANGE_FRAME_PAYLOAD],
+            chunks_in_256_mib,
+            MAX_INCLUSION_PROOF_B64,
+        )
+        .encode(),
         "a 256 MiB module's first frame at the payload ceiling",
     );
     // Nor does surrendering the entire payload help beyond 9,133 entries.
     expect_refusal(
-        first_frame(Vec::new(), 9_500).encode(),
+        first_frame(Vec::new(), 9_500, MAX_INCLUSION_PROOF_B64).encode(),
         "a first frame whose metadata alone exceeds the body cap",
     );
 }

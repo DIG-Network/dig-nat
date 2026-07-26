@@ -333,45 +333,74 @@ pub const MAX_FRAMED_BODY: usize = 64 * 1024;
 /// ceiling makes any legal range answerable. It does not.
 pub const MAX_RANGE_FRAME_PAYLOAD: usize = 32 * 1024;
 
-/// The largest `chunk_lens` array, in entries, that is GUARANTEED to fit on a first frame alongside a
-/// [`MAX_RANGE_FRAME_PAYLOAD`]-sized payload, whatever the chunk lengths are: **2,891**.
+/// The largest `chunk_lens` array, in entries, that is GUARANTEED to fit on a first frame: **2,486**.
 ///
-/// Published as a number rather than a formula because a wrong premise hid inside the derivation
-/// twice: first a 256 KiB chunk-size assumption (the canonical Digstore chunker is FastCDC with a
-/// **64 KiB target**, min 16 KiB, max 256 KiB — `digs crates/digstore-chunker/src/config.rs:26`), then
-/// the entries' DECIMAL WIDTH, which the array's JSON size depends on just as much as its length.
+/// ## The four maxima this is derived against — all of them, simultaneously
 ///
-/// Measured against the real serializer, with a ceiling-sized payload, a 1,400-byte base64
-/// `inclusion_proof` and a 64-hex `root` — the shape of a real first frame:
+/// Read these before using or changing the number. The same budget has been derived wrong three times,
+/// each time because ONE of these stayed implicit, and each time in the UNSAFE direction — too
+/// generous, which lets a conforming sender emit a frame the receiver must reject, i.e. exactly the
+/// defect #1640 exists to close.
 ///
-/// | `chunk_lens` entries | body, 5-digit lengths | body, 6-digit lengths |
+/// 1. **Payload at its cap** — [`MAX_RANGE_FRAME_PAYLOAD`] (32,768 B raw → 43,692 B base64).
+/// 2. **Inclusion proof at its cap** — `MAX_INCLUSION_PROOF_B64` = 4,096 B. *(The 2,891 figure this
+///    constant replaces held the proof at ~1,400 B, so it only fit a small-proof frame: at 2,891
+///    entries the body is 64,199 B with no proof, 65,223 B at a 1,024 B proof, and 68,295 B at the
+///    real cap.)*
+/// 3. **Entries at their maximum decimal WIDTH** — a chunk may legally be 256 KiB, and `chunk_lens` is
+///    JSON decimal, so a worst-case entry is SIX digits. *(The 3,373 figure assumed five, from a wrong
+///    premise that the chunker targets 256 KiB; it is FastCDC target **64 KiB**, min 16 KiB, max
+///    256 KiB — `digs crates/digstore-chunker/src/config.rs`.)*
+/// 4. **Every `u64` scalar at max width, including the 0.13.0 ones** — `offset`, `length`,
+///    `total_length`, `chunk_index`,
+///    `chunk_count`, `chunk_lens_offset`, each at 20 digits. Deliberately stricter than the
+///    protocol-tight widths (`length` ≤ 32,768 is 5 digits, `chunk_index` and `chunk_count`
+///    ≤ 1,048,576 are 7). That slack is given up on purpose: a bound that depends on a scalar
+///    happening to be small is a bound with a fifth implicit premise. Holding `chunk_count` at 7
+///    digits rather than 20 is worth 13 B — very nearly two entries — which is exactly the size of
+///    mistake this rule exists to prevent.
+///
+/// Derived on the **0.13.0 field set** — including the `chunk_count` + `chunk_lens_offset` prologue
+/// fields, which cost a measured 76 B — so the number does not have to move when they land. On today's
+/// 0.12.0 fields the same maxima allow 2,496; publishing the smaller figure keeps it valid across both.
+///
+/// ## Measured, never argued
+///
+/// Every figure here comes from serializing the real struct. Bodies at the four maxima, by entry
+/// width, on the 0.13.0 field set:
+///
+/// | `chunk_lens` entries | 5-digit entries | 6-digit entries |
 /// |---|---|---|
-/// | 2,048 | 57,586 B | 59,634 B |
-/// | **2,891** | 62,913 B | **65,535 B — the guaranteed bound** |
-/// | 2,892 | — | 65,542 B (over by 6) |
-/// | 3,373 | 65,536 B (exact fit at 5 digits) | 68,909 B (over by 3,373) |
-/// | 4,096 | 69,874 B (over by 4,338) | 73,970 B (over by 8,434) |
-/// | 8,192 | 94,450 B | 102,642 B |
+/// | 2,048 | 60,422 B | 62,470 B |
+/// | **2,486** | 63,050 B | **65,536 B — the bound, exactly at the cap** |
+/// | 2,487 | 63,056 B | 65,543 B (over by 7) |
+/// | 2,495 | 63,104 B | 65,599 B (over by 63) |
+/// | 2,891 | 65,480 B | 68,371 B (over by 2,835) |
+/// | 4,096 | 72,710 B | 76,806 B |
 ///
-/// This constant is the **6-digit** column, because a chunk may legally be up to the 256 KiB maximum
-/// and six digits is therefore the worst case per entry. A caller whose chunk lengths all happen to be
-/// under 100,000 — which is the case at both the 64 KiB target and the 16 KiB minimum — gets 3,373
-/// instead, but **do not rely on that**: it is a property of the data, not of the protocol.
+/// At five-digit entries 2,900 would fit, but that is a property of the DATA, not of the protocol —
+/// never rely on it.
 ///
-/// In resource terms, 2,891 entries is about **180 MiB** at the 64 KiB target chunk size and about
-/// **45 MiB** at the 16 KiB minimum.
+/// In resource terms 2,486 entries is about **155 MiB** at the 64 KiB target chunk size and about
+/// **38 MiB** at the 16 KiB minimum.
+///
+/// ## Not the same number as the sender's paging threshold
+///
+/// `MAX_CHUNK_LENS_PER_FRAME` = 2,048 is the 0.13.0 SENDER threshold — where a serve path starts
+/// paging the prologue (62,470 B at these same maxima). This constant is the hard ARITHMETIC ceiling.
+/// Two numbers doing two different jobs, and **the gap between them is deliberate margin**; do not
+/// collapse one into the other.
 ///
 /// ## Known limitation — a permitted resource can have NO conforming first frame (#1640)
 ///
 /// The ecosystem already permits resources past this bound: `digstore-host` sets
-/// `MAX_MODULE_BYTES = 256 MiB` (~4,096 chunks at the 64 KiB target — the 4,096 row above), and
+/// `MAX_MODULE_BYTES = 256 MiB` (~4,096 chunks at the 64 KiB target — the last row above), and
 /// dig-download accepts up to `MAX_MODULE_CHUNK_COUNT = 1,048,576`. For such a resource a holder that
 /// splits on [`MAX_RANGE_FRAME_PAYLOAD`] produces a first frame [`RangeFrame::encode`] must refuse —
-/// and **surrendering the payload entirely stops helping at 9,133 entries**, where the metadata ALONE
-/// fills the body.
+/// and **surrendering the payload entirely stops helping at 8,727 entries**, where the metadata ALONE
+/// fills the body (measured at these same maxima, on the 0.13.0 field set).
 ///
-/// So this is NOT a constant to re-tune: no value of [`MAX_RANGE_FRAME_PAYLOAD`] fixes it, because
-/// past ~9,133 chunks the metadata alone exceeds [`MAX_FRAMED_BODY`] regardless of payload. The
+/// So this is NOT a constant to re-tune: no value of [`MAX_RANGE_FRAME_PAYLOAD`] fixes it. The
 /// resolution is a wire-shape change — the resource-scaling metadata (`chunk_lens`, `inclusion_proof`)
 /// moves off every frame and onto the first frame or a paged prologue sent once per range stream — and
 /// **that shape lands in 0.13.0**. Until then a range past this bound hard-fails at the SENDER rather
@@ -382,7 +411,7 @@ pub const MAX_RANGE_FRAME_PAYLOAD: usize = 32 * 1024;
 /// entries without abandoning the bounded-allocation property the cap exists for), and truncating
 /// `chunk_lens` is not an option either — it is a DECRYPT input, since per-chunk AES-256-GCM-SIV needs
 /// the whole array and a reader rejects any array whose sum differs from `total_length`.
-pub const MAX_FIRST_FRAME_CHUNK_LENS: usize = 2_891;
+pub const MAX_FIRST_FRAME_CHUNK_LENS: usize = 2_486;
 
 /// Serialize `value` as a `u32` big-endian length prefix + JSON body — the uniform framing for every
 /// control message on a stream (availability + range preambles, and the range frames themselves).

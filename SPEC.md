@@ -411,7 +411,7 @@ implementation of DIG peer framing **MUST** use these exact numbers.
 |---|---|---|
 | `MAX_FRAMED_BODY` | `65536` (64 KiB) | the JSON body of ANY framed message, after the `u32`-BE prefix |
 | `MAX_RANGE_FRAME_PAYLOAD` | `32768` (32 KiB) | the raw `RangeFrame.bytes` length a single frame may carry |
-| `MAX_FIRST_FRAME_CHUNK_LENS` | `2891` | `chunk_lens` entries that are GUARANTEED to fit on a first frame alongside a ceiling-sized payload |
+| `MAX_FIRST_FRAME_CHUNK_LENS` | `2486` | `chunk_lens` entries GUARANTEED to fit on a first frame with every co-occurring field at ITS maximum |
 
 - A receiver **MUST** reject a length prefix greater than `MAX_FRAMED_BODY` with an `InvalidData`
   error, without allocating the announced length.
@@ -426,15 +426,34 @@ implementation of DIG peer framing **MUST** use these exact numbers.
   scales with the RESOURCE rather than the frame. An implementation **MUST NOT** raise the payload
   ceiling toward the base64-only bound of ~48 KiB: the residual allowance is what keeps a first frame
   with a chunk table decodable.
-- That allowance is finite, and `MAX_FIRST_FRAME_CHUNK_LENS` is where it ends: **2,891** entries, with
-  every entry at the 256 KiB maximum chunk length (six decimal digits — the worst case per entry, since
-  the array's JSON size depends on entry width as well as count). About 180 MiB of resource at the
-  canonical 64 KiB FastCDC target chunk size, about 45 MiB at the 16 KiB minimum.
+- That allowance is finite, and `MAX_FIRST_FRAME_CHUNK_LENS` is where it ends: **2,486** entries.
+  A conforming implementation **MUST** derive that figure against **every** co-occurring maximum
+  simultaneously, and **MUST** state each one wherever the figure is published:
+  1. the payload at `MAX_RANGE_FRAME_PAYLOAD` (32,768 B raw, 43,692 B base64);
+  2. the `inclusion_proof` at `MAX_INCLUSION_PROOF_B64` = 4,096 B;
+  3. every `chunk_lens` entry at its widest legal decimal form — a chunk may be 256 KiB, so six digits;
+  4. every `u64` scalar at max width (20 digits): `offset`, `length`, `total_length`, `chunk_index`,
+     and the 0.13.0 `chunk_count` + `chunk_lens_offset`.
 
-Testability: a payload of `MAX_RANGE_FRAME_PAYLOAD + 1` **MUST** fail to encode; a payload of exactly
-`MAX_RANGE_FRAME_PAYLOAD` carrying exactly `MAX_FIRST_FRAME_CHUNK_LENS` six-digit `chunk_lens` entries
-plus an inclusion proof **MUST** encode and **MUST** decode unchanged; one entry beyond that **MUST**
-fail to encode.
+  The figure is derived on the **0.13.0** field set (the prologue fields cost a measured 76 B) so it
+  does not move when they land; the 0.12.0 field set admits 2,496 at the same maxima. About 155 MiB of
+  resource at the canonical 64 KiB FastCDC target chunk size, about 38 MiB at the 16 KiB minimum.
+
+  A figure derived with any one of those maxima left implicit comes out **too generous**, which is the
+  unsafe direction — it licenses a conforming sender to emit a frame the receiver must reject, the exact
+  defect §5.1 exists to close. Such a figure **MUST** be treated as a defect, not a rounding difference.
+- `MAX_FIRST_FRAME_CHUNK_LENS` is **not** the sender's paging threshold and **MUST NOT** be used as
+  one. `MAX_CHUNK_LENS_PER_FRAME` = 2,048 is where a 0.13.0 serve path begins paging the prologue
+  (62,470 B at the same maxima); `MAX_FIRST_FRAME_CHUNK_LENS` is the hard arithmetic ceiling. The gap
+  between them is deliberate margin.
+
+Testability — the bound **MUST** be pinned from BOTH sides, because a bound checked only from below can
+only confirm itself: a payload of `MAX_RANGE_FRAME_PAYLOAD + 1` **MUST** fail to encode; a frame at
+exactly `MAX_FIRST_FRAME_CHUNK_LENS` entries with **all four maxima above held simultaneously** **MUST**
+fit within `MAX_FRAMED_BODY` and **MUST** decode unchanged; and one entry beyond that **MUST NOT** fit.
+Every co-occurring field **MUST** be at its own published cap in those fixtures — a fixture that
+quietly shrinks one field (a narrow proof, a small scalar) measures a narrower frame than the protocol
+permits and will certify a too-generous bound.
 
 #### 5.1.1 Splitting a range into frames (NORMATIVE)
 
