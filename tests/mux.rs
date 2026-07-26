@@ -69,28 +69,13 @@ async fn range_stream_delivers_exact_range_as_frames() {
                 let end = start + req.length as usize;
                 // Stream the range as two frames to exercise multi-frame reassembly.
                 let mid = start + (end - start) / 2;
-                let f1 = RangeFrame {
-                    offset: 0,
-                    length: (mid - start) as u64,
-                    bytes: res[start..mid].to_vec(),
-                    complete: false,
-                    total_length: Some(res.len() as u64),
-                    chunk_lens: Some(vec![res.len() as u64]),
-                    chunk_index: Some(0),
-                    inclusion_proof: Some("cHJvb2Y=".into()),
-                    root: Some("00".repeat(32)),
-                };
-                let f2 = RangeFrame {
-                    offset: (mid - start) as u64,
-                    length: (end - mid) as u64,
-                    bytes: res[mid..end].to_vec(),
-                    complete: true,
-                    total_length: None,
-                    chunk_lens: None,
-                    chunk_index: None,
-                    inclusion_proof: None,
-                    root: None,
-                };
+                let f1 = RangeFrame::data(0, res[start..mid].to_vec())
+                    .with_identity("00".repeat(32), res.len() as u64, 1)
+                    .with_chunk_lens_page(0, vec![res.len() as u64])
+                    .with_chunk_index(0)
+                    .with_inclusion_proof("cHJvb2Y=");
+                let f2 = RangeFrame::data((mid - start) as u64, res[mid..end].to_vec())
+                    .with_complete(true);
                 let _ = s.write_all(&f1.encode().unwrap()).await;
                 let _ = s.write_all(&f2.encode().unwrap()).await;
                 let _ = s.shutdown().await;
@@ -142,17 +127,12 @@ async fn concurrent_range_fetches_across_peers_reassemble() {
                     let req = RangeRequest::decode(&mut s).await.unwrap();
                     let start = req.offset as usize;
                     let end = start + req.length as usize;
-                    let frame = RangeFrame {
-                        offset: 0,
-                        length: (end - start) as u64,
-                        bytes: content[start..end].to_vec(),
-                        complete: true,
-                        total_length: Some(content.len() as u64),
-                        chunk_lens: Some(vec![content.len() as u64]),
-                        chunk_index: Some(0),
-                        inclusion_proof: Some("cHJvb2Y=".into()),
-                        root: Some("00".repeat(32)),
-                    };
+                    let frame = RangeFrame::data(0, content[start..end].to_vec())
+                        .with_complete(true)
+                        .with_identity("00".repeat(32), content.len() as u64, 1)
+                        .with_chunk_lens_page(0, vec![content.len() as u64])
+                        .with_chunk_index(0)
+                        .with_inclusion_proof("cHJvb2Y=");
                     let _ = s.write_all(&frame.encode().unwrap()).await;
                     let _ = s.shutdown().await;
                 });
@@ -208,20 +188,14 @@ async fn availability_precheck_reports_per_item() {
                     .iter()
                     .map(|item| {
                         let has = item.store_id == "aa".repeat(32);
-                        AvailabilityAnswer {
-                            available: has && item.root.is_none(),
-                            roots: if has && item.root.is_none() {
-                                Some(vec!["dd".repeat(32)])
-                            } else {
-                                None
-                            },
-                            total_length: None,
-                            chunk_count: None,
-                            complete: None,
+                        if has && item.root.is_none() {
+                            AvailabilityAnswer::available().with_roots(vec!["dd".repeat(32)])
+                        } else {
+                            AvailabilityAnswer::unavailable()
                         }
                     })
                     .collect();
-                let resp = AvailabilityResponse { items: answers };
+                let resp = AvailabilityResponse::new(answers);
                 let _ = s.write_all(&resp.encode().unwrap()).await;
                 let _ = s.shutdown().await;
             });
@@ -230,16 +204,8 @@ async fn availability_precheck_reports_per_item() {
 
     let resp = client
         .query_availability(vec![
-            AvailabilityItem {
-                store_id: "aa".repeat(32),
-                root: None,
-                retrieval_key: None,
-            },
-            AvailabilityItem {
-                store_id: "bb".repeat(32),
-                root: Some("cc".repeat(32)),
-                retrieval_key: None,
-            },
+            AvailabilityItem::store("aa".repeat(32)),
+            AvailabilityItem::store("bb".repeat(32)).with_root("cc".repeat(32)),
         ])
         .await
         .unwrap();
@@ -252,14 +218,7 @@ async fn availability_precheck_reports_per_item() {
 /// Framing round-trips byte-for-byte, and the spec JSON field names/discriminators are exact.
 #[tokio::test]
 async fn framed_messages_round_trip_and_match_spec_shape() {
-    let req = RangeRequest {
-        store_id: "aa".repeat(32),
-        retrieval_key: Some("bb".repeat(32)),
-        root: None,
-        capsule: false,
-        offset: 42,
-        length: 4096,
-    };
+    let req = RangeRequest::resource("aa".repeat(32), "bb".repeat(32), 42, 4096);
     let mut cursor = std::io::Cursor::new(req.encode().unwrap());
     assert_eq!(RangeRequest::decode(&mut cursor).await.unwrap(), req);
 
@@ -271,13 +230,9 @@ async fn framed_messages_round_trip_and_match_spec_shape() {
     assert!(v.get("root").is_none(), "None root omitted");
     assert!(v.get("capsule").is_none(), "false capsule omitted");
 
-    let avail = AvailabilityRequest {
-        items: vec![AvailabilityItem {
-            store_id: "aa".repeat(32),
-            root: Some("bb".repeat(32)),
-            retrieval_key: Some("cc".repeat(32)),
-        }],
-    };
+    let avail = AvailabilityRequest::new(vec![AvailabilityItem::store("aa".repeat(32))
+        .with_root("bb".repeat(32))
+        .with_retrieval_key("cc".repeat(32))]);
     let mut c2 = std::io::Cursor::new(avail.encode().unwrap());
     assert_eq!(AvailabilityRequest::decode(&mut c2).await.unwrap(), avail);
     let av = serde_json::to_value(&avail).unwrap();

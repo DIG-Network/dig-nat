@@ -25,8 +25,9 @@
 //! The control + range types here conform to the published **L7 peer-network spec** (docs.dig.net
 //! "L7 · DIG Node peer network", §8 streaming, §9 byte-range fetch + availability). The shapes are
 //! the `dig.getAvailability` / `dig.fetchRange` request/response and the streamed `RangeFrame`
-//! (`{offset, length, bytes, complete}`, first frame adding `total_length` + `chunk_lens` +
-//! `chunk_index` + `inclusion_proof` + `root`). Per-chunk integrity (split by `chunk_lens`, verify
+//! (`{offset, length, bytes, complete}`, plus the fixed-size identity set `root` + `total_length` +
+//! `chunk_count` on every frame and the resource-scaling `chunk_lens` + `inclusion_proof` once per
+//! stream, paged by `chunk_lens_offset`). Per-chunk integrity (split by `chunk_lens`, verify
 //! the whole-resource inclusion proof vs the chain-anchored `root`, AES-256-GCM-SIV-open) is done by
 //! the CONTENT layer above dig-nat; dig-nat carries these frames faithfully over the mux transport.
 
@@ -51,6 +52,7 @@ pub type PeerStream = Compat<yamux::Stream>;
 /// `store_id` only → *has_store*; `+ root` → *has_root* (the capsule `store_id:root`); `+
 /// retrieval_key` → *has_resource*. Hashes are 64-hex.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AvailabilityItem {
     /// The store id (64-hex). Always present.
     pub store_id: String,
@@ -67,6 +69,7 @@ pub struct AvailabilityItem {
 /// requests at peers that answer *available* — never opening range streams to peers that may not hold
 /// the content. A message-style control call over the mux'd mTLS connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AvailabilityRequest {
     /// The items to check, batched.
     pub items: Vec<AvailabilityItem>,
@@ -74,6 +77,7 @@ pub struct AvailabilityRequest {
 
 /// One answer in an [`AvailabilityResponse`], positionally aligned with the request `items`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AvailabilityAnswer {
     /// Whether the peer holds the queried item. Always present.
     pub available: bool,
@@ -94,6 +98,7 @@ pub struct AvailabilityAnswer {
 /// The peer's answer to an [`AvailabilityRequest`]: one [`AvailabilityAnswer`] per queried item,
 /// positionally aligned with the request's `items`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AvailabilityResponse {
     /// One answer per queried item, in request order.
     pub items: Vec<AvailabilityAnswer>,
@@ -103,6 +108,7 @@ pub struct AvailabilityResponse {
 /// Identifies a resource (`store_id` + `retrieval_key` [+ `root`]) or a whole capsule
 /// (`capsule: true`, identified by `store_id` [+ `root`]) and the `[offset, offset+length)` range.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RangeRequest {
     /// The store id (64-hex).
     pub store_id: String,
@@ -120,13 +126,46 @@ pub struct RangeRequest {
     pub offset: u64,
     /// Length (bytes) to return (widened to whole-chunk boundaries; clamped to the node window).
     pub length: u64,
+    /// Suppress the resource-scaling layout metadata (`chunk_lens` + `inclusion_proof`) on this
+    /// stream's frames, because the client already holds the commitment for this `root`.
+    ///
+    /// A client that has already read the layout once — a resumed download, a second range of the same
+    /// resource, a parallel fetch from another holder — does not need it again, and for a large
+    /// resource re-sending it costs a paged prologue per stream. Absent or `false` preserves the
+    /// pre-0.13.0 behaviour, so an older holder that ignores this field is never broken by it: it
+    /// simply sends metadata the client discards. The fixed-size identity fields (`root`,
+    /// `total_length`, `chunk_count`, `chunk_index`) are NOT suppressed — they are what detects a
+    /// wrong-generation holder on arrival.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_layout: Option<bool>,
 }
 
 /// One streamed `dig.fetchRange` frame (L7 spec §8 framing). Frames arrive in ascending `offset`
 /// order and tile the requested range exactly; the caller reassembles by `offset` and stops on
-/// `complete`. The **first frame** additionally carries the per-range verification metadata so a
-/// single-peer range is independently verifiable against the chain-anchored `root`.
+/// `complete`.
+///
+/// ## The metadata splits into two sets, and which frames carry them differs
+///
+/// Read this before implementing either side — the two halves have different rules, and conforming to
+/// the wrong half produces a verification miss on a multi-frame read rather than a clean failure.
+///
+/// - **Identity — fixed-size, on EVERY frame:** `root`, `total_length`, `chunk_count`, plus
+///   `chunk_index` where the window is chunk-aligned. These are what let a reader reject a
+///   wrong-generation or wrong-layout holder the moment a frame arrives, which is a property the
+///   once-per-stream set can never have. They cost a bounded number of bytes, so carrying them
+///   everywhere is cheap. Set them with [`with_identity`](Self::with_identity) +
+///   [`with_chunk_index`](Self::with_chunk_index).
+/// - **Prologue — resource-scaling, ONCE per range stream:** `chunk_lens` (paged, located by
+///   `chunk_lens_offset`) and `inclusion_proof`. Their size is a function of the RESOURCE rather than of
+///   the frame, so they ride the first frame or a paged prologue and **MUST NOT** be repeated on later
+///   frames. Set them with [`with_chunk_lens_page`](Self::with_chunk_lens_page) +
+///   [`with_inclusion_proof`](Self::with_inclusion_proof), or omit them entirely when the request set
+///   [`RangeRequest::skip_layout`].
+///
+/// Before 0.13.0 every one of these was "first frame only", because the whole layout had to fit one
+/// frame or the range was unservable (#1640). `SPEC.md` §5.1.1 is normative.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RangeFrame {
     /// This frame's start offset within the requested range.
     pub offset: u64,
@@ -138,22 +177,55 @@ pub struct RangeFrame {
     pub bytes: Vec<u8>,
     /// Whether this is the final frame of the range.
     pub complete: bool,
-    /// (first frame only) the full resource ciphertext length.
+    /// **(identity — every frame)** the full resource ciphertext length.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_length: Option<u64>,
-    /// (first frame only) per-chunk ciphertext lengths of the whole resource, in order.
+    /// **(prologue — once per stream)** per-chunk ciphertext lengths of the whole resource, in order,
+    /// or ONE PAGE of them beginning at `chunk_lens_offset`.
+    ///
+    /// Resource-scaling, so it MUST NOT be repeated on later frames: on a later frame it was only a
+    /// redundant equality check on an array the client already held. Omitted entirely when the request
+    /// set [`RangeRequest::skip_layout`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_lens: Option<Vec<u64>>,
-    /// (first frame only) index into `chunk_lens` of the first chunk in this frame.
+    /// **(identity — every frame, where the window is chunk-aligned)** index into the resource's
+    /// `chunk_lens` array of the first chunk in THIS frame.
+    ///
+    /// Fixed-size, and about this frame rather than about the resource, so a chunk-aligned continuation
+    /// frame states it too — see [`with_chunk_index`](Self::with_chunk_index), which is deliberately
+    /// separate from the proof setter so stating alignment never costs a repeated proof.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_index: Option<u64>,
-    /// (first frame only) merkle inclusion proof of the whole resource vs the generation `root`
-    /// (base64, relayed verbatim); `null`/absent for `capsule: true` (self-verifying on install).
+    /// **(prologue — once per stream)** merkle inclusion proof of the whole resource vs the generation
+    /// `root` (base64, relayed verbatim); `null`/absent for `capsule: true` (self-verifying on install).
+    ///
+    /// Resource-scaling and capped at [`MAX_INCLUSION_PROOF_B64`]. At 4,096 B it would consume the
+    /// entire remaining frame budget if repeated, which is the concrete reason "once per stream" is a
+    /// MUST NOT rather than a preference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inclusion_proof: Option<String>,
-    /// (first frame only) the generation root (64-hex) the inclusion proof is against.
+    /// **(identity — every frame)** the generation root (64-hex) this range is served from, and which
+    /// the inclusion proof is against.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
+    /// **(identity — every frame)** the resource's TOTAL chunk count — how many entries the
+    /// reassembled `chunk_lens` array has.
+    ///
+    /// Together with `root` and `total_length` it is what lets a reader detect a wrong-generation or
+    /// wrong-layout holder the moment a frame arrives. It is also how a reader sizes the array it is
+    /// paging in, and how it knows the prologue is complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_count: Option<u64>,
+    /// **(prologue — once per page)** the index into the resource's `chunk_lens` array at which THIS
+    /// frame's `chunk_lens` page begins — how a **paged prologue** is located and reassembled.
+    ///
+    /// A resource whose layout exceeds [`MAX_CHUNK_LENS_PER_FRAME`] cannot state it on one frame, so
+    /// the sender pages it: successive frames each carry up to that many entries, stamped with the
+    /// offset they start at. A reader places each page at its offset and has the whole array once it
+    /// holds `chunk_count` entries. Absent means "this frame's `chunk_lens`, if any, begins at 0" — the
+    /// single-frame layout, which is the pre-0.13.0 shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_lens_offset: Option<u64>,
 }
 
 /// Serde for [`RangeFrame::bytes`]: **base64** on the wire, raw `Vec<u8>` in Rust.
@@ -209,7 +281,35 @@ mod base64_bytes {
     }
 }
 
+impl AvailabilityItem {
+    /// A *has_store* query — does the peer hold anything for this store?
+    pub fn store(store_id: impl Into<String>) -> Self {
+        AvailabilityItem {
+            store_id: store_id.into(),
+            root: None,
+            retrieval_key: None,
+        }
+    }
+
+    /// Narrow the query to one generation `root` — a *has_root* query for the capsule `store_id:root`.
+    pub fn with_root(mut self, root: impl Into<String>) -> Self {
+        self.root = Some(root.into());
+        self
+    }
+
+    /// Narrow the query to one resource — a *has_resource* query.
+    pub fn with_retrieval_key(mut self, retrieval_key: impl Into<String>) -> Self {
+        self.retrieval_key = Some(retrieval_key.into());
+        self
+    }
+}
+
 impl AvailabilityRequest {
+    /// A batched availability pre-check over `items`.
+    pub fn new(items: Vec<AvailabilityItem>) -> Self {
+        AvailabilityRequest { items }
+    }
+
     /// Serialize as a `u32` big-endian length prefix + JSON body (the uniform control framing).
     pub fn encode(&self) -> io::Result<Vec<u8>> {
         encode_framed(self)
@@ -220,7 +320,58 @@ impl AvailabilityRequest {
     }
 }
 
+impl AvailabilityAnswer {
+    /// The peer holds the queried item. Describe WHAT it holds with the `with_*` setters.
+    pub fn available() -> Self {
+        AvailabilityAnswer::with_availability(true)
+    }
+
+    /// The peer does not hold the queried item — the whole answer, since no other field is meaningful.
+    pub fn unavailable() -> Self {
+        AvailabilityAnswer::with_availability(false)
+    }
+
+    fn with_availability(available: bool) -> Self {
+        AvailabilityAnswer {
+            available,
+            roots: None,
+            total_length: None,
+            chunk_count: None,
+            complete: None,
+        }
+    }
+
+    /// (store granularity) the generation roots held for the store, newest-first.
+    pub fn with_roots(mut self, roots: Vec<String>) -> Self {
+        self.roots = Some(roots);
+        self
+    }
+
+    /// (root/resource granularity) the resource's ciphertext length, so the caller can plan its ranges.
+    pub fn with_total_length(mut self, total_length: u64) -> Self {
+        self.total_length = Some(total_length);
+        self
+    }
+
+    /// (root/resource granularity) the resource's chunk count.
+    pub fn with_chunk_count(mut self, chunk_count: u64) -> Self {
+        self.chunk_count = Some(chunk_count);
+        self
+    }
+
+    /// Whether the peer holds the FULL resource/capsule rather than only part of it.
+    pub fn with_complete(mut self, complete: bool) -> Self {
+        self.complete = Some(complete);
+        self
+    }
+}
+
 impl AvailabilityResponse {
+    /// The answers to an [`AvailabilityRequest`], positionally aligned with its `items`.
+    pub fn new(items: Vec<AvailabilityAnswer>) -> Self {
+        AvailabilityResponse { items }
+    }
+
     /// Serialize as a `u32` big-endian length prefix + JSON body.
     pub fn encode(&self) -> io::Result<Vec<u8>> {
         encode_framed(self)
@@ -239,14 +390,50 @@ impl RangeRequest {
         offset: u64,
         length: u64,
     ) -> Self {
-        RangeRequest {
-            store_id: store_id.into(),
-            retrieval_key: Some(retrieval_key.into()),
-            root: None,
-            capsule: false,
+        RangeRequest::resource_or_capsule(
+            store_id,
+            Some(retrieval_key.into()),
+            false,
             offset,
             length,
+        )
+    }
+
+    /// A range request for a whole capsule / `.dig`, identified by `store_id` (plus a `root` if the
+    /// caller pins a generation).
+    pub fn capsule(store_id: impl Into<String>, offset: u64, length: u64) -> Self {
+        RangeRequest::resource_or_capsule(store_id, None, true, offset, length)
+    }
+
+    fn resource_or_capsule(
+        store_id: impl Into<String>,
+        retrieval_key: Option<String>,
+        capsule: bool,
+        offset: u64,
+        length: u64,
+    ) -> Self {
+        RangeRequest {
+            store_id: store_id.into(),
+            retrieval_key,
+            root: None,
+            capsule,
+            offset,
+            length,
+            skip_layout: None,
         }
+    }
+
+    /// Pin the request to one generation `root` (64-hex) rather than the chain-anchored tip.
+    pub fn with_root(mut self, root: impl Into<String>) -> Self {
+        self.root = Some(root.into());
+        self
+    }
+
+    /// Ask the holder to omit the resource-scaling layout metadata, because this client already holds
+    /// the commitment for this `root`. See [`RangeRequest::skip_layout`].
+    pub fn with_skip_layout(mut self, skip_layout: bool) -> Self {
+        self.skip_layout = Some(skip_layout);
+        self
     }
 
     /// Serialize as a `u32` big-endian length prefix + JSON body — the preamble a peer reads to learn
@@ -261,11 +448,105 @@ impl RangeRequest {
 }
 
 impl RangeFrame {
+    /// A **data frame**: `bytes` at `offset`, with no metadata — the shape of every continuation frame.
+    ///
+    /// `length` is derived from `bytes`, since a frame that misdeclares its own payload length is never
+    /// what a serve path wants. The metadata a FIRST frame or a prologue page carries is layered on with
+    /// the `with_*` setters, so a continuation frame cannot accidentally claim a layout it is not
+    /// stating — the two shapes are different call chains, not one call with a pile of `None`s.
+    pub fn data(offset: u64, bytes: Vec<u8>) -> Self {
+        RangeFrame {
+            offset,
+            length: bytes.len() as u64,
+            bytes,
+            complete: false,
+            total_length: None,
+            chunk_lens: None,
+            chunk_index: None,
+            inclusion_proof: None,
+            root: None,
+            chunk_count: None,
+            chunk_lens_offset: None,
+        }
+    }
+
+    /// Mark this as the final frame of the range.
+    pub fn with_complete(mut self, complete: bool) -> Self {
+        self.complete = complete;
+        self
+    }
+
+    /// The fixed-size identity metadata EVERY frame of a range should carry: the generation `root`
+    /// (64-hex) the range is served from, the resource's ciphertext `total_length`, and its
+    /// `chunk_count`.
+    ///
+    /// These three are what let a reader reject a wrong-generation or wrong-layout holder the moment a
+    /// frame arrives — which the resource-scaling metadata never could, since it arrives once. They are
+    /// fixed-size, so carrying them everywhere costs a bounded number of bytes.
+    pub fn with_identity(
+        mut self,
+        root: impl Into<String>,
+        total_length: u64,
+        chunk_count: u64,
+    ) -> Self {
+        self.root = Some(root.into());
+        self.total_length = Some(total_length);
+        self.chunk_count = Some(chunk_count);
+        self
+    }
+
+    /// A page of the resource's `chunk_lens` array, beginning at entry `chunk_lens_offset`.
+    ///
+    /// Call it once with offset `0` for a layout that fits one frame (at most
+    /// [`MAX_CHUNK_LENS_PER_FRAME`] entries), or once per page of a **paged prologue**. `chunk_lens` is
+    /// a DECRYPT input — per-chunk AES-GCM-SIV needs the WHOLE array, and a reader rejects an array
+    /// whose sum differs from `total_length` — so a page is only ever useful as part of a complete set.
+    pub fn with_chunk_lens_page(mut self, chunk_lens_offset: u64, chunk_lens: Vec<u64>) -> Self {
+        self.chunk_lens_offset = Some(chunk_lens_offset);
+        self.chunk_lens = Some(chunk_lens);
+        self
+    }
+
+    /// Where this frame starts in the resource's chunk sequence — the index into `chunk_lens` of its
+    /// first chunk, for a chunk-aligned window.
+    ///
+    /// Fixed-size **identity**, so a chunk-aligned CONTINUATION frame states it too, not only the first
+    /// frame. It has its own setter for exactly that reason: it used to be a parameter of
+    /// [`with_inclusion_proof`](Self::with_inclusion_proof), which meant the one field every reader wants
+    /// on every frame could not be stated without repeating a once-per-stream proof — a `SPEC.md` §5.1.1
+    /// MUST NOT, and 4,096 B per frame against a budget with zero slack.
+    pub fn with_chunk_index(mut self, chunk_index: u64) -> Self {
+        self.chunk_index = Some(chunk_index);
+        self
+    }
+
+    /// The merkle inclusion proof of the whole resource against the generation `root` (base64, relayed
+    /// verbatim).
+    ///
+    /// Resource-scaling, so it rides the first frame or the prologue — once per range stream, never
+    /// repeated. Base64 longer than [`MAX_INCLUSION_PROOF_B64`] is refused by
+    /// [`encode`](Self::encode): such a resource has no conforming range stream at all, and the holder
+    /// must say so rather than stream frames a reader cannot verify.
+    pub fn with_inclusion_proof(mut self, inclusion_proof: impl Into<String>) -> Self {
+        self.inclusion_proof = Some(inclusion_proof.into());
+        self
+    }
+
+    /// Override the declared `length`, which [`data`](Self::data) otherwise derives from `bytes`.
+    ///
+    /// For budget fixtures that hold every scalar at its widest legal value. A serve path has no reason
+    /// to call this: a frame whose `length` disagrees with its payload is a frame the reader distrusts.
+    pub fn with_declared_length(mut self, length: u64) -> Self {
+        self.length = length;
+        self
+    }
+
     /// Serialize as a `u32` big-endian length prefix + JSON body (one framed frame on the stream).
     ///
     /// Fails with [`io::ErrorKind::InvalidData`] if [`bytes`](Self::bytes) exceeds
-    /// [`MAX_RANGE_FRAME_PAYLOAD`], or if the serialized body exceeds [`MAX_FRAMED_BODY`] for any
-    /// other reason (an unusually large `chunk_lens` table or proof). A serving peer therefore cannot
+    /// [`MAX_RANGE_FRAME_PAYLOAD`], if [`inclusion_proof`](Self::inclusion_proof) exceeds
+    /// [`MAX_INCLUSION_PROOF_B64`], or if the serialized body exceeds [`MAX_FRAMED_BODY`] for any
+    /// other reason (an unusually large `chunk_lens` page). A serving peer therefore cannot
     /// emit a frame [`decode`](Self::decode) is required to reject: it splits its resource on
     /// [`MAX_RANGE_FRAME_PAYLOAD`] or it learns about it here, at the send site, with the ceiling
     /// named in the error.
@@ -274,7 +555,9 @@ impl RangeFrame {
     /// payload well over the ceiling still fits in [`MAX_FRAMED_BODY`] once base64'd when the frame
     /// carries no metadata, so it would encode here and then overflow the moment the same span rode a
     /// FIRST frame with a chunk table attached — a size-dependent, intermittent failure. One explicit
-    /// ceiling on `bytes` makes the limit the same for every frame.
+    /// ceiling on `bytes` makes the limit the same for every frame. The proof is checked for the same
+    /// reason: it is **premise 2** of [`MAX_FIRST_FRAME_CHUNK_LENS`], and a premise only a test believes
+    /// is not a bound (#1655).
     pub fn encode(&self) -> io::Result<Vec<u8>> {
         if self.bytes.len() > MAX_RANGE_FRAME_PAYLOAD {
             return Err(io::Error::new(
@@ -285,6 +568,19 @@ impl RangeFrame {
                     self.bytes.len()
                 ),
             ));
+        }
+        if let Some(proof) = &self.inclusion_proof {
+            if proof.len() > MAX_INCLUSION_PROOF_B64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "RangeFrame inclusion_proof {} exceeds MAX_INCLUSION_PROOF_B64 \
+                         {MAX_INCLUSION_PROOF_B64}; the resource has no conforming range stream, so \
+                         answer RANGE_METADATA_UNREPRESENTABLE rather than streaming frames",
+                        proof.len()
+                    ),
+                ));
+            }
         }
         encode_framed(self)
     }
@@ -333,6 +629,37 @@ pub const MAX_FRAMED_BODY: usize = 64 * 1024;
 /// ceiling makes any legal range answerable. It does not.
 pub const MAX_RANGE_FRAME_PAYLOAD: usize = 32 * 1024;
 
+/// Maximum length of a base64 [`RangeFrame::inclusion_proof`], in bytes: **4,096** — enough for a
+/// 96-level merkle path, and **premise 2 of [`MAX_FIRST_FRAME_CHUNK_LENS`]**.
+///
+/// Published and enforced from 0.13.0. Before that it lived only in a test-local `const` and in prose,
+/// so the word GUARANTEED on the entry bound rested on a cap nothing checked: an 8 KiB proof made a
+/// *sub*-bound resource unsendable, which the published bound says cannot happen (#1655).
+/// [`RangeFrame::encode`] now refuses an over-cap proof at the SENDER, naming this constant.
+///
+/// Widening it is not a local decision: every byte added here comes out of
+/// [`MAX_FIRST_FRAME_CHUNK_LENS`], which must then be re-derived and re-published. A proof that does
+/// not fit is a resource with NO conforming range stream — the holder answers a structured
+/// `RANGE_METADATA_UNREPRESENTABLE` error rather than streaming an unverifiable frame.
+///
+/// This is a **shared byte-identical wire constant**: every implementation of DIG peer framing MUST
+/// use this exact value.
+pub const MAX_INCLUSION_PROOF_B64: usize = 4096;
+
+/// The `chunk_lens` entries a serving peer puts on ONE frame before it starts **paging the prologue**:
+/// **2,048**.
+///
+/// This is the SENDER's threshold, deliberately below the hard arithmetic ceiling
+/// [`MAX_FIRST_FRAME_CHUNK_LENS`]; the gap between the two is margin, and collapsing one into the other
+/// removes the only slack the budget has. A resource whose layout exceeds this is described by a
+/// **paged prologue**: successive frames each carry up to this many entries, and every page states the
+/// [`RangeFrame::chunk_lens_offset`] it begins at, so the reader reassembles one array of
+/// [`RangeFrame::chunk_count`] entries before it decrypts.
+///
+/// This is a **shared byte-identical wire constant**: every implementation of DIG peer framing MUST
+/// use this exact value.
+pub const MAX_CHUNK_LENS_PER_FRAME: usize = 2048;
+
 /// The largest `chunk_lens` array, in entries, that is GUARANTEED to fit on a first frame: **2,486**.
 ///
 /// ## The four maxima this is derived against — all of them, simultaneously
@@ -360,9 +687,11 @@ pub const MAX_RANGE_FRAME_PAYLOAD: usize = 32 * 1024;
 ///    digits rather than 20 is worth 13 B — very nearly two entries — which is exactly the size of
 ///    mistake this rule exists to prevent.
 ///
-/// Derived on the **0.13.0 field set** — including the `chunk_count` + `chunk_lens_offset` prologue
-/// fields, which cost a measured 76 B — so the number does not have to move when they land. On today's
-/// 0.12.0 fields the same maxima allow 2,496; publishing the smaller figure keeps it valid across both.
+/// Measured on the **real 0.13.0 struct**, `chunk_count` and `chunk_lens_offset` included. It was
+/// pre-derived against those fields before they existed — via a mirror struct, which reserved a measured
+/// 76 B — and the reservation proved exact: the number did NOT move when the fields landed. That is the
+/// technique worth reusing, because this bound has **zero** slack (65,536 B, the cap exactly), so any
+/// further field WILL move it, and only the both-sides pin in `tests/framing_ceiling.rs` will say so.
 ///
 /// ## Measured, never argued
 ///
@@ -391,26 +720,33 @@ pub const MAX_RANGE_FRAME_PAYLOAD: usize = 32 * 1024;
 /// Two numbers doing two different jobs, and **the gap between them is deliberate margin**; do not
 /// collapse one into the other.
 ///
-/// ## Known limitation — a permitted resource can have NO conforming first frame (#1640)
+/// ## This is a CEILING, not the largest servable resource (#1640, resolved in 0.13.0)
 ///
-/// The ecosystem already permits resources past this bound: `digstore-host` sets
-/// `MAX_MODULE_BYTES = 256 MiB` (~4,096 chunks at the 64 KiB target — the last row above), and
-/// dig-download accepts up to `MAX_MODULE_CHUNK_COUNT = 1,048,576`. For such a resource a holder that
-/// splits on [`MAX_RANGE_FRAME_PAYLOAD`] produces a first frame [`RangeFrame::encode`] must refuse —
-/// and **surrendering the payload entirely stops helping at 8,727 entries**, where the metadata ALONE
-/// fills the body (measured at these same maxima, on the 0.13.0 field set).
+/// The ecosystem permits resources far past this bound — `digstore-host` sets
+/// `MAX_MODULE_BYTES = 256 MiB` (~4,096 chunks at the 64 KiB target, the last row above) and
+/// dig-download accepts `MAX_MODULE_CHUNK_COUNT = 1,048,576` — and they are all servable, because the
+/// resource-scaling metadata no longer has to fit one frame: it rides a **paged prologue**
+/// ([`MAX_CHUNK_LENS_PER_FRAME`] entries per page, each located by
+/// [`RangeFrame::chunk_lens_offset`]). A 1,048,576-chunk layout costs roughly 7.3 MB across about 512
+/// pages, once per range stream — and nothing at all when the client sets
+/// [`RangeRequest::skip_layout`] because it already holds the layout.
 ///
-/// So this is NOT a constant to re-tune: no value of [`MAX_RANGE_FRAME_PAYLOAD`] fixes it. The
-/// resolution is a wire-shape change — the resource-scaling metadata (`chunk_lens`, `inclusion_proof`)
-/// moves off every frame and onto the first frame or a paged prologue sent once per range stream — and
-/// **that shape lands in 0.13.0**. Until then a range past this bound hard-fails at the SENDER rather
-/// than corrupting a read at the receiver, which is the correct half of the trade.
+/// So this constant governs how much layout ONE frame may state, which is why it is still the number a
+/// sender must respect and never the number a resource must fit under. Before 0.13.0 the two were the
+/// same thing, and a resource past the bound simply had no conforming first frame: [`RangeFrame::encode`]
+/// refused it, hard-failing LOUDLY at the sender rather than corrupting a read at the receiver — the
+/// correct half of the trade, but only half. Surrendering the payload entirely bought only so much room:
+/// past **8,727 entries** the metadata ALONE fills the body, which is why no value of
+/// [`MAX_RANGE_FRAME_PAYLOAD`] was ever the fix and the wire shape had to change.
 ///
-/// Do NOT work around it locally: raising [`MAX_FRAMED_BODY`] is a RECEIVER bound (no sender may exceed
-/// it until every receiver is deployed, and no finite cap holds `MAX_MODULE_CHUNK_COUNT` = 1,048,576
-/// entries without abandoning the bounded-allocation property the cap exists for), and truncating
-/// `chunk_lens` is not an option either — it is a DECRYPT input, since per-chunk AES-256-GCM-SIV needs
-/// the whole array and a reader rejects any array whose sum differs from `total_length`.
+/// Two workarounds remain forbidden, for reasons that did not go away: raising [`MAX_FRAMED_BODY`] is a
+/// RECEIVER bound (no sender may exceed it until every receiver is deployed, and no finite cap holds a
+/// million entries without abandoning the bounded-allocation property the cap exists for), and
+/// truncating `chunk_lens` is not an option either — it is a DECRYPT input, since per-chunk
+/// AES-256-GCM-SIV needs the whole array and a reader rejects any array whose sum differs from
+/// `total_length`. The ONE remaining unrepresentable input is an `inclusion_proof` over
+/// [`MAX_INCLUSION_PROOF_B64`]; such a resource has no conforming range stream at all, and the holder
+/// says so with a structured `RANGE_METADATA_UNREPRESENTABLE` error instead of streaming frames.
 pub const MAX_FIRST_FRAME_CHUNK_LENS: usize = 2_486;
 
 /// Serialize `value` as a `u32` big-endian length prefix + JSON body — the uniform framing for every

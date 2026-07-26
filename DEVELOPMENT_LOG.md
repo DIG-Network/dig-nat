@@ -82,8 +82,12 @@ The rules that fall out, and they are cheap:
 - **Settle these by SERIALIZING the real struct, never by arithmetic in prose.** Three of the four wrong
   answers came from reasoning about byte counts in sentences. Where a field does not exist yet (the
   0.13.0 prologue), measure it with a mirror struct rather than adding a byte count to a comment.
-- **Derive against the FUTURE field set when it is known.** 2,486 is computed on the 0.13.0 fields so it
-  never has to move; the current fields would have allowed 2,496.
+- **Derive against the FUTURE field set when it is known — and it paid off exactly as intended.** 2,486
+  was computed on the then-unwritten 0.13.0 fields via a two-field mirror struct. When those fields
+  actually landed, the real struct measured **65,536 B at 2,486 entries** — the mirror's 76 B reservation
+  was exact, so a bound with ZERO slack survived a field addition without moving. The reservation
+  technique is the transferable part: reserve the future field set by serializing a mirror of it, and the
+  next release does not get to invalidate your published number.
 
 Also worth separating: `MAX_FIRST_FRAME_CHUNK_LENS` = 2,486 is the hard arithmetic ceiling, while
 `MAX_CHUNK_LENS_PER_FRAME` = 2,048 is the sender's paging threshold. Both are correct, they do different
@@ -185,3 +189,41 @@ real outbound dial to a server accept nothing completes — a selective relayed-
 never bypassed (the bogus circuit authenticates nothing), and the dial is not permanently lost (dropping
 the dead server circuit frees the peer key for a re-dial), but consumers should bound the server-accept
 with a timeout and re-dial on failure. It is an availability property inherent to an untrusted TURN relay.
+
+## `#[non_exhaustive]` is the field that pays for all the future fields
+
+0.13.0 added two fields to `RangeFrame` and one to `RangeRequest`, and the expensive part was not the
+fields — it was that five consumer crates all had to release to see them, because these types had public
+fields and no `#[non_exhaustive]`, so *any* field addition was a breaking change.
+
+`#[non_exhaustive]` inverts that permanently: every future additive field on these wire types is a
+**patch**, and consumers keep compiling. The catch is that the attribute is itself breaking — it forbids
+ALL cross-crate struct literals (`E0639`) whether or not you add a field — so it can only go in alongside
+a break you are already paying for. 0.13.0 was that window.
+
+Two things learned doing it:
+
+- **Constructors are the migration path, not a nicety.** A `#[non_exhaustive]` type with no constructor is
+  simply unbuildable by a consumer. Every one of the six wire types got a `new`/named constructor plus
+  `with_*` setters for the optional fields, and dig-nat's own integration tests are separate crates, so
+  migrating them exercised the exact `E0639` the consumers were about to hit — the in-repo migration is
+  the cascade's worked example.
+- **`RangeFrame`'s constructor had to make the metadata OMITTABLE.** Continuation frames must not carry
+  the resource-scaling set; a constructor that demanded it would have made every continuation-frame call
+  site state a layout it is not stating. Hence `data()` + `with_identity()` + `with_chunk_lens_page()` +
+  `with_inclusion_proof()`: the first-frame and continuation shapes are different call chains rather than
+  one call with a pile of `None`s.
+
+## A premise only a test believes is not a bound
+
+`MAX_INCLUSION_PROOF_B64` = 4,096 was cited as *premise 2* of the published entry bound in SPEC.md and in
+a doc comment, while existing only as a `const` inside a test file. Nothing enforced it, and no consumer
+could read it — so an 8 KiB proof made a resource with well UNDER 2,486 chunks unsendable, which is
+exactly what the word GUARANTEED said could not happen (#1655).
+
+It failed closed, which is why it was survivable: a refusal, not an undecodable frame. But the lesson
+generalizes past this constant. **If a published bound rests on a premise, the premise must be a
+published, enforced value, and the test must import it rather than declare its own copy** — a
+test-local `const` is indistinguishable from enforcement right up to the moment a real input exceeds it.
+The test for it also has to be built so the refusal can only be the proof's fault: the fixture holds a
+comfortably sub-bound entry count, because an at-bound one would have been refused either way.
