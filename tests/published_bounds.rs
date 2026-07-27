@@ -8,7 +8,7 @@
 
 use dig_nat::{
     MAX_CHUNK_LENS_PER_FRAME, MAX_FIRST_FRAME_CHUNK_LENS, MAX_FRAMED_BODY, MAX_INCLUSION_PROOF_B64,
-    MAX_RANGE_FRAME_PAYLOAD,
+    MAX_RANGE_FRAME_PAYLOAD, MAX_RESOURCE_CHUNK_COUNT,
 };
 
 /// The published values, read through the public paths `SPEC.md` documents. Pinning them here means a
@@ -21,6 +21,19 @@ fn the_framing_bounds_are_readable_at_the_crate_root_with_their_published_values
     assert_eq!(MAX_INCLUSION_PROOF_B64, 4_096);
     assert_eq!(MAX_CHUNK_LENS_PER_FRAME, 2_048);
     assert_eq!(MAX_FIRST_FRAME_CHUNK_LENS, 2_486);
+    assert_eq!(MAX_RESOURCE_CHUNK_COUNT, 1_048_576);
+}
+
+/// The resource ceiling is a bound on ONE allocation made from a peer-declared number, so the byte cost
+/// at the ceiling is part of the published contract, not an implementation detail: 8 MB of `u64`.
+///
+/// Pinned rather than recomputed, because every raise of this number raises that allocation with it.
+#[test]
+fn the_resource_chunk_count_ceiling_costs_eight_megabytes_of_u64() {
+    assert_eq!(
+        MAX_RESOURCE_CHUNK_COUNT * std::mem::size_of::<u64>(),
+        8 * 1024 * 1024
+    );
 }
 
 /// The sender's paging threshold must stay strictly inside the hard arithmetic ceiling: the gap is the

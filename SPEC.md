@@ -512,6 +512,43 @@ the too-generous direction.
 - A reader **MUST** bound the layout it accumulates by `chunk_count`, and `chunk_count` by the
   consumer's own `MAX_MODULE_CHUNK_COUNT` — a hostile sender **MUST NOT** be able to force unbounded
   allocation by announcing a huge count or by sending pages beyond it.
+##### Reassembling the paged prologue (NORMATIVE)
+
+A reader accumulates the pages of one range stream into one array of `chunk_count` entries. The rules
+below are a **class**, not a list of observed misbehaviours: each is stated over every page that could
+break it, because a rule aimed at one behaviour (a short LAST page) is bypassed by the next variant of
+it (a short MIDDLE page, a repeated page, an offset off by one). `ChunkLensAssembler` is the reference
+implementation and `ChunkLensError` names one variant per rule.
+
+- A reader **MUST** refuse a declared `chunk_count` exceeding `MAX_RESOURCE_CHUNK_COUNT` (1,048,576)
+  **before** allocating, and **MUST** reserve the array **fallibly**. Sizing an allocation to a
+  stranger's declared number is a memory-exhaustion primitive: one small frame declaring a vast count is
+  otherwise enough to abort a node. At the ceiling the array is 8 MB of `u64`, which is the whole
+  derivation of that number.
+- A page **MUST** be non-empty and **MUST NOT** exceed `MAX_CHUNK_LENS_PER_FRAME` entries. An empty page
+  fills nothing, so accepting it lets a sender stream frames indefinitely without completing the prologue.
+- A page's `chunk_lens_offset` **MUST** be a multiple of `MAX_CHUNK_LENS_PER_FRAME` and **MUST** be
+  strictly below `chunk_count`. The offset range check **MUST** be performed in the wire's own `u64`
+  width, so an offset near `u64::MAX` cannot truncate into a valid index.
+- A page **MUST NOT** extend past `chunk_count`, and every page except the tail **MUST** be exactly
+  `MAX_CHUNK_LENS_PER_FRAME` entries long. A short non-final page leaves a gap that no page-aligned page
+  can ever fill, so it is refused **on arrival** rather than surfacing later as an unexplained
+  incompleteness.
+- A page for an already-filled slot **MUST** be REJECTED and **MUST NOT** overwrite what was accepted.
+  Overwriting would let the LAST sender of a page decide its contents.
+- A rejected page **MUST** leave the accumulated state unchanged — a rejection is not a partial
+  application.
+- A reader **MUST NOT** expose a partial array under any circumstance, and **MUST** treat a prologue that
+  ends short of `chunk_count` as a failure that yields **no array at all**. `chunk_lens` is a **DECRYPT**
+  input whose entries must sum to `total_length`; a layout short even one entry cannot decrypt the
+  resource, so a partial array is unusable rather than partially useful.
+- A `chunk_count` of zero is a complete prologue with an empty array. Reporting it forever-incomplete
+  would stall a stream over a resource that is already fully described.
+- A sender **MUST** produce pages of exactly this shape. `RangeFrame::split_chunk_lens_pages` is the
+  normative split and the mirror of the reassembler; a serve path **SHOULD** use it rather than re-derive
+  the paging rule, since #1640 was precisely an encode/decode asymmetry in which the two sides of one
+  rule were maintained separately.
+
 - A client that already holds the commitment for this `root` **SHOULD** set `RangeRequest.skip_layout`,
   and a holder honouring it omits the resource-scaling set entirely (the identity set is **NOT**
   suppressed). `skip_layout` absent or `false` preserves the pre-0.13.0 behaviour, so a holder that does

@@ -58,12 +58,25 @@ async fn accept_over_the_wire(
     let encoded = frame
         .encode()
         .expect("fixture frame must be encodable — an over-budget fixture is a broken fixture");
+
+    // A guard against this fixture quietly shrinking back under the ceiling it is supposed to measure.
+    // A full page riding a cap-sized payload must be a NEAR-ceiling frame; if a future edit makes these
+    // frames small, this suite would go on passing while measuring nothing (#1640's exact failure mode).
+    if page.len() == MAX_CHUNK_LENS_PER_FRAME {
+        assert!(
+            encoded.len() > 55_000 && encoded.len() <= dig_nat::MAX_FRAMED_BODY + 4,
+            "a full-page fixture frame must sit just inside MAX_FRAMED_BODY, not far below it; got {} B",
+            encoded.len()
+        );
+    }
     let decoded = RangeFrame::decode(&mut encoded.as_slice())
         .await
         .expect("decode must not fail on a frame we just encoded")
         .expect("a whole frame was written, so decode must yield one");
 
-    let page = decoded.chunk_lens.expect("the page survives the round trip");
+    let page = decoded
+        .chunk_lens
+        .expect("the page survives the round trip");
     let offset = decoded.chunk_lens_offset.expect("the offset survives too");
     assembler.accept_page(offset, &page)
 }
@@ -89,7 +102,10 @@ async fn pages_of_a_multi_page_layout_reassemble_byte_identically() {
 
     let mut assembler = ChunkLensAssembler::new(5_000).expect("5,000 is well inside the cap");
     for (offset, page) in &pages {
-        assert!(!assembler.is_complete(), "not complete until every page lands");
+        assert!(
+            !assembler.is_complete(),
+            "not complete until every page lands"
+        );
         accept_over_the_wire(&mut assembler, *offset, page, 5_000, total_length)
             .await
             .expect("an honest page is accepted");
@@ -353,9 +369,16 @@ fn splitting_produces_aligned_full_pages_that_tile_the_array() {
             assert!(!page.is_empty() && page.len() <= MAX_CHUNK_LENS_PER_FRAME);
             next += page.len();
         }
-        assert_eq!(next, chunk_count, "the pages cover every entry, exactly once");
         assert_eq!(
-            pages.iter().flat_map(|(_, p)| p).copied().collect::<Vec<_>>(),
+            next, chunk_count,
+            "the pages cover every entry, exactly once"
+        );
+        assert_eq!(
+            pages
+                .iter()
+                .flat_map(|(_, p)| p)
+                .copied()
+                .collect::<Vec<_>>(),
             chunk_lens
         );
     }

@@ -522,9 +522,7 @@ impl RangeFrame {
         chunk_lens
             .chunks(MAX_CHUNK_LENS_PER_FRAME)
             .enumerate()
-            .map(|(page, entries)| {
-                ((page * MAX_CHUNK_LENS_PER_FRAME) as u64, entries.to_vec())
-            })
+            .map(|(page, entries)| ((page * MAX_CHUNK_LENS_PER_FRAME) as u64, entries.to_vec()))
             .collect()
     }
 
@@ -958,12 +956,11 @@ impl ChunkLensAssembler {
         }
 
         let mut lens = Vec::new();
-        lens.try_reserve_exact(chunk_count).map_err(|_| {
-            ChunkLensError::AllocationFailed {
+        lens.try_reserve_exact(chunk_count)
+            .map_err(|_| ChunkLensError::AllocationFailed {
                 chunk_count,
                 bytes: chunk_count * std::mem::size_of::<u64>(),
-            }
-        })?;
+            })?;
         lens.resize(chunk_count, 0);
 
         let page_count = chunk_count.div_ceil(MAX_CHUNK_LENS_PER_FRAME);
@@ -1004,7 +1001,8 @@ impl ChunkLensAssembler {
                 entries: page.len(),
             });
         }
-        if !offset.is_multiple_of(page_size) {
+        // `%` rather than `u64::is_multiple_of`, which is not stable at this crate's MSRV (1.75).
+        if offset % page_size != 0 {
             return Err(ChunkLensError::MisalignedOffset { offset });
         }
         // Compared as u64 so an offset near `u64::MAX` cannot wrap into a valid index on a 64-bit host.
