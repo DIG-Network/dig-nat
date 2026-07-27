@@ -507,6 +507,27 @@ impl RangeFrame {
         self
     }
 
+    /// Split a whole resource's `chunk_lens` into the pages of a **paged prologue**: `(offset, page)`
+    /// pairs, in order, each ready for [`with_chunk_lens_page`](Self::with_chunk_lens_page).
+    ///
+    /// This is the encoder half of the paging rule, and it exists so that no serve path re-derives that
+    /// rule by hand. #1640 was an encode/decode asymmetry, so the split and its mirror
+    /// [`ChunkLensAssembler`] are published together from one module: the pages this returns are exactly
+    /// the pages the assembler requires — aligned offsets, [`MAX_CHUNK_LENS_PER_FRAME`] entries each
+    /// except a shorter tail, tiling the array with no gap and no overlap.
+    ///
+    /// A layout at or under the threshold yields a single page at offset 0, which is the single-frame
+    /// pre-0.13.0 shape; an empty layout yields no pages at all.
+    pub fn split_chunk_lens_pages(chunk_lens: &[u64]) -> Vec<(u64, Vec<u64>)> {
+        chunk_lens
+            .chunks(MAX_CHUNK_LENS_PER_FRAME)
+            .enumerate()
+            .map(|(page, entries)| {
+                ((page * MAX_CHUNK_LENS_PER_FRAME) as u64, entries.to_vec())
+            })
+            .collect()
+    }
+
     /// Where this frame starts in the resource's chunk sequence — the index into `chunk_lens` of its
     /// first chunk, for a chunk-aligned window.
     ///
@@ -748,6 +769,315 @@ pub const MAX_CHUNK_LENS_PER_FRAME: usize = 2048;
 /// [`MAX_INCLUSION_PROOF_B64`]; such a resource has no conforming range stream at all, and the holder
 /// says so with a structured `RANGE_METADATA_UNREPRESENTABLE` error instead of streaming frames.
 pub const MAX_FIRST_FRAME_CHUNK_LENS: usize = 2_486;
+
+/// The largest `chunk_count` a reader will reassemble a layout for: **1,048,576 entries**.
+///
+/// It bounds the ONE allocation a paged prologue makes from a peer-declared number. At the ceiling the
+/// array is 1,048,576 × 8 B = **8 MB** of `u64`, which is the whole derivation: a bounded, affordable
+/// worst case per in-flight stream. Above it a reader refuses rather than sizes itself to a stranger's
+/// claim — a ~64-byte frame declaring a vast count is otherwise a memory-exhaustion primitive, and one
+/// such frame has already aborted a node.
+///
+/// It mirrors dig-download's `MAX_MODULE_CHUNK_COUNT`, deliberately: the two are the same bound seen
+/// from the transport and from the content layer, so they must not drift apart. At the ~64 KiB FastCDC
+/// target this ceiling is about 64 GiB of resource, far past any size the ecosystem permits
+/// (`digstore-host`'s `MAX_MODULE_BYTES` is 256 MiB), so it constrains a liar and never an honest holder.
+///
+/// This is a **shared byte-identical wire constant**: every implementation of DIG paged-prologue
+/// reassembly MUST use this exact value.
+pub const MAX_RESOURCE_CHUNK_COUNT: usize = 1_048_576;
+
+/// Why a [`ChunkLensAssembler`] refused a page, or refused to yield an array.
+///
+/// Each variant is ONE rejection with its own name. That is deliberate: a guard justified by a single
+/// attacker behaviour ("a liar sends a short page") is bypassed by the next variant of it — a *middle*
+/// page rather than a last one, a repeated page rather than a missing one, an offset off by one rather
+/// than wildly wrong. Naming each member of the class separately is what lets a consumer report, and a
+/// test pin, the specific rule that was broken instead of a generic "bad prologue".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ChunkLensError {
+    /// The declared `chunk_count` exceeds [`MAX_RESOURCE_CHUNK_COUNT`]. Refused BEFORE allocating.
+    #[error(
+        "declared chunk_count {chunk_count} exceeds MAX_RESOURCE_CHUNK_COUNT {MAX_RESOURCE_CHUNK_COUNT}"
+    )]
+    ChunkCountTooLarge {
+        /// The count the sender declared.
+        chunk_count: usize,
+    },
+
+    /// The array for a legal `chunk_count` could not be allocated on this host. A resource ceiling is
+    /// not a memory guarantee, so the reservation is fallible and its failure is an error rather than an
+    /// abort.
+    #[error("cannot reserve a {chunk_count}-entry chunk_lens array ({bytes} bytes)")]
+    AllocationFailed {
+        /// The count that could not be reserved.
+        chunk_count: usize,
+        /// The reservation size in bytes.
+        bytes: usize,
+    },
+
+    /// A page carrying no entries. It fills nothing, so accepting it would let a sender stream frames
+    /// indefinitely without ever completing the prologue.
+    #[error("chunk_lens page at offset {offset} is empty")]
+    EmptyPage {
+        /// The offset the empty page claimed.
+        offset: u64,
+    },
+
+    /// A page carrying more than [`MAX_CHUNK_LENS_PER_FRAME`] entries — a wire-constant violation,
+    /// independent of where the page claims to sit.
+    #[error(
+        "chunk_lens page of {entries} entries exceeds MAX_CHUNK_LENS_PER_FRAME {MAX_CHUNK_LENS_PER_FRAME}"
+    )]
+    PageTooLarge {
+        /// The page's entry count.
+        entries: usize,
+    },
+
+    /// A `chunk_lens_offset` that is not a multiple of [`MAX_CHUNK_LENS_PER_FRAME`]. Pages are placed by
+    /// page index, so a misaligned page would straddle two slots and make occupancy unanswerable.
+    #[error(
+        "chunk_lens_offset {offset} is not a multiple of MAX_CHUNK_LENS_PER_FRAME {MAX_CHUNK_LENS_PER_FRAME}"
+    )]
+    MisalignedOffset {
+        /// The offset the page claimed.
+        offset: u64,
+    },
+
+    /// A `chunk_lens_offset` at or beyond the declared `chunk_count` — there is no such entry to fill.
+    #[error("chunk_lens_offset {offset} is beyond the declared chunk_count {chunk_count}")]
+    OffsetOutOfRange {
+        /// The offset the page claimed.
+        offset: u64,
+        /// The declared total entry count.
+        chunk_count: usize,
+    },
+
+    /// A page whose extent runs past the end of the array — an aligned offset is not sufficient, since a
+    /// full page at the LAST page's offset covers entries that do not exist.
+    #[error(
+        "chunk_lens page of {entries} entries at offset {offset} extends past the declared chunk_count \
+         {chunk_count}"
+    )]
+    PageExtendsPastEnd {
+        /// The offset the page claimed.
+        offset: u64,
+        /// The page's entry count.
+        entries: usize,
+        /// The declared total entry count.
+        chunk_count: usize,
+    },
+
+    /// A page that is neither full nor the tail. Pages must tile the array exactly, so a short
+    /// non-final page leaves a gap that no page-aligned page can ever fill; it is refused on arrival
+    /// rather than surfacing later as an unexplained incompleteness.
+    #[error(
+        "chunk_lens page at offset {offset} has {entries} entries; this page must have exactly {expected}"
+    )]
+    UnexpectedPageLength {
+        /// The offset the page claimed.
+        offset: u64,
+        /// The page's entry count.
+        entries: usize,
+        /// The entry count this page slot requires.
+        expected: usize,
+    },
+
+    /// A page for a slot that is already filled. A duplicate or overlapping page is a REJECT, never an
+    /// overwrite — otherwise the LAST sender of a page decides its contents.
+    #[error("a chunk_lens page at offset {offset} was already accepted")]
+    DuplicatePage {
+        /// The offset of the already-filled slot.
+        offset: u64,
+    },
+
+    /// The prologue ended short of `chunk_count`, so there is no array to yield.
+    #[error("incomplete chunk_lens prologue: {have} of {want} entries")]
+    Incomplete {
+        /// Entries actually accumulated.
+        have: usize,
+        /// Entries the declared `chunk_count` requires.
+        want: usize,
+    },
+}
+
+/// Reassembles one resource's `chunk_lens` array from the pages of a **paged prologue** — the
+/// decode-side mirror of [`RangeFrame::split_chunk_lens_pages`] (`SPEC.md` §5.1.1 is normative).
+///
+/// ## Why it lives here, beside the encoder
+///
+/// #1640 was an encode/decode asymmetry across a crate boundary: dig-nat capped DECODE and capped
+/// ENCODE at nothing, so every read past ~48 KiB failed. Both halves of the paging rule therefore live
+/// in this one module, next to the constants they are derived from. A second implementation of these
+/// placement, duplicate and completeness rules would be that same defect class waiting to recur.
+///
+/// ## Fail-closed, with no partial results
+///
+/// `chunk_lens` is a **DECRYPT** input: per-chunk AES-256-GCM-SIV needs the WHOLE array, and its
+/// entries must sum to the resource's `total_length`. A partial layout is therefore unusable rather
+/// than partially useful, which is why [`into_chunk_lens`](Self::into_chunk_lens) yields NOTHING until
+/// every page has landed, and why every irregular page is refused on arrival instead of adopted and
+/// checked later. The array is reserved fallibly and bounded by [`MAX_RESOURCE_CHUNK_COUNT`], so a
+/// declared count is never allowed to become an allocation this host cannot survive.
+///
+/// ```no_run
+/// use dig_nat::mux::{ChunkLensAssembler, RangeFrame};
+///
+/// # fn f(frames: Vec<RangeFrame>) -> Result<(), Box<dyn std::error::Error>> {
+/// let mut assembler = ChunkLensAssembler::new(5_000)?;
+/// for frame in frames {
+///     if let Some(page) = &frame.chunk_lens {
+///         assembler.accept_page(frame.chunk_lens_offset.unwrap_or(0), page)?;
+///     }
+/// }
+/// let chunk_lens = assembler.into_chunk_lens()?; // errors unless the prologue is complete
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+pub struct ChunkLensAssembler {
+    /// The array under construction, pre-sized to `chunk_count`. Unfilled entries are zero, which is
+    /// never mistaken for data because occupancy is tracked separately in `filled`.
+    lens: Vec<u64>,
+    /// One flag per page slot — the authoritative occupancy record, so a repeated page is detectable
+    /// even when it carries the same bytes as the page already accepted.
+    filled: Vec<bool>,
+    /// How many page slots are filled, so completeness is answered without rescanning `filled`.
+    filled_pages: usize,
+}
+
+impl ChunkLensAssembler {
+    /// Start reassembling the layout of a resource whose frames declare `chunk_count` entries.
+    ///
+    /// Refuses a `chunk_count` above [`MAX_RESOURCE_CHUNK_COUNT`] BEFORE it allocates anything, and
+    /// reserves the array with `try_reserve_exact` so even a legal count cannot abort the process on a
+    /// host that cannot spare it.
+    pub fn new(chunk_count: usize) -> Result<Self, ChunkLensError> {
+        if chunk_count > MAX_RESOURCE_CHUNK_COUNT {
+            return Err(ChunkLensError::ChunkCountTooLarge { chunk_count });
+        }
+
+        let mut lens = Vec::new();
+        lens.try_reserve_exact(chunk_count).map_err(|_| {
+            ChunkLensError::AllocationFailed {
+                chunk_count,
+                bytes: chunk_count * std::mem::size_of::<u64>(),
+            }
+        })?;
+        lens.resize(chunk_count, 0);
+
+        let page_count = chunk_count.div_ceil(MAX_CHUNK_LENS_PER_FRAME);
+        let mut filled = Vec::new();
+        filled
+            .try_reserve_exact(page_count)
+            .map_err(|_| ChunkLensError::AllocationFailed {
+                chunk_count,
+                bytes: page_count,
+            })?;
+        filled.resize(page_count, false);
+
+        Ok(ChunkLensAssembler {
+            lens,
+            filled,
+            filled_pages: 0,
+        })
+    }
+
+    /// Place one `chunk_lens` page, which begins at entry `offset` of the resource's array.
+    ///
+    /// A page is accepted only if it satisfies EVERY rule of the paged prologue; each violation has its
+    /// own [`ChunkLensError`] variant, and a rejected page leaves the assembler exactly as it was.
+    ///
+    /// - non-empty, and at most [`MAX_CHUNK_LENS_PER_FRAME`] entries
+    /// - `offset` a multiple of [`MAX_CHUNK_LENS_PER_FRAME`], and inside the declared count
+    /// - an extent that stays within the array, and a length that exactly fills its page slot
+    /// - a slot not already filled — a duplicate or overlapping page is REJECTED, never an overwrite
+    pub fn accept_page(&mut self, offset: u64, page: &[u64]) -> Result<(), ChunkLensError> {
+        let chunk_count = self.lens.len();
+        let page_size = MAX_CHUNK_LENS_PER_FRAME as u64;
+
+        if page.is_empty() {
+            return Err(ChunkLensError::EmptyPage { offset });
+        }
+        if page.len() > MAX_CHUNK_LENS_PER_FRAME {
+            return Err(ChunkLensError::PageTooLarge {
+                entries: page.len(),
+            });
+        }
+        if !offset.is_multiple_of(page_size) {
+            return Err(ChunkLensError::MisalignedOffset { offset });
+        }
+        // Compared as u64 so an offset near `u64::MAX` cannot wrap into a valid index on a 64-bit host.
+        if offset >= chunk_count as u64 {
+            return Err(ChunkLensError::OffsetOutOfRange {
+                offset,
+                chunk_count,
+            });
+        }
+
+        let start = offset as usize;
+        let end = start + page.len();
+        if end > chunk_count {
+            return Err(ChunkLensError::PageExtendsPastEnd {
+                offset,
+                entries: page.len(),
+                chunk_count,
+            });
+        }
+        // Every page but the tail must be exactly full, or it leaves a gap no aligned page can fill.
+        let expected = MAX_CHUNK_LENS_PER_FRAME.min(chunk_count - start);
+        if page.len() != expected {
+            return Err(ChunkLensError::UnexpectedPageLength {
+                offset,
+                entries: page.len(),
+                expected,
+            });
+        }
+
+        let slot = start / MAX_CHUNK_LENS_PER_FRAME;
+        if self.filled[slot] {
+            return Err(ChunkLensError::DuplicatePage { offset });
+        }
+
+        self.lens[start..end].copy_from_slice(page);
+        self.filled[slot] = true;
+        self.filled_pages += 1;
+        Ok(())
+    }
+
+    /// Whether every page slot has been filled, i.e. the layout is whole and decryptable.
+    ///
+    /// A zero-chunk resource is complete immediately: there is no layout to reassemble, and reporting it
+    /// forever-incomplete would stall a stream over a resource already fully described.
+    pub fn is_complete(&self) -> bool {
+        self.filled_pages == self.filled.len()
+    }
+
+    /// The reassembled `chunk_lens` array, or [`ChunkLensError::Incomplete`] if any page is missing.
+    ///
+    /// There is no partial variant of this call, by design: a layout short even one entry cannot decrypt
+    /// the resource, and handing back what arrived so far would invite a caller to treat a hostile or
+    /// truncated prologue as usable.
+    pub fn into_chunk_lens(self) -> Result<Vec<u64>, ChunkLensError> {
+        if !self.is_complete() {
+            let have = self
+                .filled
+                .iter()
+                .enumerate()
+                .filter(|(_, filled)| **filled)
+                .map(|(slot, _)| {
+                    let start = slot * MAX_CHUNK_LENS_PER_FRAME;
+                    MAX_CHUNK_LENS_PER_FRAME.min(self.lens.len() - start)
+                })
+                .sum();
+            return Err(ChunkLensError::Incomplete {
+                have,
+                want: self.lens.len(),
+            });
+        }
+        Ok(self.lens)
+    }
+}
 
 /// Serialize `value` as a `u32` big-endian length prefix + JSON body — the uniform framing for every
 /// control message on a stream (availability + range preambles, and the range frames themselves).
