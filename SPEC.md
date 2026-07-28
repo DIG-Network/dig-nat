@@ -336,6 +336,19 @@ INITIATED:
   to accept via `RelayAcceptor::accept`, which runs `PeerSession::server` behind a `TlsAcceptor`
   (`dig_tls::server_config_spki_pinned`). The accepted `PeerConnection` reports the connecting peer's
   VERIFIED `peer_id` + #1204 BLS binding — identical authentication to a direct inbound connection.
+- **ONLY a dialer's opening ClientHello may open an introduced circuit (NORMATIVE).** A frame from a
+  peer with no registered tunnel is an introduced circuit **if and only if** it begins with a TLS
+  handshake record whose first message is a ClientHello (content-type `0x16` at byte 0, handshake type
+  `0x01` at byte 5). Any other frame — a ServerHello, an application record, a record too short to
+  classify, or arbitrary bytes — **MUST** be dropped without registering a tunnel and without surfacing
+  an accept. The mTLS role of a relay circuit therefore derives from the circuit's DIRECTION (whoever
+  sent the opening handshake is the client; its counterpart is the server) and is decided at exactly ONE
+  place. A frame that merely arrives on a key with no circuit is not a new circuit: it belongs to one
+  that no longer exists here (notably a peer's records still in flight after `fast_connect` released the
+  per-peer tunnel on a relayed→direct promotion, §4b) or to one that was never this node's. Admitting
+  such a frame stands an mTLS SERVER up against a peer that is itself a server — a handshake that cannot
+  complete (`got ServerHello when expecting ClientHello` / `UnexpectedMessage`) — and lets a single
+  arbitrary byte cost a tunnel slot plus an accept task.
 - **Accept is opt-in; unknown-peer frames are otherwise DROPPED.** When the responder path is NOT
   enabled, an inbound frame from a peer with no open tunnel **MUST** be dropped (the untrusted-relay
   default). This preserves the pre-existing flood defense for consumers that only dial.

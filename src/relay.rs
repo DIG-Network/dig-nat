@@ -124,9 +124,14 @@ struct TunnelEntry {
 /// Whether `payload` begins with a TLS handshake record whose first message is a ClientHello — a TLS
 /// record has content-type `0x16` (handshake) at byte 0 and the handshake message type at byte 5
 /// (`0x01` = ClientHello, `0x02` = ServerHello). A rustls client ships its ClientHello flight as the
-/// first `poll_write`, so the first relayed frame from a fresh dialer matches this. Used ONLY to
-/// distinguish a peer's GLARE ClientHello (a competing simultaneous dial) from the ServerHello / app
-/// records expected on a tunnel where we are the client (#1536).
+/// first `poll_write`, so the first relayed frame from a fresh dialer matches this.
+///
+/// This is the relay layer's DIRECTION discriminator, and it decides the mTLS role in both directions:
+/// a ClientHello means the remote is the circuit's client, so we are its server; anything else is not
+/// the start of an inbound circuit at all. [`RelayStatus::route_relayed`] uses it to tell a peer's
+/// GLARE ClientHello (a competing simultaneous dial) from the ServerHello / app records expected where
+/// we are the client (#1536), and [`RelayStatus::accept_introduced`] uses it to refuse to manufacture
+/// a server-role circuit out of a frame no dialer sent (#1761).
 fn is_tls_client_hello(payload: &[u8]) -> bool {
     payload.len() >= 6 && payload[0] == 0x16 && payload[5] == 0x01
 }
@@ -560,9 +565,10 @@ impl RelayStatus {
 
     /// Route one inbound RLY-002 `relay_message` to its tunnel by `from` peer_id. Oversized payloads
     /// are dropped (size cap); a frame from a peer with no open tunnel becomes an introduced circuit
-    /// (accepted as a server, or dropped when the responder path is off / a flood cap is hit); a full
-    /// inbound channel drops the frame (backpressure). Returns silently in every drop case (untrusted
-    /// relay).
+    /// ONLY when it is a dialer's opening ClientHello (#1761 — see
+    /// [`accept_introduced`](Self::accept_introduced)), and is otherwise dropped, as it is when the
+    /// responder path is off or a flood cap is hit; a full inbound channel drops the frame
+    /// (backpressure). Returns silently in every drop case (untrusted relay).
     ///
     /// GLARE (#1536): when a ClientHello arrives on a tunnel where WE are ALSO the client — the peer
     /// dialed us at the same time we dialed it — a deterministic tie-break makes exactly ONE side the
@@ -643,7 +649,9 @@ impl RelayStatus {
                         Route::Accept
                     }
                 }
-                // No circuit yet — an INTRODUCED inbound circuit (a peer dialing us over the relay).
+                // No circuit under this key — a candidate INTRODUCED circuit (a peer dialing us over
+                // the relay). Whether it really is one is decided by the frame's direction in
+                // `accept_introduced`, which admits only a dialer's opening ClientHello (#1761).
                 None => Route::Accept,
             }
         };
@@ -661,12 +669,37 @@ impl RelayStatus {
 
     /// Accept an INTRODUCED inbound circuit from `from` as a server-role tunnel and surface it to the
     /// consumer's [`RelayAcceptor`](crate::accept::RelayAcceptor) — the RESPONDER path. Gated on: the
-    /// responder path being enabled ([`enable_accept`](Self::enable_accept)), NON-CLOBBER (a circuit
-    /// already under this key is kept, never replaced by a racing registration — the #1536
-    /// double-session defense), and the flood cap ([`MAX_RELAY_TUNNELS`]). The opening frame (the
-    /// dialer's ClientHello) is delivered into the fresh tunnel so the server handshake sees it; a full
-    /// accept channel drops the newest circuit (bounded backpressure).
+    /// frame actually being a dialer's OPENING HANDSHAKE (below), the responder path being enabled
+    /// ([`enable_accept`](Self::enable_accept)), NON-CLOBBER (a circuit already under this key is kept,
+    /// never replaced by a racing registration — the #1536 double-session defense), and the flood cap
+    /// ([`MAX_RELAY_TUNNELS`]). The opening frame (the dialer's ClientHello) is delivered into the fresh
+    /// tunnel so the server handshake sees it; a full accept channel drops the newest circuit (bounded
+    /// backpressure).
+    ///
+    /// This is the ONE place a server-role circuit is created, so the mTLS role of a relayed circuit is
+    /// decided HERE and only here, from the circuit's own direction — never from what the accept path
+    /// happens to be handed.
     fn accept_introduced(self: &Arc<Self>, from: &str, payload: Vec<u8>) {
+        // #1761: ONLY a client's opening handshake may open an inbound circuit. A relayed frame from a
+        // peer we hold no tunnel to is otherwise NOT the start of a circuit — it is a frame belonging to
+        // a circuit that no longer exists here, or one that was never ours. The whole class must be
+        // dropped, not just the observed instance: a peer's ServerHello or application record arriving
+        // after `fast_connect` released the per-peer tunnel on a relayed→direct promotion, a frame that
+        // outlived a timed-out or torn-down circuit, and any garbage an untrusted relay injects. Accepting
+        // any of them stands up a TLS SERVER against a peer that is itself a server, which is the live
+        // `got ServerHello when expecting ClientHello` / `UnexpectedMessage` deadlock — and it also let a
+        // single arbitrary byte cost a tunnel slot plus an accept-task.
+        if !is_tls_client_hello(&payload) {
+            // The relay-supplied `from` is deliberately NOT logged: it is an untrusted, unbounded
+            // peer-controlled string, and this line is reachable by any frame a hostile relay cares to
+            // send. The frame length is the only diagnostic that cannot carry attacker text.
+            tracing::debug!(
+                len = payload.len(),
+                "dropping a relayed frame that is not a dialer's opening handshake — no circuit is open \
+                 for this peer"
+            );
+            return;
+        }
         let Some(accept_tx) = self.inbound_accept.lock().unwrap().clone() else {
             return;
         };
@@ -1408,6 +1441,12 @@ mod tests {
         assert_eq!(winner.family, Family::V6);
     }
 
+    /// A minimal TLS handshake record whose first message is a ClientHello — the ONLY frame that opens
+    /// an introduced circuit (#1761), so every test that drives the responder path must send this shape.
+    fn client_hello_frame() -> Vec<u8> {
+        vec![0x16, 0x03, 0x01, 0x00, 0x05, 0x01, 0, 0, 0, 0]
+    }
+
     /// Build a `Connected` status with a live (dummy) outbound sink + local identity, so
     /// `route_relayed`'s introduced-circuit path can run without a real relay socket.
     fn connected_status(local_id: &str) -> Arc<RelayStatus> {
@@ -1428,7 +1467,7 @@ mod tests {
     fn introduced_frame_dropped_when_accept_disabled() {
         let status = connected_status("00aa");
         // A ClientHello-shaped frame from a peer we hold NO tunnel to — the introduced-circuit trigger.
-        status.route_relayed("ffbb", vec![0x16, 0x03, 0x01, 0x00, 0x05, 0x01, 0, 0, 0, 0]);
+        status.route_relayed("ffbb", client_hello_frame());
         assert!(
             !status.open_tunnel_exists("ffbb"),
             "no tunnel surfaced for an introduced circuit while accept is off"
@@ -1458,7 +1497,7 @@ mod tests {
         }
         assert_eq!(status.tunnels.lock().unwrap().len(), MAX_RELAY_TUNNELS);
 
-        status.route_relayed("overflowpeer", vec![1, 2, 3]);
+        status.route_relayed("overflowpeer", client_hello_frame());
         assert!(
             !status.open_tunnel_exists("overflowpeer"),
             "an introduced circuit beyond the tunnel cap is dropped, not registered"
@@ -1486,7 +1525,7 @@ mod tests {
         // Fill the accept channel to capacity WITHOUT draining it — each surfaced circuit occupies one
         // slot and keeps its server tunnel registered (the RelayTunnel lives in the channel).
         for i in 0..INBOUND_ACCEPT_CAP {
-            status.route_relayed(&format!("in{i:05}"), vec![9, 9, 9]);
+            status.route_relayed(&format!("in{i:05}"), client_hello_frame());
         }
         assert_eq!(
             status.tunnels.lock().unwrap().len(),
@@ -1496,7 +1535,7 @@ mod tests {
 
         // One more: the accept channel is full → the tunnel is registered then immediately dropped,
         // so its routing is deregistered and nothing new is surfaced.
-        status.route_relayed("overflow", vec![9, 9, 9]);
+        status.route_relayed("overflow", client_hello_frame());
         assert!(
             !status.open_tunnel_exists("overflow"),
             "an introduced circuit is dropped when the accept channel is full"
@@ -1522,7 +1561,7 @@ mod tests {
         let mut accept_rx = status.enable_accept();
 
         // The peer's introduced ClientHello arrives first → we accept it as a server-role circuit.
-        status.route_relayed("aaaa", vec![0x16, 0x03, 0x01, 0x00, 0x05, 0x01, 0, 0, 0, 0]);
+        status.route_relayed("aaaa", client_hello_frame());
         assert!(status.open_tunnel_exists("aaaa"));
         let _server_tunnel = accept_rx
             .try_recv()
@@ -1553,7 +1592,7 @@ mod tests {
         );
 
         let mut accept_rx = status.enable_accept();
-        status.route_relayed("cccc", vec![0x16, 0x03, 0x01, 0x00, 0x05, 0x01, 0, 0, 0, 0]);
+        status.route_relayed("cccc", client_hello_frame());
         assert!(
             !status.open_tunnel_exists("cccc"),
             "a frame stamped with our own id is dropped, never registered"
@@ -1582,7 +1621,7 @@ mod tests {
 
         // The relay injects a bogus ClientHello with from=ffff → glare on our client tunnel → we (the
         // lower id) yield: drop the client tunnel, surface a server accept.
-        status.route_relayed("ffff", vec![0x16, 0x03, 0x01, 0x00, 0x05, 0x01, 0, 0, 0, 0]);
+        status.route_relayed("ffff", client_hello_frame());
         let server_tunnel = accept_rx
             .try_recv()
             .expect("the injected ClientHello yielded a server accept");
@@ -1605,6 +1644,64 @@ mod tests {
         assert!(
             status.open_tunnel("ffff", DEFAULT_NETWORK_ID).is_ok(),
             "a fresh outbound dial succeeds after the bogus injection is cleaned up"
+        );
+    }
+
+    /// REGRESSION (#1761): only a client's OPENING HANDSHAKE may create a server-role circuit.
+    ///
+    /// A relayed frame from a peer we hold no tunnel to used to be accepted as an introduced circuit
+    /// WHATEVER its content, so any frame that is not a dialer's ClientHello manufactured a bogus
+    /// server-role circuit — and the mTLS server behind it then failed with the live
+    /// `got ServerHello when expecting ClientHello` (both ends running the TLS server role).
+    ///
+    /// The frames covered here are the whole CLASS of "not the start of an inbound circuit", each with
+    /// a real production or adversarial origin: a peer's ServerHello or application record arriving
+    /// after we released our client tunnel (a `fast_connect` relayed→direct promotion drops the
+    /// per-peer tunnel while the peer's frames are still in flight), a truncated record too short to
+    /// classify, and arbitrary relay garbage. The final ClientHello is the truthful CONTROL: the
+    /// responder path still works, and dropping the stray frames never blacklists the peer.
+    #[test]
+    fn only_a_clienthello_creates_an_introduced_circuit() {
+        let status = connected_status("00aa");
+        let mut accept_rx = status.enable_accept();
+
+        // A TLS handshake record whose message type is ServerHello (0x02) — the live #1761 frame.
+        let server_hello = vec![0x16, 0x03, 0x03, 0x00, 0x05, 0x02, 0, 0, 0, 0];
+        // A TLS application-data record (0x17) — a mid-session frame from a released tunnel.
+        let app_data = vec![0x17, 0x03, 0x03, 0x00, 0x04, 0xde, 0xad, 0xbe, 0xef];
+        // A record header truncated before the handshake-message byte — unclassifiable, so not an
+        // opening handshake.
+        let truncated = vec![0x16, 0x03, 0x03, 0x00, 0x05];
+        // Not TLS at all.
+        let garbage = vec![0x00, 0x01, 0x02, 0x03, 0x04, 0x05];
+
+        for (label, frame) in [
+            ("ServerHello", server_hello),
+            ("application record", app_data),
+            ("truncated record", truncated),
+            ("garbage", garbage),
+        ] {
+            status.route_relayed("ffbb", frame);
+            assert!(
+                !status.open_tunnel_exists("ffbb"),
+                "a {label} frame must not register a server-role circuit"
+            );
+            assert!(
+                accept_rx.try_recv().is_err(),
+                "a {label} frame must not surface an accept"
+            );
+        }
+
+        // CONTROL: the peer's genuine ClientHello still opens the circuit — the responder path is
+        // intact and the earlier drops left no per-peer state behind.
+        status.route_relayed("ffbb", client_hello_frame());
+        assert!(
+            status.open_tunnel_exists("ffbb"),
+            "a genuine ClientHello still opens an introduced circuit"
+        );
+        assert!(
+            accept_rx.try_recv().is_ok(),
+            "a genuine ClientHello still surfaces an accept"
         );
     }
 }
