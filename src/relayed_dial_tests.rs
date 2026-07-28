@@ -456,6 +456,90 @@ async fn relay_tunnel_stream_round_trips_bytes() {
     assert_eq!(&back, b"pong");
 }
 
+/// REGRESSION (#1761): after a relayed circuit's local tunnel is RELEASED — what
+/// [`crate::fast_connect`] does to the per-peer relay tunnel on a relayed→direct promotion — the
+/// peer's still-in-flight frames MUST NOT manufacture a fresh server-role circuit.
+///
+/// This is the live failure reproduced with real rustls records, not synthesised bytes: seed1 logged
+/// `mtls accept: got ServerHello when expecting ClientHello` and seed2 `fatal alert:
+/// UnexpectedMessage`, because the dialer's own side re-entered the RESPONDER path on the server's
+/// reply and ran a SECOND TLS server against it. Both ends were servers, so no relayed circuit could
+/// carry a byte.
+///
+/// Driven in production order and asserted on RECEIVER-SIDE state (the dialer's accept channel + its
+/// tunnel table), never on a sender-side log line: the dialer's accept path is ENABLED throughout —
+/// exactly as a real node's is — so nothing but the frame-direction gate can keep it quiet.
+#[tokio::test]
+async fn released_tunnel_does_not_re_enter_the_responder_path_on_the_peers_reply() {
+    use crate::RelayAcceptor;
+
+    let server = test_node("relayed/released-server");
+    let client = test_node("relayed/released-client");
+    let server_id = server.peer_id();
+    let client_hex = client.peer_id().to_hex();
+    let server_hex = server_id.to_hex();
+
+    let (client_status, server_status) = loopback_reservation_pair(&client_hex, &server_hex);
+
+    // The SERVER holds its accepted session open and, on request, writes real TLS records back to the
+    // client by opening a yamux stream — the in-flight traffic a promotion races.
+    let mut server_inbound = server_status.enable_accept();
+    let acceptor =
+        RelayAcceptor::new(Arc::clone(&server)).with_binding_policy(BindingPolicy::Required);
+    let (write_now_tx, write_now_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let tunnel = server_inbound.recv().await.expect("introduced circuit");
+        let mut conn = acceptor.accept(tunnel).await.expect("server mTLS accept");
+        let _ = write_now_rx.await;
+        // Records written after the client released its tunnel — these are the stray frames.
+        if let Ok(mut s) = conn.session.open_stream().await {
+            let _ = s.write_all(b"post-promotion traffic").await;
+            let _ = s.flush().await;
+        }
+    });
+
+    // The dialer ALSO runs the responder path (every real node both dials and accepts) — this receiver
+    // is the observable the assertion rests on.
+    let mut client_inbound = client_status.enable_accept();
+
+    let transport = Arc::new(ReservationRelayedTransport::new(
+        Arc::clone(&client_status),
+        RELAY_ENDPOINT.parse().unwrap(),
+    ));
+    let dialer = MtlsDialer::new(Arc::clone(&client))
+        .with_binding_policy(BindingPolicy::Required)
+        .with_relayed_dialer(transport);
+    let peer = PeerTarget::relay_only(server_id, NET);
+    let outcome = MethodOutcome::single(TraversalKind::Relayed, RELAY_ENDPOINT.parse().unwrap());
+
+    let conn = tokio::time::timeout(Duration::from_secs(5), dialer.dial(&peer, &outcome))
+        .await
+        .expect("relayed dial completes")
+        .expect("relayed dial succeeds");
+    assert_eq!(conn.peer_id, server_id);
+
+    // PROMOTION: release the relayed transport (fast-connect drops the swapped-out slot), which
+    // deregisters the per-peer tunnel while the peer is still sending.
+    // Dropping the connection ends the mux driver, which tears down the mTLS stream and so the
+    // tunnel; the peer's session teardown records are already in flight at this moment.
+    drop(conn);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The peer's remaining application records arrive on the released circuit too.
+    let _ = write_now_tx.send(());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert!(
+        client_inbound.try_recv().is_err(),
+        "the peer's reply on a released circuit must not surface as an introduced circuit \
+         (that is what put BOTH ends in the TLS server role, #1761)"
+    );
+    assert!(
+        !client_status.open_tunnel_exists(&server_hex),
+        "the released circuit stays released — a peer that merely replied on it must not get a \
+         fresh server-role circuit registered under its key"
+    );
+}
+
 /// With NO relay data-plane wired, a relayed outcome fails cleanly (never a silent broken dial).
 #[tokio::test]
 async fn relayed_dial_without_transport_is_clean_error() {
