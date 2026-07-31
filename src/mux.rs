@@ -40,6 +40,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
+use crate::safe_text::SafeText;
+
 /// One logical, bidirectional stream to the peer — a tokio [`AsyncRead`] + [`AsyncWrite`]. Reads
 /// deliver bytes incrementally as they arrive (streaming, with yamux-window backpressure); many
 /// [`PeerStream`]s coexist on one [`PeerSession`] without head-of-line blocking.
@@ -1118,7 +1120,7 @@ async fn decode_framed<T: for<'de> Deserialize<'de>, R: AsyncRead + Unpin>(
     }
     let mut body = vec![0u8; len];
     r.read_exact(&mut body).await?;
-    serde_json::from_slice(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    serde_json::from_slice(&body).map_err(malformed_frame)
 }
 
 /// Like [`decode_framed`] but returns `Ok(None)` on a CLEAN end-of-stream at a frame boundary (the
@@ -1143,7 +1145,24 @@ async fn decode_framed_opt<T: for<'de> Deserialize<'de>, R: AsyncRead + Unpin>(
     r.read_exact(&mut body).await?;
     serde_json::from_slice(&body)
         .map(Some)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        .map_err(malformed_frame)
+}
+
+/// Turn a `serde_json` decode failure on a PEER-SUPPLIED frame into an `io::Error` that says what
+/// went wrong without repeating what the peer sent (#1674).
+///
+/// The naive `io::Error::new(InvalidData, e)` keeps serde's own message, and serde's message quotes
+/// the offending input back — so every node that logged a malformed frame logged text of the
+/// sender's choosing. Routing through [`SafeText::describing_json_error`] keeps the diagnosis
+/// (category, line, column) and drops the quotation.
+fn malformed_frame(error: serde_json::Error) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "malformed frame: {}",
+            SafeText::describing_json_error(&error)
+        ),
+    )
 }
 
 /// One command to the yamux driver task. yamux 0.13 has no `Control` handle, so we drive the
