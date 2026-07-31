@@ -16,7 +16,7 @@
 //! prove only that the sanitizer works — which is the failure mode that let this class survive in
 //! three separate crates already.
 
-use dig_nat::RangeFrame;
+use dig_nat::{RangeFrame, RangeRequest};
 
 /// The stranger's payload. Deliberately plain ASCII with no JSON-escapable character, so it is
 /// **byte-identical** whether an error renders it raw or through `{:?}`. A marker containing a
@@ -124,6 +124,37 @@ async fn a_forged_log_line_cannot_be_smuggled_through_a_decode_error() {
         !msg.contains("forged"),
         "the decode error echoed the peer's forged line: {msg:?}"
     );
+}
+
+/// The SERVING side, which is the more exposed of the two.
+///
+/// `RangeFrame::decode` above is a client reading a reply from a holder it chose to talk to.
+/// `RangeRequest::decode` is a node reading a request from ANY stranger who can open a stream — no
+/// selection, no prior relationship. The two use different decoders internally (`decode_framed_opt`
+/// vs `decode_framed`), so covering only the client half leaves the more hostile half unproven; that
+/// asymmetry was found by reverting the fix and watching these tests stay green.
+#[tokio::test]
+async fn a_strangers_request_preamble_cannot_echo_its_own_bytes_back() {
+    let body = format!(r#"{{"store_id":"{STRANGER_MARKER}","length":"{STRANGER_MARKER}"}}"#);
+    let mut wire = Vec::new();
+    wire.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    wire.extend_from_slice(body.as_bytes());
+
+    let mut cursor = std::io::Cursor::new(wire);
+    let err = RangeRequest::decode(&mut cursor)
+        .await
+        .expect_err("a string length is not a u64");
+
+    assert!(
+        !err.to_string().contains(STRANGER_MARKER),
+        "the serving side echoed the stranger's bytes: {err}"
+    );
+    assert!(
+        !format!("{err:?}").contains(STRANGER_MARKER),
+        "the serving side's Debug echoed the stranger's bytes: {err:?}"
+    );
+    // CONTROL: still diagnosable.
+    assert!(err.to_string().contains("column"), "got: {err}");
 }
 
 // ---------------------------------------------------------------------------------------------
