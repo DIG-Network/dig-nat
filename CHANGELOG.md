@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.15.0] - 2026-07-31
+
+### Features
+- **safe-text:** SafeText — peer bytes cannot reach an error string by construction (#1674) (#21)
+
 ## [0.14.1] - 2026-07-28
 
 ### Bug Fixes
