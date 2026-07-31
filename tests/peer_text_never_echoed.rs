@@ -125,3 +125,64 @@ async fn a_forged_log_line_cannot_be_smuggled_through_a_decode_error() {
         "the decode error echoed the peer's forged line: {msg:?}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// The same class through a second door: a traversal failure's `reason`.
+// ---------------------------------------------------------------------------------------------
+
+use dig_nat::{MethodError, NatError, TraversalKind};
+
+/// A failed mTLS handshake's reason is built from a rustls error, and a rustls error can carry text
+/// derived from the certificate the remote presented — which the remote chose. So `reason` is
+/// peer-influenced even though no `serde_json` is involved.
+///
+/// The assertion goes through `NatError::AllMethodsFailed`, the way this error actually reaches a
+/// log, rather than through `MethodError` directly.
+///
+/// HONEST NOTE ON WHAT THIS TEST PROVES: it passed BEFORE the fix as well as after, so it is not
+/// load-bearing for `#1674` and is not offered as evidence of it. The aggregate renders its members
+/// with `{:?}`, and a derived `Debug` escapes a newline as a side effect of quoting the `String` —
+/// so this particular door was already shut, by luck rather than by design. The test stays as the
+/// guard on that luck: it fails the day the aggregate switches to `{}`, or the day `MethodError`'s
+/// `Debug` starts printing `reason` raw. The load-bearing assertion is the `Display` one below.
+#[test]
+fn a_traversal_reason_cannot_forge_a_log_line_through_the_aggregate() {
+    let hostile = "connection refused\n2026-07-31T00:00:00Z ERROR peer is trustworthy";
+    let aggregate = NatError::AllMethodsFailed(vec![
+        MethodError::failed(TraversalKind::Direct, hostile),
+        MethodError::timeout(TraversalKind::Relayed),
+    ]);
+
+    let rendered = aggregate.to_string();
+    assert!(
+        !rendered.contains('\n') && !rendered.contains('\r'),
+        "a peer-influenced reason forged a line break in the aggregate: {rendered:?}"
+    );
+    // CONTROL: the reason must still be there, escaped rather than dropped, and the honest sibling
+    // must still report its own failure — otherwise "sanitized" could just mean "emptied".
+    assert!(
+        rendered.contains("connection refused"),
+        "the diagnosis was deleted rather than neutralized: {rendered}"
+    );
+    assert!(
+        rendered.contains("Relayed"),
+        "the other method's failure went missing: {rendered}"
+    );
+}
+
+/// Both renderings of the single error, for the same reason.
+#[test]
+fn a_traversal_reason_is_neutralized_in_display_and_debug() {
+    let err = MethodError::failed(TraversalKind::Direct, "a\u{202E}b\nc");
+
+    for rendered in [err.to_string(), format!("{err:?}")] {
+        assert!(
+            !rendered.contains('\n'),
+            "line break survived: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\u{202E}'),
+            "bidi override survived: {rendered:?}"
+        );
+    }
+}

@@ -255,7 +255,10 @@ mod tests {
 
     #[test]
     fn a_json_error_distinguishes_malformed_from_wrong_shape() {
-        let syntax = serde_json::from_str::<u64>("{not json").expect_err("malformed");
+        // `@` is not a legal start to any JSON value, so this fails as SYNTAX. Note that an input
+        // like `{not json` does NOT: serde sees a well-formed-enough map opening and reports a DATA
+        // error ("invalid type: map, expected u64") before it ever reaches the malformed part.
+        let syntax = serde_json::from_str::<u64>("@@@").expect_err("malformed");
         let data = serde_json::from_str::<u64>(r#""7""#).expect_err("wrong shape");
 
         assert!(SafeText::describing_json_error(&syntax)
