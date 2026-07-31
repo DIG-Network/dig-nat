@@ -432,6 +432,12 @@ contract.
 
 - A receiver **MUST** reject a length prefix greater than `MAX_FRAMED_BODY` with an `InvalidData`
   error, without allocating the announced length.
+- **A decode failure on a peer-supplied frame MUST NOT quote the frame back.** The `InvalidData`
+  error a receiver raises for an unparseable body **MUST** state the failure *category* (syntax /
+  data / EOF) and its line and column, and **MUST NOT** contain any of the received bytes.
+  `serde_json`'s native message embeds the offending value verbatim, so relaying it would let a
+  sender choose text that appears in the receiver's own diagnostics — both an injection channel and
+  an echo of attacker-chosen content. `SafeText::describing_json_error` is the conforming rendering.
 - **A conforming sender MUST NOT emit a frame a conforming receiver is required to reject.** This is
   the governing invariant, and it is symmetric by construction: encoding **MUST** fail, at the sender,
   when the serialized body would exceed `MAX_FRAMED_BODY`, when `RangeFrame.bytes` exceeds
@@ -701,6 +707,26 @@ source address. Both properties are REQUIRED, independently of each other:
 - Both checks apply to every UDP request/response protocol this crate speaks (STUN today; PCP's
   nonce check is the same pattern). NAT-PMP (RFC 6886) has no per-transaction nonce by protocol design
   and is not held to the id/nonce requirement, but source validation still applies where practical.
+
+## 6a. Rendering untrusted text in errors (NORMATIVE, #1674)
+
+Text that a remote party influenced — a decode failure's offending input, a TLS error derived from the
+certificate a peer presented, a relay's status line — **MUST** be neutralized at the point it is
+RENDERED, not at the point it is logged. Sanitizing at each log site is not sanitizing: the next log
+line starts again from the raw value.
+
+- `SafeText` is the conforming carrier. Its only constructors are `from_untrusted` (escapes every
+  control and bidirectional-formatting character, bounds the result to `MAX_SAFE_TEXT_CHARS = 512`)
+  and `from_static` (a `&'static str`, i.e. a source literal). A raw runtime `String` cannot enter it
+  unsanitized, so an error that HOLDS a `SafeText` cannot carry raw peer text however it is built.
+- A rendered error **MUST NOT** contain U+000A, U+000D, any other control character, or any
+  bidi-formatting character originating from a remote party.
+- Both `Display` **and** `Debug` **MUST** neutralize. `Debug` reaches a log at least as often —
+  `{:?}` on a `Result`, an `unwrap` panic, a `tracing` field — so a safe `Display` over a leaky
+  `Debug` closes half the surface. `MethodError` states both explicitly rather than relying on a
+  derived `Debug` that happens to escape as a side effect of quoting.
+- `MethodError.reason` remains a `String` so a consumer can match on it, and is neutralized in both
+  renderings. A consumer that reads the field directly and logs it **MUST** neutralize it itself.
 
 ## 7. Configuration + defaults
 

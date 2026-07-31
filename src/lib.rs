@@ -74,6 +74,7 @@ pub mod peer;
 pub mod relay;
 pub mod relay_descriptor;
 pub mod runtime;
+pub mod safe_text;
 pub mod strategy;
 pub mod stun;
 pub mod tunnel;
@@ -113,6 +114,7 @@ pub use peer::{PeerConnection, PeerTarget};
 pub use relay::{RelayState, RelayStatus, RelayTunnel};
 pub use relay_descriptor::{verify_relay_descriptor, RelayDescriptor, RelayDescriptorError};
 pub use runtime::{NatRuntime, NatRuntimeBuilder};
+pub use safe_text::{SafeText, MAX_SAFE_TEXT_CHARS};
 
 use dialer::MtlsDialer;
 use method::direct::DirectMethod;

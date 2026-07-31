@@ -6,7 +6,10 @@
 //! [`NatError::AllMethodsFailed`] carrying the per-method reasons — so an operator/agent can see
 //! exactly why each path was rejected without scraping logs.
 
+use std::fmt;
+
 use crate::method::TraversalKind;
+use crate::safe_text::SafeText;
 
 /// Peer-RPC JSON-RPC error codes from the L7 peer-network spec (§7, §9). Exposed so a node building
 /// its RPC surface over dig-nat maps transport outcomes to the exact catalogued codes.
@@ -69,17 +72,58 @@ impl NatError {
 ///
 /// Aggregated into [`NatError::AllMethodsFailed`] in attempt order. The `kind` lets an agent see
 /// *which* path failed and the `reason` is a stable human string.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{kind:?}: {reason}")]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MethodError {
     /// Which traversal method produced this failure.
     pub kind: TraversalKind,
     /// A stable, human-readable reason (also machine-greppable).
+    ///
+    /// **Peer-influenced.** A failed mTLS handshake's reason is derived from a rustls error, and a
+    /// rustls error can carry text derived from the certificate the remote presented. It is stored
+    /// raw (so a consumer can match on it) but NEUTRALIZED WHEN RENDERED — see the `Display` and
+    /// `Debug` impls below.
     pub reason: String,
     /// Whether the failure was a timeout (vs an outright refusal / protocol error). Lets the
     /// strategy + observers distinguish "peer/gateway unreachable in time" from "actively rejected".
     pub timeout: bool,
 }
+
+/// Renders the `kind` then the `reason`, with the reason NEUTRALIZED (#1674).
+///
+/// Sanitizing lives here rather than at each construction site because that is what makes it hold:
+/// `reason` is a `String` reachable from `MethodError::failed`, from struct literal syntax, and from
+/// a consumer mutating the public field, and a guard applied at any one of those is a guard the next
+/// caller skips. Applied in `Display` it is unrepresentable in a rendered error however the error
+/// was built.
+impl fmt::Display for MethodError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:?}: {}",
+            self.kind,
+            SafeText::from_untrusted(&self.reason)
+        )
+    }
+}
+
+/// Hand-written for the same reason as `Display`, and because `Debug` is the rendering that actually
+/// reaches a log here: [`NatError::AllMethodsFailed`] formats its members with `{:?}`.
+///
+/// A DERIVED `Debug` happens to be safe today — it renders `reason` with `{:?}`, which escapes a
+/// newline as a side effect of quoting. That is luck, not a guarantee: it does not neutralize bidi
+/// overrides, it applies no length bound, and it would silently stop protecting anything the day the
+/// aggregate switched to `{}`. So the neutralization is stated rather than inherited.
+impl fmt::Debug for MethodError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MethodError")
+            .field("kind", &self.kind)
+            .field("reason", &SafeText::from_untrusted(&self.reason))
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+impl std::error::Error for MethodError {}
 
 impl MethodError {
     /// A non-timeout method failure.
