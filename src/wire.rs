@@ -119,10 +119,52 @@ pub enum RelayMessage {
     #[serde(rename = "hole_punch_result")]
     HolePunchResult { peer_id: String, success: bool },
 
+    // -- RLY-009: DHT record observability (dig_ecosystem #1935) --
+    /// Relay → Client: ask this node for an AGGREGATED view of its DHT provider records.
+    ///
+    /// The relay is not a DHT node and holds no records, but it already keeps a live reservation to
+    /// every registered peer — and a Kademlia node stores records for keys near its OWN `peer_id`,
+    /// so its store describes MANY OTHER peers' content. Asking each connected node therefore yields
+    /// a broad slice of the real DHT without the relay ever joining it.
+    ///
+    /// `max_keys` bounds the answer. Additive (NC-6 soft-fork): a pre-RLY-009 node does not
+    /// recognise this `type` and simply never answers, which the relay MUST treat as "no data"
+    /// rather than an error.
+    #[serde(rename = "get_dht_records")]
+    GetDhtRecords { max_keys: usize },
+
+    /// Client → Relay: the aggregated view requested by [`RelayMessage::GetDhtRecords`].
+    ///
+    /// Carries COUNTS, never provider identities — a provider record is a `(peer_id, content_key)`
+    /// pair, and publishing that linkage is exactly what the relay's `/map` privacy contract
+    /// forbids.
+    #[serde(rename = "dht_records")]
+    DhtRecords {
+        records: Vec<DhtRecordEntry>,
+        /// Keys with a live provider BEFORE `max_keys` was applied, so the relay can report
+        /// "showing N of M" instead of presenting a truncated view as complete.
+        total_keys: usize,
+        truncated: bool,
+    },
+
     // -- Error --
     /// Relay → Client: error notification.
     #[serde(rename = "error")]
     Error { code: u32, message: String },
+}
+
+/// One content key in a [`RelayMessage::DhtRecords`] answer: the key and how many live providers the
+/// answering node knows for it.
+///
+/// Deliberately carries no provider identity (see [`RelayMessage::DhtRecords`]). Mirrors
+/// `dig_dht::ProviderSnapshotEntry` by shape rather than by dependency — `dig-dht` sits ABOVE
+/// `dig-nat` in the crate hierarchy, so the type is defined here and the node maps into it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DhtRecordEntry {
+    /// The 64-hex content key.
+    pub content_key: String,
+    /// How many non-expired providers the answering node holds a record for.
+    pub providers: usize,
 }
 
 /// Peer info as tracked by the relay server. `#[serde]` field names are part of the wire contract

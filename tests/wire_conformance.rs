@@ -128,6 +128,20 @@ fn all_discriminators_present() {
             },
             "error",
         ),
+        // RLY-009 (dig_ecosystem #1935) — pinned like every other discriminator, because the relay
+        // server, dig-gossip and dig-node all carry a vendored copy of this enum and must agree.
+        (
+            RelayMessage::GetDhtRecords { max_keys: 8 },
+            "get_dht_records",
+        ),
+        (
+            RelayMessage::DhtRecords {
+                records: vec![],
+                total_keys: 0,
+                truncated: false,
+            },
+            "dht_records",
+        ),
     ];
     for (msg, expected) in cases {
         assert_eq!(serde_json::to_value(&msg).unwrap()["type"], expected);
@@ -330,4 +344,43 @@ fn a_chunk_aligned_continuation_frame_states_its_index_without_a_proof() {
         continuation.encode().is_ok(),
         "the identity-only continuation shape must encode"
     );
+}
+
+/// RLY-009 field names are the wire contract, same as `relay_peer_info_field_names` (#1935).
+#[test]
+fn dht_records_field_names() {
+    let msg = RelayMessage::DhtRecords {
+        records: vec![dig_nat::wire::DhtRecordEntry {
+            content_key: "ab".repeat(32),
+            providers: 3,
+        }],
+        total_keys: 7,
+        truncated: true,
+    };
+    let v = serde_json::to_value(&msg).unwrap();
+    assert_eq!(v["type"], "dht_records");
+    for key in ["records", "total_keys", "truncated"] {
+        assert!(v.get(key).is_some(), "missing `{key}`");
+    }
+    let entry = &v["records"][0];
+    for key in ["content_key", "providers"] {
+        assert!(entry.get(key).is_some(), "missing entry `{key}`");
+    }
+
+    // The privacy property, asserted on the SERIALIZED bytes: a provider record is a
+    // (peer_id, content_key) pair, and RLY-009 must publish only the count. If an identity field is
+    // ever added to the entry this fails, which is the point.
+    let raw = serde_json::to_string(&msg).unwrap();
+    assert!(
+        !raw.contains("peer_id"),
+        "RLY-009 must never carry a provider identity: {raw}"
+    );
+}
+
+/// A request pins its own field name too — the relay depends on `max_keys` to bound the answer.
+#[test]
+fn get_dht_records_carries_the_bound() {
+    let v = serde_json::to_value(RelayMessage::GetDhtRecords { max_keys: 128 }).unwrap();
+    assert_eq!(v["type"], "get_dht_records");
+    assert_eq!(v["max_keys"], 128);
 }
