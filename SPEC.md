@@ -636,6 +636,31 @@ never see each other).
   never grows past the cap), and both the per-push fold and the `Peers`-frame replace **MUST** enforce
   it. Membership/dedup **MUST** be O(1) so the flood cannot impose an O(n²) insert cost.
 
+### 5a.2 RLY-009 — aggregated DHT-record answers (NORMATIVE)
+
+The relay is not a DHT node and holds no provider records, but it keeps a live reservation to every
+registered peer. RLY-009 lets it ASK: a Kademlia node stores records for keys near its OWN `peer_id`,
+so each node's store describes MANY OTHER peers' content, and the union across connected nodes is a
+broad slice of the real DHT with the relay never joining it (dig_ecosystem #1935).
+
+- The relay MAY send `get_dht_records { max_keys }` over the reservation. A node that opts in
+  answers `dht_records { records, total_keys, truncated }`.
+- **Opt-in.** A node MUST answer only when a reader has been registered
+  (`RelayStatus::set_dht_records_provider`). With none registered it MUST stay SILENT — on the wire
+  indistinguishable from a pre-RLY-009 node, which the relay MUST treat as "no data", never an error.
+- **Counts, never identities.** `records` carries `content_key` → live provider COUNT. A provider
+  record is a `(peer_id, content_key)` pair, and publishing that linkage is precisely what the
+  relay's `/map` privacy contract forbids. No provider identity may appear in an RLY-009 answer.
+- **The bound is the relay's, and MUST be honoured.** The provider store is attacker-influenced (any
+  peer may `add_provider`), so an answer ignoring `max_keys` would let a Sybil dictate the frame size
+  on the socket the node depends on for its own reachability. `total_keys` reports the true
+  pre-truncation count and `truncated` says whether the cap bit, so a partial view is never
+  presented as complete.
+- **A node MUST ignore an inbound `dht_records`.** It is the answerer, never the asker; treating a
+  stray one as an error would let a confused or hostile relay drop the node's reservation.
+- Additive (NC-6 soft-fork), and byte-identical across the four vendored copies of this wire
+  (`dig-gossip`, `dig-relay`, `dig-nat`, `dig-node`).
+
 ### 5a.1 Address-carrying introduction (B1, NORMATIVE)
 
 The reservation advertises dialable candidates so a relay-discovered peer can be DIRECT-dialed over

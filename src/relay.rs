@@ -335,6 +335,47 @@ pub struct RelayStatus {
     /// Monotonic id assigned to each tunnel registration so a stale [`RelayTunnel`]'s `Drop` never
     /// deregisters a NEWER entry under the same peer key (see [`TunnelEntry::id`]; #1536 glare replace).
     next_tunnel_id: AtomicU64,
+    /// Supplies the aggregated DHT-record view answered to RLY-009 `get_dht_records`
+    /// (dig_ecosystem #1935). `None` (the default) means this node answers NOTHING — a node that
+    /// has not opted in is indistinguishable on the wire from a pre-RLY-009 one, which is the safe
+    /// default for an observability feature.
+    ///
+    /// A closure rather than a data field because the records live in the DHT layer, which sits
+    /// ABOVE this crate in the hierarchy: `dig-dht` depends on `dig-nat`, never the reverse. The
+    /// consumer registers a reader; this crate only forwards the answer.
+    dht_records: Mutex<DhtRecordsHook>,
+}
+
+/// Holds the optional RLY-009 reader. A closure has no `Debug`, and `RelayStatus` derives it, so the
+/// hook is wrapped rather than making every field's diagnostics hand-written.
+#[derive(Default)]
+struct DhtRecordsHook(Option<Arc<DhtRecordsProvider>>);
+
+impl std::fmt::Debug for DhtRecordsHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Whether a reader is registered is the only useful diagnostic; the closure itself is opaque.
+        f.write_str(if self.0.is_some() {
+            "DhtRecordsHook(registered)"
+        } else {
+            "DhtRecordsHook(none)"
+        })
+    }
+}
+
+/// Reads this node's aggregated DHT provider records, bounded by the caller's `max_keys`, for the
+/// RLY-009 answer. Registered by the consumer via [`RelayStatus::set_dht_records_provider`].
+pub type DhtRecordsProvider = dyn Fn(usize) -> DhtRecordsAnswer + Send + Sync;
+
+/// What a node reports for RLY-009 — the wire payload, before it becomes a
+/// [`RelayMessage::DhtRecords`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DhtRecordsAnswer {
+    /// Content keys and their live provider COUNTS. Never provider identities.
+    pub records: Vec<crate::wire::DhtRecordEntry>,
+    /// Keys with a live provider before `max_keys` was applied.
+    pub total_keys: usize,
+    /// Whether `max_keys` dropped entries.
+    pub truncated: bool,
 }
 
 impl Default for RelayStatus {
@@ -352,6 +393,7 @@ impl Default for RelayStatus {
             tunnels: Mutex::new(HashMap::new()),
             relay_seq: AtomicU64::new(0),
             next_tunnel_id: AtomicU64::new(0),
+            dht_records: Mutex::new(DhtRecordsHook::default()),
         }
     }
 }
@@ -481,6 +523,27 @@ impl RelayStatus {
         *self.local_peer_id.lock().unwrap() = Some(peer_id.to_string());
         *self.local_network_id.lock().unwrap() = Some(network_id.to_string());
         *self.outbound.lock().unwrap() = Some(outbound);
+    }
+
+    /// Register the reader that answers RLY-009 `get_dht_records` (dig_ecosystem #1935).
+    ///
+    /// Until this is called the node answers nothing, which is on the wire indistinguishable from a
+    /// pre-RLY-009 node — the correct default for an observability feature that publishes what this
+    /// node knows about the network.
+    ///
+    /// The reader receives the relay's requested `max_keys` and MUST honour it: the provider store is
+    /// attacker-influenced (any peer can `add_provider`), so an unbounded answer would let a Sybil
+    /// dictate the frame size on a socket this node depends on for reachability.
+    pub fn set_dht_records_provider<F>(&self, reader: F)
+    where
+        F: Fn(usize) -> DhtRecordsAnswer + Send + Sync + 'static,
+    {
+        self.dht_records.lock().unwrap().0 = Some(Arc::new(reader));
+    }
+
+    /// The registered RLY-009 reader, if the consumer opted in.
+    fn dht_records_provider(&self) -> Option<Arc<DhtRecordsProvider>> {
+        self.dht_records.lock().unwrap().0.clone()
     }
 
     /// Enable the RESPONDER (accept) path and return the receiver of INTRODUCED inbound circuits.
@@ -1275,6 +1338,28 @@ where
         RelayMessage::RelayGossipMessage { from, payload, .. } => {
             status.route_relayed(&from, payload)
         }
+        // RLY-009 (#1935): the relay is asking what this node holds in its DHT provider store.
+        // Answered only if the consumer registered a reader; otherwise we stay silent, which a
+        // pre-RLY-009 relay and a non-participating node are equally free to do.
+        RelayMessage::GetDhtRecords { max_keys } => {
+            if let Some(reader) = status.dht_records_provider() {
+                let answer = reader(max_keys);
+                send(
+                    write,
+                    &RelayMessage::DhtRecords {
+                        records: answer.records,
+                        total_keys: answer.total_keys,
+                        truncated: answer.truncated,
+                    },
+                )
+                .await?;
+            }
+        }
+        // A node never RECEIVES an answer — it is the one answering. Ignore rather than error, so a
+        // confused or hostile relay cannot drop this node's reservation by echoing one back.
+        RelayMessage::DhtRecords { .. } => {
+            tracing::debug!("ignoring dht_records sent to a client");
+        }
         RelayMessage::Error { code, message } => {
             // A relay `Error` frame is NOT automatically a reservation problem — the relay reports
             // per-REQUEST failures on the same channel. Treating them all as fatal made a routine
@@ -1351,6 +1436,70 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     // -- #1932: a per-request relay error must not cost us the reservation -------------------
+
+    // -- #1935: RLY-009 aggregated DHT-record answers -----------------------------------------
+
+    #[test]
+    fn a_node_answers_nothing_until_a_reader_is_registered() {
+        // The opted-out default. A node that has not opted in must be indistinguishable on the wire
+        // from a pre-RLY-009 one — silence, not an empty answer, and certainly not an error.
+        let status = RelayStatus::new();
+        assert!(
+            status.dht_records_provider().is_none(),
+            "no reader by default"
+        );
+    }
+
+    #[test]
+    fn a_registered_reader_receives_the_relays_bound_and_its_answer_is_returned() {
+        // The bound must reach the reader: the provider store is attacker-influenced, so an answer
+        // that ignored max_keys would let a Sybil dictate the frame size on the reservation socket.
+        let status = RelayStatus::new();
+        let seen: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_w = Arc::clone(&seen);
+        status.set_dht_records_provider(move |max_keys| {
+            seen_w.lock().unwrap().push(max_keys);
+            DhtRecordsAnswer {
+                records: vec![crate::wire::DhtRecordEntry {
+                    content_key: "cd".repeat(32),
+                    providers: 4,
+                }],
+                total_keys: 9,
+                truncated: true,
+            }
+        });
+
+        let reader = status.dht_records_provider().expect("reader registered");
+        let answer = reader(16);
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![16],
+            "the bound reached the reader"
+        );
+        assert_eq!(answer.total_keys, 9);
+        assert!(answer.truncated);
+        assert_eq!(answer.records[0].providers, 4);
+    }
+
+    #[test]
+    fn the_answer_carries_counts_and_no_identity() {
+        // Same property the wire test pins, asserted at the type level so it holds for any caller
+        // constructing an answer, not only for the one serialized shape.
+        let answer = DhtRecordsAnswer {
+            records: vec![crate::wire::DhtRecordEntry {
+                content_key: "ef".repeat(32),
+                providers: 2,
+            }],
+            total_keys: 1,
+            truncated: false,
+        };
+        let rendered = format!("{answer:?}");
+        assert!(
+            !rendered.contains("peer_id"),
+            "no identity field: {rendered}"
+        );
+    }
 
     #[test]
     fn peer_not_found_is_not_fatal_because_it_is_about_another_peer() {
