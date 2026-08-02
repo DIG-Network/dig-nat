@@ -23,9 +23,21 @@ use serde::{Deserialize, Serialize};
 // contract, kept byte-identical to the four copies (dig-relay, dig-node, dig-gossip, dig-nat), and
 // documenting them per-copy would invite drift. The variant docs above each `#[serde(rename)]`
 // carry the RLY-00x meaning; the field names ARE the JSON keys.
+// `non_exhaustive` so ADDING a wire message is no longer a breaking change.
+//
+// This wire grows: RLY-008 added PEX, RLY-009 added the DHT-record view. Each addition was a
+// semver-major event for a `pub enum`, because a downstream exhaustive `match` stops compiling —
+// and in this ecosystem that meant every consumer pinned to the old minor (dig-gossip, dig-dht,
+// dig-download, dig-peer-selector, dig-peer) had to be bumped and re-released before dig-node could
+// pick the change up at all. RLY-009 cost exactly that cascade (dig_ecosystem #1935).
+//
+// With this attribute a new variant is ADDITIVE: external matches already carry a wildcard arm, so
+// the next RLY-0xx ships as a PATCH and reaches every consumer on a plain `cargo update`. Adding it
+// is itself the last breaking change of this class.
 #[allow(missing_docs)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum RelayMessage {
     // -- RLY-001: Registration --
     /// Client → Relay: register after WebSocket connect.

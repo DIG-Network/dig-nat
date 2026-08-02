@@ -636,6 +636,23 @@ never see each other).
   never grows past the cap), and both the per-push fold and the `Peers`-frame replace **MUST** enforce
   it. Membership/dedup **MUST** be O(1) so the flood cannot impose an O(n²) insert cost.
 
+### 5a.3 Wire extensibility (NORMATIVE)
+
+`RelayMessage` is `#[non_exhaustive]`. Adding a new RLY-0xx message is therefore an ADDITIVE change:
+a consumer's `match` already carries a wildcard arm, so a new variant ships as a PATCH and reaches
+every consumer on a plain `cargo update`.
+
+This is a contract, not a convenience. Before it, each wire addition was a semver-major event for a
+`pub enum`, so every crate pinned to the previous minor had to be bumped and re-released before the
+node could pick the change up — RLY-009 cost exactly that five-crate cascade (dig_ecosystem #1935).
+
+- A receiver MUST tolerate an unknown `type` discriminator by IGNORING the frame, never by erroring
+  and never by dropping the reservation — an unrecognised message is how a newer peer looks to an
+  older one, and treating it as fatal would make every future addition an outage.
+- A new variant MUST NOT change the meaning or encoding of an existing one; the four vendored copies
+  (`dig-gossip`, `dig-relay`, `dig-nat`, `dig-node`) MUST stay byte-identical for every message they
+  both understand.
+
 ### 5a.2 RLY-009 — aggregated DHT-record answers (NORMATIVE)
 
 The relay is not a DHT node and holds no provider records, but it keeps a live reservation to every
