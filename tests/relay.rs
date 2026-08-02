@@ -219,11 +219,14 @@ async fn dead_relay_degrades_gracefully_without_crashing() {
 
 /// Covers the production [`run_relay_connection`] wrapper + `handle_incoming` branches: the relay
 /// acks (→ Connected), forwards a `peer_connected` notice (ignored), answers the client's `pong` to
-/// a relay `ping`, then sends an `error` frame — which the client treats as a session failure and
-/// drops to Disconnected (bumping the reconnect count). Robustly asserts the observable
-/// Connected → (error) → Disconnected transition rather than racing the pong frame.
+/// a relay `ping`, then sends a PER-REQUEST `error` frame (code 3 `PEER_NOT_FOUND`) — which must
+/// leave the reservation INTACT (dig_ecosystem #1932).
+///
+/// Code 3 means the peer we tried to reach is not on this relay: routine on a live network, and no
+/// statement about our own registration. It used to drop the session, which de-registered the node
+/// and flapped it out of every other peer's introductions on every failed dial.
 #[tokio::test]
-async fn client_handles_frames_and_error_drops_session() {
+async fn a_per_request_error_leaves_the_reservation_intact() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -231,7 +234,6 @@ async fn client_handles_frames_and_error_drops_session() {
         let (tcp, _) = listener.accept().await.unwrap();
         let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
         let (mut write, mut read) = ws.split();
-        // Consume Register, ack it → client goes Connected.
         let _ = read.next().await;
         let ack = RelayMessage::RegisterAck {
             success: true,
@@ -242,8 +244,6 @@ async fn client_handles_frames_and_error_drops_session() {
             .send(Message::Text(serde_json::to_string(&ack).unwrap()))
             .await
             .unwrap();
-        // A relay ping (client answers with a pong — exercises that handle_incoming branch) and a
-        // peer_connected notice (ignored branch).
         write
             .send(Message::Text(
                 serde_json::to_string(&RelayMessage::Ping { timestamp: 1 }).unwrap(),
@@ -257,13 +257,91 @@ async fn client_handles_frames_and_error_drops_session() {
             ))
             .await
             .unwrap();
-        // Give the client a moment to be Connected, then send an error frame → session failure.
         tokio::time::sleep(Duration::from_millis(150)).await;
         write
             .send(Message::Text(
                 serde_json::to_string(&RelayMessage::Error {
                     code: 3,
                     message: "PEER_NOT_FOUND".into(),
+                })
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        // Hold the socket OPEN afterwards: the point is that the reservation survives the error,
+        // so the server must not be the thing that ends it.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    });
+
+    let status = RelayStatus::new();
+    let task_status = Arc::clone(&status);
+    let endpoint = format!("ws://{addr}");
+    let endpoint_for_task = endpoint.clone();
+    let client = tokio::spawn(async move {
+        run_relay_connection(
+            endpoint_for_task,
+            "peerhex".into(),
+            "DIG_MAINNET".into(),
+            Vec::new(),
+            task_status,
+        )
+        .await
+    });
+
+    let mut connected = false;
+    for _ in 0..150 {
+        if status.is_connected() {
+            connected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(connected, "reached Connected via RegisterAck");
+
+    // Well past the error frame: the reservation must still be held, with no reconnect attempt.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        status.is_connected(),
+        "a per-request error must not drop the reservation, state={:?}",
+        status.state()
+    );
+    assert_eq!(
+        status.reconnect_attempts(),
+        0,
+        "no reconnect should have been triggered by a per-request error"
+    );
+
+    client.abort();
+    server.abort();
+}
+
+/// The other half of the same contract: an error that says OUR OWN registration is invalid
+/// (code 1 `NOT_REGISTERED`) MUST still drop the session so the client re-registers with backoff.
+#[tokio::test]
+async fn a_registration_invalidating_error_still_drops_the_session() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let (mut write, mut read) = ws.split();
+        let _ = read.next().await;
+        let ack = RelayMessage::RegisterAck {
+            success: true,
+            message: "ok".into(),
+            connected_peers: 2,
+        };
+        write
+            .send(Message::Text(serde_json::to_string(&ack).unwrap()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        write
+            .send(Message::Text(
+                serde_json::to_string(&RelayMessage::Error {
+                    code: 1,
+                    message: "NOT_REGISTERED".into(),
                 })
                 .unwrap(),
             ))
@@ -276,8 +354,6 @@ async fn client_handles_frames_and_error_drops_session() {
     let task_status = Arc::clone(&status);
     let endpoint = format!("ws://{addr}");
     let endpoint_for_task = endpoint.clone();
-    // Production wrapper (default backoff): after the error drop it would sleep 5s before retry, so
-    // we observe the Connected→Disconnected transition and abort before the sleep completes.
     let client = tokio::spawn(async move {
         run_relay_connection(
             endpoint_for_task,
@@ -289,7 +365,6 @@ async fn client_handles_frames_and_error_drops_session() {
         .await
     });
 
-    // Observe Connected (RegisterAck), then Disconnected with a bumped attempt count (the error).
     let mut connected = false;
     for _ in 0..150 {
         if status.is_connected() {
@@ -308,13 +383,16 @@ async fn client_handles_frames_and_error_drops_session() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(dropped, "error frame dropped the session to Disconnected");
+    assert!(
+        dropped,
+        "a registration-invalidating error drops the session"
+    );
     let v = status.snapshot_json(&endpoint, "peerhex");
     assert!(
         v["last_error"]
             .as_str()
             .unwrap_or("")
-            .contains("relay error 3"),
+            .contains("relay error 1"),
         "recorded the relay error, got {:?}",
         v["last_error"]
     );

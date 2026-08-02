@@ -615,6 +615,20 @@ never see each other).
 - The discovered-peer set is exposed via `RelayStatus::known_peers` / `known_peer_count` for the
   consumer (dig-gossip's pool/address book) to read. It is per-session — cleared on every reconnect so
   a stale list is never served across a drop.
+- A relay `Error` frame **MUST** be classified before it is allowed to end the reservation, because
+  the relay reports both reservation-level and PER-REQUEST failures on the same channel:
+  - Codes meaning THIS node's registration did not happen or is no longer valid — `1 NOT_REGISTERED`,
+    and the four that accompany a failing `register_ack` (`4 CAPACITY`, `5 ID_IN_USE`,
+    `6 IDENTITY_MISMATCH`, `7 RATE_LIMITED`) — **MUST** end the reservation loop and re-register with
+    backoff.
+  - Per-request codes — `2 BAD_MESSAGE` (one frame we sent) and `3 PEER_NOT_FOUND` (the peer we tried
+    to reach is not on this relay) — **MUST NOT** disturb the reservation. `PEER_NOT_FOUND` is routine
+    on a live network; treating it as fatal de-registers the node on every failed dial and flaps it in
+    and out of every other peer's introductions.
+  - An UNKNOWN code **MUST** be treated as per-request (reservation held) and logged. The asymmetry is
+    deliberate: a wrong guess costs a log line, whereas defaulting to fatal would let a newly-introduced
+    code drop every node on the network off its relay at once.
+  These codes are byte-identical to `dig-relay`'s `errcode` catalogue.
 - The relay is an UNTRUSTED intermediary. The discovered-peer set **MUST** be bounded to a fixed cap
   (`MAX_KNOWN_PEERS`, 1024) and deduped by `peer_id`: a hostile/compromised relay can stream an
   unbounded flood of `PeerConnected` frames — or a single oversized `Peers` frame — with distinct
