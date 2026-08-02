@@ -136,6 +136,29 @@ fn is_tls_client_hello(payload: &[u8]) -> bool {
     payload.len() >= 6 && payload[0] == 0x16 && payload[5] == 0x01
 }
 
+/// Relay error codes that invalidate THIS node's own reservation, mirroring `dig-relay`'s
+/// `errcode` catalogue. Kept as an explicit list so the two stay conformance-checkable.
+///
+/// - `1 NOT_REGISTERED` — the relay does not consider us registered, so the reservation is gone.
+/// - `4 CAPACITY`, `5 ID_IN_USE`, `6 IDENTITY_MISMATCH`, `7 RATE_LIMITED` — each accompanies a
+///   FAILING `register_ack`: the registration did not happen.
+const FATAL_RELAY_ERROR_CODES: [u32; 5] = [1, 4, 5, 6, 7];
+
+/// Whether a relay `Error` frame means the RESERVATION is invalid (end the loop, back off and
+/// re-register) rather than a single request having failed (log it; keep serving).
+///
+/// The relay reports both kinds on one channel, and the per-request kind is the COMMON one:
+/// `3 PEER_NOT_FOUND` simply means the peer we tried to reach is no longer on this relay, which
+/// happens constantly on a live network and says nothing about our own registration. Treating it as
+/// fatal cost the node its reservation on every failed dial (dig_ecosystem #1932).
+///
+/// An UNKNOWN (future) code is deliberately treated as NON-fatal. Guessing wrong in that direction
+/// costs one logged line; guessing wrong the other way would let a newly-introduced code drop every
+/// node on the network off its relay at once.
+pub fn relay_error_is_fatal(code: u32) -> bool {
+    FATAL_RELAY_ERROR_CODES.contains(&code)
+}
+
 /// Compute the next reconnect backoff: capped exponential in the number of consecutive failures.
 /// `failures == 0` → base; doubles each failure up to [`MAX_BACKOFF_SECS`]. Pure → unit-tested.
 pub fn backoff_secs(consecutive_failures: u32) -> u64 {
@@ -1253,7 +1276,15 @@ where
             status.route_relayed(&from, payload)
         }
         RelayMessage::Error { code, message } => {
-            return Err(format!("relay error {code}: {message}"));
+            // A relay `Error` frame is NOT automatically a reservation problem — the relay reports
+            // per-REQUEST failures on the same channel. Treating them all as fatal made a routine
+            // "the peer you asked for has left" (`PEER_NOT_FOUND`) tear down this node's own
+            // reservation, de-register it, and force a full reconnect — a flap that repeatedly
+            // pulled the node out of the relay's introductions (dig_ecosystem #1932).
+            if relay_error_is_fatal(code) {
+                return Err(format!("relay error {code}: {message}"));
+            }
+            tracing::debug!(code, %message, "relay reported a per-request error; reservation held");
         }
         other => tracing::debug!(?other, "relay message ignored by reservation loop"),
     }
@@ -1318,6 +1349,41 @@ mod tests {
     use dig_ip::Family;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Mutex as StdMutex;
+
+    // -- #1932: a per-request relay error must not cost us the reservation -------------------
+
+    #[test]
+    fn peer_not_found_is_not_fatal_because_it_is_about_another_peer() {
+        // The exact frame that was flapping the fleet: the peer we dialled had left the relay.
+        // Routine on a live network, and no statement at all about our own registration.
+        assert!(!relay_error_is_fatal(3));
+    }
+
+    #[test]
+    fn a_bad_frame_we_sent_costs_that_frame_not_the_reservation() {
+        assert!(!relay_error_is_fatal(2));
+    }
+
+    #[test]
+    fn every_code_that_means_our_registration_failed_is_fatal() {
+        // 1 NOT_REGISTERED, and the four that accompany a failing register_ack. For these the
+        // reservation genuinely does not exist, so ending the loop and re-registering is correct.
+        for code in [1, 4, 5, 6, 7] {
+            assert!(
+                relay_error_is_fatal(code),
+                "code {code} invalidates the reservation and must end the loop"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_future_code_keeps_the_reservation() {
+        // Deliberate asymmetry: a wrong guess here costs one log line, whereas defaulting to fatal
+        // would let a newly-introduced code take every node off its relay simultaneously.
+        for code in [0, 8, 99, u32::MAX] {
+            assert!(!relay_error_is_fatal(code), "code {code} must not be fatal");
+        }
+    }
 
     #[test]
     fn parses_wss_host_and_explicit_port() {
