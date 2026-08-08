@@ -13,7 +13,7 @@
 # the others so the ordering/fallback strategy is tested with mock methods regardless.
 [package]
 name = "dig-nat"
-version = "0.18.0"
+version = "0.19.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -26,10 +26,11 @@ categories = ["network-programming"]
 [dependencies]
 # Canonical relay endpoint: `dig_constants::DIG_RELAY_URL` (wss://relay.dig.net:443) is the single
 # source of truth dig-nat uses to reach `relay.dig.net`. Sourced from the crates.io release.
-# VERSION REQ: `>=0.4, <0.6` spans the additive 0.4.x and 0.5.x lines (nothing dig-nat depends on
-# changed across them) while guarding against a future breaking 0.6; it resolves to the latest
-# published 0.5.x on crates.io.
-dig-constants = { version = ">=0.4, <0.6" }
+# VERSION REQ: plain caret on the current line. The 0.4→0.10 releases were additive over the one
+# symbol dig-nat consumes (`DIG_RELAY_URL`, unchanged in name and value), so the old `>=0.4, <0.6`
+# span described a compatibility window that no longer matches what is published; track the current
+# line and widen deliberately if a consumer ever needs an older one.
+dig-constants = { version = "0.10" }
 
 # The CANONICAL DIG peer mTLS crate (L00): the shipped public DigNetwork CA, per-peer `NodeCert`
 # (CA-signed leaf carrying the #1204 BLS-G1 binding), `peer_id = SHA-256(TLS SPKI DER)`, the ready
@@ -45,7 +46,10 @@ dig-tls = { version = "0.3" }
 # relay descriptors (#1204/#1199), AND by the cross-crate conformance test that pins dig-tls's binding
 # BLS derivation byte-identical to dig-identity's (the check dig-tls's `bls.rs` doc-comment defers to
 # this integration level). The cert-binding + peer_id use of dig-identity moved to dig-tls.
-dig-identity = { version = ">=0.4.1, <0.5" }
+# VERSION REQ: plain caret on the current line — the 0.4→0.6 delta over the six symbols dig-nat uses
+# is purely additive (their signatures are unchanged), so the old `>=0.4.1, <0.5` span excluded
+# compatible releases for no reason.
+dig-identity = { version = "0.6" }
 
 # The ecosystem's single, canonical address-family discovery + IPv6-first happy-eyeballs dial
 # (CLAUDE.md §5.2). dig-nat is the FIRST consumer: `MtlsDialer::dial` builds a `dig_ip::PeerCandidates`

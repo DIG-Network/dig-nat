@@ -153,14 +153,21 @@ The dialer **MUST** delegate family selection + racing to `dig_ip::connect`. `Mt
 The behaviour `dig-nat` INHERITS from `dig-ip` (its structural guarantees, tested here in
 `tests/dial_family.rs`):
 
-- **G1** — the dial NEVER attempts an address of a family the LOCAL host lacks (an IPv4-only host
-  never emits an IPv6 SYN).
+- **G1** — when the local∩peer family intersection is NON-EMPTY, the dial MUST NOT attempt an address
+  of a family the LOCAL host lacks (a host with a detected IPv4 route and a dual-stack peer never
+  emits an IPv6 SYN).
 - **G2** — the dial NEVER attempts an address of a family the PEER lacks.
 - **IPv6-first preference** — a viable IPv6 candidate wins even if a hedged IPv4 attempt connects
   sooner; IPv4 wins only when IPv6 genuinely fails/stalls.
-- **Clean disjoint outcome** — when the local host and the peer share no family, the dial fails
-  IMMEDIATELY with `dig_ip::ConnectError::NoCommonFamily` (surfaced as a `MethodError` whose reason
-  contains "no common address family"); NO dial is attempted, so there is no doomed, hanging SYN.
+- **Fail OPEN on an empty intersection** — `LocalStack` detection is affirmative-only: a successful
+  probe proves a family is routable, but a failed probe proves only the absence of a DEFAULT route,
+  not that the family is unreachable (overlay / split-tunnel / container networks, and the pre-route
+  window at boot, all produce false negatives). So the intersection is an OPTIMIZATION, not a veto:
+  when it is empty and the peer HAS candidates, the dial MUST attempt ALL of the peer's candidates
+  IPv6-first rather than stranding a peer the negative detection cannot honestly rule out.
+- **Clean nothing-to-dial outcome** — `dig_ip::ConnectError::NoCommonFamily` (surfaced as a
+  `MethodError` whose reason contains "no common address family") is returned ONLY when the peer
+  offers no candidate at all; NO dial is attempted, so there is no doomed, hanging SYN.
 - The per-attempt timeout + inter-attempt stagger are configurable (`HappyEyeballsConfig`, mapped to
   `dig_ip::DialConfig`) so the racing is deterministically testable.
 - The established connection's reported remote address (`PeerConnection::remote_addr`) reflects the
@@ -846,9 +853,11 @@ relay_descriptor::verify_relay_descriptor(&desc, presented_spki_der, did_resolve
   + intersection are dig-ip's job at dial time.
 - Family intersection (via dig-ip, `tests/dial_family.rs` using `LocalStack::from_flags`): dual-stack
   prefers IPv6; a failed IPv6 falls back to IPv4; a v4-only host dials only IPv4 (G1); a v4-only peer
-  is dialed only over IPv4 (G2); a disjoint local/peer pair fails immediately with `NoCommonFamily` and
+  is dialed only over IPv4 (G2); an EMPTY intersection over a peer that has candidates fails OPEN and
+  attempts them all IPv6-first; a peer with NO candidates fails immediately with `NoCommonFamily` and
   attempts NO dial. End-to-end over the production `MtlsDialer`: `[unreachable IPv6, reachable IPv4]`
-  connects over IPv4; a v4-only host asked for a v6-only peer returns a clean no-common-family error.
+  connects over IPv4; a v4-only-detected host asked for a v6-only peer really attempts that candidate
+  and surfaces the transport failure, never a no-common-family refusal.
 - IPv6 selection: `select_global_ipv6` returns a global-unicast IPv6 and rejects link-local / ULA /
   loopback / unspecified.
 - Identity: `peer_id = SHA-256(SPKI DER)` matches `dig-gossip` (`tests/identity.rs` conformance).

@@ -96,9 +96,13 @@ three places, kept consistent:
   aggregates the outcome into a `dig_ip::PeerCandidates` (`dialer::candidates_from_outcome`), resolves
   the local host's `dig_ip::LocalStack` (`cached()` in prod, or a pinned stack via `with_local_stack`
   for tests), and calls `dig_ip::connect` with a raw-TCP dial closure. `dig-ip` guarantees the dial
-  never attempts a family the local host (G1) or the peer (G2) lacks, prefers a viable IPv6 over a
-  hedged IPv4, and fails a disjoint pair immediately with `NoCommonFamily` (no doomed SYN) — behaviour
-  that used to be a hand-rolled racer + sort here. The per-attempt timeout + stagger are injectable
+  never attempts a family the peer lacks (G2), prefers a viable IPv6 over a hedged IPv4, and — while a
+  common family exists — never attempts one the local host lacks (G1) — behaviour that used to be a
+  hand-rolled racer + sort here. Since dig-ip 0.1.2 that local filter is an OPTIMIZATION rather than a
+  veto: local-stack detection is affirmative-only, so an EMPTY intersection fails OPEN to all of the
+  peer's candidates instead of stranding a peer whose family a false-negative probe merely failed to
+  see (overlay / split-tunnel / pre-route networks). `NoCommonFamily` now means only "the peer offers
+  no candidate at all". The per-attempt timeout + stagger are injectable
   (`HappyEyeballsConfig` → `dig_ip::DialConfig`) so the wiring is unit-tested with no real sockets. The
   winning stream's family is reflected in `PeerConnection::remote_addr`. Once TCP wins, the single mTLS
   handshake runs over it (unchanged).
