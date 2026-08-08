@@ -18,8 +18,11 @@
 //! single ecosystem responsibility. [`MtlsDialer::dial`] aggregates a [`MethodOutcome`]'s candidate
 //! addresses into a [`dig_ip::PeerCandidates`] and calls [`dig_ip::connect`], handing it the local
 //! host's [`dig_ip::LocalStack`] and a closure that performs one candidate's raw TCP connect.
-//! `dig-ip` then dials over the **local∩peer family intersection** (never a family the local host or
-//! the peer lacks — its structural guarantee), IPv6-first with graceful IPv4 fallback. Once a TCP
+//! `dig-ip` then dials over the **local∩peer family intersection** (never a family the peer lacks,
+//! and — while that intersection is non-empty — never one the local host lacks), IPv6-first with
+//! graceful IPv4 fallback. Because local-stack detection is affirmative-only, an EMPTY intersection
+//! FAILS OPEN to all of the peer's candidates rather than stranding it on a false-negative probe.
+//! Once a TCP
 //! connection wins, the single mTLS handshake runs over it — the identity/cert behaviour below is
 //! unchanged; only the family selection + racing moved out. See `dig-ip`'s `SPEC.md`.
 
@@ -297,10 +300,12 @@ impl Dialer for MtlsDialer {
             return self.dial_relayed(peer, outcome).await;
         }
 
-        // Delegate family selection + racing to dig-ip: it dials only the local∩peer family
-        // intersection (never a family the local host or the peer lacks), IPv6-first with graceful
-        // IPv4 fallback. A disjoint pair fails immediately with `NoCommonFamily` — no doomed attempt
-        // that can only time out. The winning stream carries its own peer address, so `remote_addr`
+        // Delegate family selection + racing to dig-ip: it dials the local∩peer family intersection
+        // (never a family the peer lacks), IPv6-first with graceful IPv4 fallback, and falls OPEN to
+        // every peer candidate when that intersection is empty — local-stack detection is
+        // affirmative-only, so a negative probe must not veto a peer it merely failed to see. Only a
+        // peer with NO candidates yields `NoCommonFamily`, so there is never a doomed attempt that
+        // can only time out. The winning stream carries its own peer address, so `remote_addr`
         // reflects the family actually used.
         let local = self.local_stack.unwrap_or_else(LocalStack::cached);
         let candidates = candidates_from_outcome(outcome);
