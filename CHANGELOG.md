@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.19.0] - 2026-08-08
+
+### Features
+- **deps:** Bump dig-constants 0.10, dig-identity 0.6, dig-ip 0.1.2 (#25)
+
 ## [0.18.0] - 2026-08-02
 
 ### Features
