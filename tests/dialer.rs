@@ -222,12 +222,21 @@ async fn dial_falls_back_from_unreachable_ipv6_to_ipv4() {
     assert!(conn.remote_addr.is_ipv4());
 }
 
-/// A v4-only local host asked to dial a peer that ONLY advertises an IPv6 candidate fails cleanly and
-/// IMMEDIATELY (dig-ip's `NoCommonFamily`) — it never emits a doomed IPv6 SYN that could only hang.
+/// A v4-only-DETECTED local host asked to dial a peer that ONLY advertises an IPv6 candidate does not
+/// strand it: since dig-ip 0.1.2 the empty local∩peer intersection FAILS OPEN, so the IPv6 candidate
+/// IS attempted and the failure reported is the real transport failure (a tcp connect error), never a
+/// "no common address family" refusal. Negative local-stack detection is a false negative on overlay /
+/// split-tunnel / pre-route networks, so it must not veto a dial the peer says is possible.
 #[tokio::test]
-async fn dial_v4_only_host_to_v6_only_peer_is_clean_no_common_family() {
+async fn dial_v4_only_host_to_v6_only_peer_fails_open_and_attempts_the_candidate() {
     let dialer = MtlsDialer::new(test_node("dialer/client-d"))
-        .with_local_stack(LocalStack::from_flags(false, true));
+        .with_local_stack(LocalStack::from_flags(false, true))
+        // Bound the attempt: this address is unroutable by construction, and the point of the test is
+        // WHICH failure is reported, not how long the doomed connect takes.
+        .with_happy_eyeballs(HappyEyeballsConfig {
+            per_attempt_timeout: Duration::from_millis(250),
+            stagger: Duration::from_millis(20),
+        });
     let v6_only: std::net::SocketAddr = "[2001:db8::1]:9".parse().unwrap();
     let peer = PeerTarget::with_addr(PeerId::from_bytes([1u8; 32]), v6_only, "DIG_MAINNET");
     let outcome = MethodOutcome::single(TraversalKind::Direct, v6_only);
@@ -235,11 +244,15 @@ async fn dial_v4_only_host_to_v6_only_peer_is_clean_no_common_family() {
     let err = dialer.dial(&peer, &outcome).await.unwrap_err();
     assert_eq!(err.kind, TraversalKind::Direct);
     assert!(
-        err.reason.contains("no common address family"),
-        "reports a clean no-common-family error, got: {}",
+        !err.reason.contains("no common address family"),
+        "the peer must not be stranded by an unreliable negative local-stack probe, got: {}",
         err.reason
     );
-    assert!(!err.reason.contains("tcp connect"));
+    assert!(
+        err.reason.contains("tcp connect"),
+        "the candidate is really attempted, so the transport failure is what surfaces, got: {}",
+        err.reason
+    );
 }
 
 /// Dialing an address with nothing listening fails cleanly (tcp connect error), no panic/hang.
