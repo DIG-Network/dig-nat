@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.20.0] - 2026-08-22
+
+### Build
+- **deps:** Uplift dig-tls 0.3 -> 0.4 (chia-bls 0.36.1), release 0.20.0 (#27)
+
 ## [0.19.0] - 2026-08-08
 
 ### Features
