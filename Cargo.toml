@@ -13,7 +13,7 @@
 # the others so the ordering/fallback strategy is tested with mock methods regardless.
 [package]
 name = "dig-nat"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -38,7 +38,13 @@ dig-constants = { version = "0.10" }
 # dig-nat CONSUMES all of this instead of hand-rolling cert generation / mTLS config / the binding /
 # peer_id (deleted in 0.6.0), so there is exactly ONE implementation of the DIG cert model and no
 # byte-drift risk. dig-tls is L00, so dig-nat (L10) → dig-tls is a valid reference-DOWN edge.
-dig-tls = { version = "0.3" }
+#
+# VERSION REQ 0.4: the chia-bls 0.26 -> 0.36.1 uplift. dig-nat re-exports `NodeCert`, whose
+# constructors take a `chia_bls::SecretKey`, so that type's identity crosses dig-nat's own public
+# surface and this bump is breaking for consumers. It was also dig-nat's LAST edge onto the old chia
+# line; dig-identity and dig-constants were already on 0.36.1. Byte-identity across the uplift is
+# proven by `tests/bls_golden_vectors.rs`, blessed on the 0.26 line before the manifest moved.
+dig-tls = { version = "0.4" }
 
 # The node/relay BLS12-381 G1 identity primitives (dig-identity slot 0x0010, EIP-2333 path
 # m/12381'/8444'/9'/0'): `sign_message`/`verify_signature` (BLS G2 over the AugScheme),

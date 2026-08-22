@@ -867,6 +867,12 @@ relay_descriptor::verify_relay_descriptor(&desc, presented_spki_der, did_resolve
   directions, and the pubkey dig-tls binds into a real `NodeCert` (recovered via
   `verify_binding_from_leaf_cert`) equals dig-identity's derived pubkey. This is the check dig-tls's
   `bls.rs` defers to the integration level; it FAILS if a future `chia-bls`/`blst` bump ever diverges.
+- Frozen BLS vectors (`tests/bls_golden_vectors.rs`): the cross-crate conformance above is a
+  RELATIVE check — a `chia-bls` uplift that changed the derivation on both sides at once would keep
+  it green. So the EIP-2333 secret scalar, the compressed 48-byte G1 public key, and the
+  deterministic 96-byte G2 AugScheme signature are additionally pinned as absolute byte vectors for
+  three label-derived keys. A dependency uplift **MUST** reproduce them exactly; a changed value is a
+  wire-compatibility break with peers already deployed, never a value to re-bless.
 - Cert BLS-binding (§2a, verified via re-exported `dig_tls` in `tests/identity.rs` + exhaustively in
   dig-tls's own suite): a CA-signed `NodeCert` verifies to `Bound{bls_pub}`; a substituted BLS pubkey,
   a binding replayed onto a different SPKI, a bad G1 point, and a malformed/unknown-version extension
