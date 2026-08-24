@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.21.0] - 2026-08-24
+
+### Bug Fixes
+- **relay:** A stale relayed circuit must not suppress a fresh dial (#28)
+
 ## [0.20.0] - 2026-08-22
 
 ### Build
