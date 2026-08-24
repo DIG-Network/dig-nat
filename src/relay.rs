@@ -100,6 +100,26 @@ const INBOUND_ACCEPT_CAP: usize = 64;
 /// vanished mid-handshake). Left immortal, such an entry PERMANENTLY suppresses the last-resort tier
 /// for that peer — precisely the connectivity loss the relay exists to prevent. 30s is orders of
 /// magnitude above a handshake RTT, so a real glare is never mistaken for a phantom.
+///
+/// THE ASSUMPTION THIS WINDOW RESTS ON, stated because the guard has a SECOND job. Discriminating a
+/// glare is exact: that race resolves within one handshake round trip, far inside any plausible
+/// window. But the same guard also protects an ESTABLISHED session ("the existing circuit IS the
+/// connection"), and for that job "silent for 30s" means dead only if a live relayed session is
+/// guaranteed inbound traffic at least that often. NOTHING IN THIS CRATE GUARANTEES THAT — a consumer
+/// that can leave a relayed session genuinely quiet for longer must carry its own keepalive over the
+/// tunnel (recorded normatively in `SPEC.md`). If that is violated, a quiet-but-live circuit loses its
+/// key to a fresh dial, the displaced session's id-matched `close_tunnel` never fires, and inbound
+/// frames route into the new entry — #1536's double-session harm reached by a new trigger.
+///
+/// NOT related to [`PING_INTERVAL_SECS`], which is also 30 — a COINCIDENCE, and a misleading one. That
+/// is the node-to-RELAY reservation keepalive (RLY-006); it never reaches
+/// [`route_relayed`](RelayStatus::route_relayed), so it never refreshes a circuit's `last_activity`.
+/// Do not "align" the two, and do not read one as justifying the other.
+///
+/// The window also does NOT bound a relay that INJECTS frames: `last_activity` is stamped on any
+/// inbound frame for the key, ahead of routing and validation, so an injecting relay can hold a
+/// phantom "live" forever. Stamping later does not help (an injected frame reaches a live sink too);
+/// see the injected-ClientHello caveat in `SPEC.md`.
 const STALE_CIRCUIT_IDLE: Duration = Duration::from_secs(30);
 
 /// The mTLS role a locally-registered [`RelayTunnel`] runs — the discriminator that resolves the
@@ -746,6 +766,12 @@ impl RelayStatus {
             // An inbound frame is this circuit's proof of life, so stamp it before routing: staleness
             // (#1871) is measured from LAST ACTIVITY, never from registration, or a healthy long-lived
             // relayed session would age into "replaceable" and be clobbered by the next dial.
+            //
+            // This counts ARRIVAL, not validity — it is deliberately ahead of the `match`, so a frame
+            // that is then ignored (glare tie-break) or dropped (full/closed sink) still refreshes the
+            // circuit. That is right for a genuine peer, whose frames prove it is there whatever we do
+            // with them; it also means an INJECTING relay can keep a phantom alive. The window is a
+            // liveness heuristic, never a security boundary — see [`STALE_CIRCUIT_IDLE`].
             if let Some(entry) = tunnels.get_mut(from) {
                 entry.last_activity = Instant::now();
             }

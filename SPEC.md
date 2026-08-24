@@ -403,14 +403,33 @@ INITIATED:
   client tunnel to force it to yield its outbound dial to a server accept that no real peer completes —
   a selective relayed-dial denial (both legs fail). This never bypasses mTLS identity (the injected
   circuit authenticates nothing), but it is an availability lever inherent to an untrusted TURN relay.
-  The denial is bounded by the `STALE_CIRCUIT_IDLE` liveness window above: a circuit that never
-  completes carries no inbound frames, so the next dial after the window replaces it. Before that
-  bound existed the denial WAS permanent whenever the stalled circuit's `RelayTunnel` was never
-  dropped (a stuck accept task) — observed in the field as a relayed tier refused at zero elapsed time
-  while the peer pool held no connection at all.
+  The `STALE_CIRCUIT_IDLE` liveness window above bounds this denial **only against a peer that has
+  vanished or stalled** — such a circuit carries no inbound frames, so the next dial after the window
+  replaces it. Before that window existed the denial was permanent in that case too, whenever the
+  stalled circuit's `RelayTunnel` was never dropped (a stuck accept task) — observed in the field as a
+  relayed tier refused at zero elapsed time while the peer pool held no connection at all.
+  **The window does NOT bound an INJECTING relay, and MUST NOT be claimed to.** Liveness is stamped on
+  any inbound frame from the peer key, before routing and before validation, so it is refreshed even by
+  a frame that is subsequently ignored (the glare tie-break) or dropped (a full or closed sink). A relay
+  able to inject the fabricated ClientHello that creates the phantom is equally able to inject one byte
+  per window and hold the circuit "live" indefinitely, restoring the permanent denial. Moving the stamp
+  later does not close this: an injected frame reaches a live sink as readily as a genuine one. This is
+  the same availability lever as the injection itself — inherent to an untrusted TURN relay, not a
+  regression of it — and it is why consumers **SHOULD** bound the server-accept handshake with a
+  timeout rather than relying on the idle window as a security boundary.
   The dial is NOT permanently lost: once the never-completing server circuit is dropped, the peer key
   frees and a fresh dial may be attempted. Consumers **SHOULD** bound the server-accept handshake with a
   timeout and re-attempt the outbound dial on failure.
+- **Liveness-window assumption (NORMATIVE).** Treating "no inbound frame within `STALE_CIRCUIT_IDLE`"
+  as dead is exact for a GLARE, which resolves within one handshake round trip. For an ESTABLISHED
+  circuit it rests on an assumption the relay layer does not itself enforce: that a live relayed
+  session exchanges *some* inbound frame at least that often. A consumer that can leave a relayed
+  session genuinely quiet for longer than the window **MUST** carry its own application- or
+  session-level keepalive over the tunnel. Note that the reservation keepalive (`PING_INTERVAL_SECS`,
+  RLY-006) does **NOT** satisfy this: it is a node-to-RELAY ping and never reaches per-circuit frame
+  routing, so it never refreshes a circuit's liveness. If the assumption is violated, a quiet-but-live
+  circuit loses its peer key to a fresh dial, the displaced session's id-matched teardown never runs,
+  and inbound frames route to the new entry — the #1536 double-session harm reached by a new trigger.
 
 Without a responder path, both circuit ends acted as TLS client and the handshake deadlocked; without
 the deterministic role tie-break + non-clobber, a simultaneous or timing-ordered mutual dial
