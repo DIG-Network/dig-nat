@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dig_ip::{CandidateSource, DialConfig, LocalStack, PeerCandidates};
 use futures_util::{SinkExt, StreamExt};
@@ -90,6 +90,18 @@ pub const MAX_RELAY_TUNNELS: usize = 256;
 /// (bounded backpressure), never queued unboundedly.
 const INBOUND_ACCEPT_CAP: usize = 64;
 
+/// How long a registered relay circuit may sit with NO inbound frame before a fresh outbound dial to
+/// that peer is allowed to replace it (#1871).
+///
+/// The RLY-002 non-clobber guard (#1536) exists to resolve a GLARE — two peers dialing each other at
+/// once — and that race is decided within one handshake round trip. A circuit silent for far longer
+/// than any handshake is not a glare; it is a registration whose mTLS session never came up, or one
+/// that has since died without its [`RelayTunnel`] being dropped (a stuck accept task, a peer that
+/// vanished mid-handshake). Left immortal, such an entry PERMANENTLY suppresses the last-resort tier
+/// for that peer — precisely the connectivity loss the relay exists to prevent. 30s is orders of
+/// magnitude above a handshake RTT, so a real glare is never mistaken for a phantom.
+const STALE_CIRCUIT_IDLE: Duration = Duration::from_secs(30);
+
 /// The mTLS role a locally-registered [`RelayTunnel`] runs — the discriminator that resolves the
 /// GLARE / simultaneous-mutual-dial case (#1536). A relay circuit needs exactly ONE mTLS client + ONE
 /// mTLS server; when two NAT'd peers fall to the relay tier and dial EACH OTHER at the same time (the
@@ -119,6 +131,10 @@ struct TunnelEntry {
     sink: mpsc::Sender<Vec<u8>>,
     role: TunnelRole,
     id: u64,
+    /// When this circuit last showed life — stamped at registration and refreshed on every inbound
+    /// frame routed into it. Read by [`RelayStatus::open_tunnel`] to tell a live circuit from a
+    /// phantom (#1871); see [`STALE_CIRCUIT_IDLE`].
+    last_activity: Instant,
 }
 
 /// Whether `payload` begins with a TLS handshake record whose first message is a ClientHello — a TLS
@@ -604,8 +620,26 @@ impl RelayStatus {
         // duplicate would orphan one role and leave two mTLS sessions racing to one peer. Checked +
         // inserted under ONE lock so a concurrent `route_relayed` cannot slip a role in between.
         let mut tunnels = self.tunnels.lock().unwrap();
-        if tunnels.contains_key(target_peer) {
-            return Err("existing relay circuit to peer — not opening a duplicate".into());
+        // #1871: only a LIVE circuit may suppress the dial. A registration that has carried no inbound
+        // frame for [`STALE_CIRCUIT_IDLE`] is not the glare this guard defends against — it is a
+        // phantom the peer pool cannot see, and honouring it suppresses the last-resort tier forever.
+        // Evict it and let the dial proceed: a redundant circuit costs one socket, a suppressed one
+        // costs all connectivity to that peer.
+        match tunnels.get(target_peer) {
+            Some(entry) if entry.last_activity.elapsed() < STALE_CIRCUIT_IDLE => {
+                return Err("existing relay circuit to peer — not opening a duplicate".into());
+            }
+            Some(_) => {
+                // The evicted entry's `RelayTunnel` may still be held by a stuck task; its `Drop` is
+                // id-matched (`close_tunnel`), so it cannot deregister the fresh circuit below.
+                tracing::debug!(
+                    target_peer,
+                    idle_secs = STALE_CIRCUIT_IDLE.as_secs(),
+                    "replacing a stale relay circuit — no inbound frame within the idle window"
+                );
+                tunnels.remove(target_peer);
+            }
+            None => {}
         }
         // A dialer runs the mTLS client over the tunnel it opens.
         Ok(self.insert_entry(&mut tunnels, target_peer, network_id, TunnelRole::Client))
@@ -639,7 +673,15 @@ impl RelayStatus {
     ) -> RelayTunnel {
         let (tx, rx) = mpsc::channel(RELAY_TUNNEL_INBOUND_CAP);
         let id = self.next_tunnel_id.fetch_add(1, Ordering::Relaxed);
-        tunnels.insert(target_peer.to_string(), TunnelEntry { sink: tx, role, id });
+        tunnels.insert(
+            target_peer.to_string(),
+            TunnelEntry {
+                sink: tx,
+                role,
+                id,
+                last_activity: Instant::now(),
+            },
+        );
         RelayTunnel {
             target: target_peer.to_string(),
             network_id: network_id.to_string(),
@@ -701,6 +743,12 @@ impl RelayStatus {
         }
         let route = {
             let mut tunnels = self.tunnels.lock().unwrap();
+            // An inbound frame is this circuit's proof of life, so stamp it before routing: staleness
+            // (#1871) is measured from LAST ACTIVITY, never from registration, or a healthy long-lived
+            // relayed session would age into "replaceable" and be clobbered by the next dial.
+            if let Some(entry) = tunnels.get_mut(from) {
+                entry.last_activity = Instant::now();
+            }
             match tunnels.get(from).map(|e| (e.sink.clone(), e.role, e.id)) {
                 // We are the SERVER for this peer — every frame is the client's; route it.
                 Some((sink, TunnelRole::Server, _)) => Route::Deliver(sink),
@@ -848,6 +896,30 @@ impl RelayStatus {
     #[cfg(test)]
     pub(crate) fn open_tunnel_exists(&self, target_peer: &str) -> bool {
         self.tunnels.lock().unwrap().contains_key(target_peer)
+    }
+
+    /// Test-only: rewind a registered tunnel's `last_activity` by `age`, so a test can express an
+    /// idle circuit without sleeping through [`STALE_CIRCUIT_IDLE`] in wall-clock time.
+    #[cfg(test)]
+    pub(crate) fn backdate_tunnel(&self, target_peer: &str, age: Duration) {
+        let mut tunnels = self.tunnels.lock().unwrap();
+        let entry = tunnels
+            .get_mut(target_peer)
+            .expect("backdate_tunnel: no such tunnel");
+        entry.last_activity = Instant::now()
+            .checked_sub(age)
+            .expect("backdate_tunnel: age precedes the monotonic clock origin");
+    }
+
+    /// Test-only: the mTLS role registered under `target_peer`, if any — lets a test assert WHICH
+    /// registration holds the key after a stale circuit is replaced.
+    #[cfg(test)]
+    fn tunnel_role(&self, target_peer: &str) -> Option<TunnelRole> {
+        self.tunnels
+            .lock()
+            .unwrap()
+            .get(target_peer)
+            .map(|e| e.role)
     }
 
     /// Test-only: register a SERVER-role tunnel to `target_peer` directly, for tests that drive an mTLS
@@ -1694,6 +1766,89 @@ mod tests {
         );
     }
 
+    /// REGRESSION (#1871): a STALE relay circuit — one registered but silent past
+    /// [`STALE_CIRCUIT_IDLE`] — must NOT suppress a fresh outbound dial to that peer.
+    ///
+    /// Measured on two real hosts with direct connectivity physically impossible: the relayed tier
+    /// returned `existing relay circuit to peer — not opening a duplicate` at `elapsed_ms=0` while the
+    /// node's peer pool reported `connected_peers: 0, peers: []`. A server-role registration whose
+    /// mTLS session never came up is invisible to the pool yet immortal in the tunnel table, so the
+    /// last-resort tier stayed permanently suppressed for that peer.
+    ///
+    /// The replacement must also TAKE the key as the dialer's own CLIENT-role circuit — a fix that
+    /// returned a tunnel while leaving the phantom server entry in place would report success and
+    /// still route inbound frames into the dead session.
+    #[test]
+    fn stale_relayed_circuit_does_not_suppress_a_fresh_dial() {
+        let status = connected_status("00aa");
+        // A phantom: a server-role circuit accepted from an introduced frame whose session never came
+        // up. Its `RelayTunnel` is still held (a stuck accept task), so `Drop` never deregistered it.
+        let phantom = status.register_tunnel("ffbb", DEFAULT_NETWORK_ID, TunnelRole::Server);
+        status.backdate_tunnel("ffbb", STALE_CIRCUIT_IDLE + Duration::from_secs(1));
+
+        let fresh = status
+            .open_tunnel("ffbb", DEFAULT_NETWORK_ID)
+            .expect("a circuit idle past the stale window must not suppress the relayed tier");
+
+        assert_eq!(
+            status.tunnel_role("ffbb"),
+            Some(TunnelRole::Client),
+            "the fresh dial must OWN the key as the mTLS client — leaving the phantom server entry              registered would keep routing inbound frames into the dead session"
+        );
+        drop(fresh);
+        drop(phantom);
+    }
+
+    /// CONTROL for [`stale_relayed_circuit_does_not_suppress_a_fresh_dial`]: a LIVE circuit still
+    /// refuses a duplicate. This is the #1536 glare defense, and it is what separates the #1871 fix
+    /// from simply deleting the guard — a timing-ordered glare resolves within a handshake RTT, far
+    /// inside [`STALE_CIRCUIT_IDLE`], so the second dial must still be refused.
+    #[test]
+    fn live_relayed_circuit_still_refuses_a_duplicate_dial() {
+        let status = connected_status("00aa");
+        let held = status.register_tunnel("ffbb", DEFAULT_NETWORK_ID, TunnelRole::Server);
+
+        let Err(err) = status.open_tunnel("ffbb", DEFAULT_NETWORK_ID) else {
+            panic!("a freshly-registered circuit is a glare, not a phantom — refuse the dial")
+        };
+        assert!(
+            err.contains("not opening a duplicate"),
+            "the glare refusal must keep its own reason: {err}"
+        );
+        assert_eq!(
+            status.tunnel_role("ffbb"),
+            Some(TunnelRole::Server),
+            "the live server circuit keeps the key"
+        );
+        drop(held);
+    }
+
+    /// An inbound frame REFRESHES a circuit, so liveness is measured from last activity and not from
+    /// registration time. Without this, a long-lived healthy relayed session would age into
+    /// "stale" and be clobbered by the next dial — reintroducing the #1536 double-session under a
+    /// different trigger.
+    #[test]
+    fn inbound_traffic_refreshes_a_circuit_so_it_is_not_stale() {
+        let status = connected_status("00aa");
+        let held = status.register_tunnel("ffbb", DEFAULT_NETWORK_ID, TunnelRole::Server);
+        status.backdate_tunnel("ffbb", STALE_CIRCUIT_IDLE + Duration::from_secs(1));
+
+        // One inbound application frame on the server-role circuit — the peer is demonstrably alive.
+        // (Not a ClientHello: a server-role tunnel routes any frame straight through as the client's.)
+        status.route_relayed("ffbb", vec![0x17, 0x03, 0x03, 0x00, 0x01, 0x00]);
+
+        let Err(err) = status.open_tunnel("ffbb", DEFAULT_NETWORK_ID) else {
+            panic!(
+                "a circuit that just carried a frame is LIVE — staleness must be measured from                  last activity, not from registration"
+            )
+        };
+        assert!(
+            err.contains("not opening a duplicate"),
+            "a refreshed circuit refuses the duplicate for the glare reason: {err}"
+        );
+        drop(held);
+    }
+
     /// SECURITY (flood defense, tunnel cap): once [`MAX_RELAY_TUNNELS`] tunnels are open, a further
     /// introduced circuit from a new peer is DROPPED rather than registered — a hostile relay flooding
     /// distinct fabricated `from` ids cannot spawn unbounded server tunnels/accept-tasks.
@@ -1920,4 +2075,3 @@ mod tests {
         );
     }
 }
-
