@@ -630,14 +630,14 @@ impl RelayStatus {
                 return Err("existing relay circuit to peer — not opening a duplicate".into());
             }
             Some(_) => {
-                // The evicted entry's `RelayTunnel` may still be held by a stuck task; its `Drop` is
-                // id-matched (`close_tunnel`), so it cannot deregister the fresh circuit below.
+                // Fall through to `insert_entry`, which overwrites the key. The displaced entry's
+                // `RelayTunnel` may still be held by a stuck task, but its `Drop` is id-matched
+                // (`close_tunnel`), so it cannot deregister the fresh circuit that replaced it.
                 tracing::debug!(
                     target_peer,
                     idle_secs = STALE_CIRCUIT_IDLE.as_secs(),
                     "replacing a stale relay circuit — no inbound frame within the idle window"
                 );
-                tunnels.remove(target_peer);
             }
             None => {}
         }

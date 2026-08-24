@@ -380,7 +380,13 @@ INITIATED:
 - **At most ONE circuit per peer key — non-clobber (NORMATIVE).** A node **MUST NOT** hold two circuits
   (a client dial AND a server accept) to the same peer simultaneously. Opening a relayed dial to a peer
   a live circuit already exists for **MUST** be refused (the existing circuit IS the connection), and
-  the introduced-circuit accept path **MUST NOT** overwrite an existing entry. This covers the
+  the introduced-circuit accept path **MUST NOT** overwrite an existing entry.
+  A circuit is **LIVE** for this purpose only while it has carried an inbound frame within
+  `STALE_CIRCUIT_IDLE` (30s); a registration idle beyond that **MUST NOT** suppress a fresh dial and
+  **MUST** be replaced by it. Liveness is measured from LAST ACTIVITY, never from registration time, so
+  a long-lived healthy circuit never ages into replaceable. The window is orders of magnitude above a
+  handshake round trip, so it cannot mistake a real glare — which resolves within one RTT — for a
+  phantom. This covers the
   TIMING-ordered glare variant — a peer's ClientHello arriving BEFORE our own dial to it registers: we
   accept it as a server, and our subsequent dial to that peer is refused rather than clobbering the
   server circuit into a conflicting second mTLS session. The per-frame role LOOKUP + any same-frame
@@ -397,6 +403,11 @@ INITIATED:
   client tunnel to force it to yield its outbound dial to a server accept that no real peer completes —
   a selective relayed-dial denial (both legs fail). This never bypasses mTLS identity (the injected
   circuit authenticates nothing), but it is an availability lever inherent to an untrusted TURN relay.
+  The denial is bounded by the `STALE_CIRCUIT_IDLE` liveness window above: a circuit that never
+  completes carries no inbound frames, so the next dial after the window replaces it. Before that
+  bound existed the denial WAS permanent whenever the stalled circuit's `RelayTunnel` was never
+  dropped (a stuck accept task) — observed in the field as a relayed tier refused at zero elapsed time
+  while the peer pool held no connection at all.
   The dial is NOT permanently lost: once the never-completing server circuit is dropped, the peer key
   frees and a fresh dial may be attempted. Consumers **SHOULD** bound the server-accept handshake with a
   timeout and re-attempt the outbound dial on failure.
