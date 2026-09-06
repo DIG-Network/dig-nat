@@ -5,7 +5,7 @@
 //! "mocked socket" the task calls for. Covers the success paths (a present gateway/STUN server) and
 //! the timeout paths (nothing listening) that the pure encode/parse tests can't reach.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use dig_nat::method::natpmp::{
@@ -339,6 +339,88 @@ async fn stun_query_times_out_when_no_server() {
     assert!(
         matches!(err, StunError::Timeout | StunError::Io(_)),
         "graceful failure, got: {err:?}"
+    );
+}
+
+/// dig_ecosystem#3204 RECONCILIATION, exercised end-to-end (not just the pure classifier — see
+/// `reflexive_guard_tests` in `src/stun.rs`): three ranges this crate's pre-adoption guard used to
+/// ACCEPT are now `NeverDialable` per `dig_stun::scope`'s table, reconciled against dig-node's
+/// on-chain gate (dig-stun `SPEC.md` §5.4). This proves the reconciled classifier is actually WIRED
+/// INTO `query_reflexive_address`'s real dial path over a real (loopback) socket — a classifier
+/// that is merely correct in isolation but never reached would leave the same hole open.
+#[tokio::test]
+async fn stun_rejects_reconciled_never_dialable_ranges() {
+    let cases: [(&str, SocketAddr); 3] = [
+        (
+            "192.0.0.0/24 IETF protocol assignment (RFC 6890)",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 1)), 4000),
+        ),
+        (
+            "2001:2::/48 benchmarking (RFC 5180)",
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x2001, 2, 0, 0, 0, 0, 0, 1)), 4001),
+        ),
+        (
+            "100::/64 discard-only (RFC 6666)",
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, 1)), 4002),
+        ),
+    ];
+
+    for (label, reflexive) in cases {
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let responder = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (_, from) = server.recv_from(&mut buf).await.unwrap();
+            let txid: [u8; 12] = buf[8..20].try_into().unwrap();
+            let resp = match reflexive.ip() {
+                IpAddr::V4(_) => build_xor_mapped_response(&txid, reflexive),
+                IpAddr::V6(_) => build_xor_mapped_v6_response(&txid, reflexive),
+            };
+            server.send_to(&resp, from).await.unwrap();
+        });
+
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let err = query_reflexive_address(&client, server_addr, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            StunError::NoMappedAddress,
+            "{label} must be rejected post-reconciliation (dig_ecosystem#3204)"
+        );
+        responder.await.unwrap();
+    }
+}
+
+/// The reconciliation (above) tightens specific ranges; it must NOT reject every v4-mapped IPv6
+/// answer indiscriminately. `::ffff:8.8.8.8` embeds a genuinely GLOBAL address, so it must be
+/// ACCEPTED — closing the loop, for this wire shape, on both the reject path
+/// (`stun_rejects_ipv4_mapped_reserved_reflexive_address` above) and the accept path (here). Also
+/// the byte-identity check dig_ecosystem#3204 calls for: the decoded value is the wire form
+/// UNFOLDED (`::ffff:8.8.8.8`, not folded to `8.8.8.8`) — folding is only for the classification
+/// decision, never the returned address, identically before and after the dig-stun adoption.
+#[tokio::test]
+async fn stun_accepts_ipv4_mapped_global_reflexive_address() {
+    let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let mapped = SocketAddr::new(IpAddr::V6(Ipv4Addr::new(8, 8, 8, 8).to_ipv6_mapped()), 4003);
+
+    tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        let (_, from) = server.recv_from(&mut buf).await.unwrap();
+        let txid: [u8; 12] = buf[8..20].try_into().unwrap();
+        let resp = build_xor_mapped_v6_response(&txid, mapped);
+        server.send_to(&resp, from).await.unwrap();
+    });
+
+    let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let got = query_reflexive_address(&client, server_addr, Duration::from_secs(2))
+        .await
+        .expect("a global v4-mapped reflexive must be accepted, not rejected");
+    assert_eq!(
+        got, mapped,
+        "the address is returned as decoded off the wire (V6 form), unfolded"
     );
 }
 
