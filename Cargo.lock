@@ -582,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "dig-nat"
-version = "0.21.1"
+version = "0.21.2"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -590,6 +590,7 @@ dependencies = [
  "dig-constants",
  "dig-identity",
  "dig-ip",
+ "dig-stun",
  "dig-tls",
  "futures",
  "futures-util",
@@ -607,6 +608,17 @@ dependencies = [
  "tokio-util",
  "tracing",
  "yamux",
+]
+
+[[package]]
+name = "dig-stun"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6a980e520a5ceccc776b01e860bae3e0fe0e64037ee01b97774d20e385fb025"
+dependencies = [
+ "ring",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

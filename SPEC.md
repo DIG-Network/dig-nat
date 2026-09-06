@@ -188,8 +188,28 @@ defense-in-depth for a circuit opened by other paths.
 
 ### 3.4 Per-method address-family notes
 
-- **STUN (RFC 5389)** parses BOTH `FAMILY_IPV4` and `FAMILY_IPV6` XOR-MAPPED-ADDRESS attributes;
-  reflexive-address discovery is family-agnostic.
+- **STUN (RFC 5389) codec + client + scope guard are owned by `dig-stun` (hierarchy L00, dig_ecosystem#3204).**
+  `dig-nat` (L10) **CONSUMES** it and holds no codec / client / classifier code of its own — the
+  duplicated copy (which had already diverged from `dig-relay`'s STUN server on a shipped defect,
+  dig-relay#35) was extracted to `dig-stun` byte-for-byte from this crate's own `0.21.1`, so there is
+  exactly one implementation and no further byte-drift risk. `stun::{encode_binding_request,
+  parse_binding_response, query_reflexive_address, new_transaction_id, StunError,
+  ATTR_MAPPED_ADDRESS, ATTR_XOR_MAPPED_ADDRESS, BINDING_REQUEST, BINDING_SUCCESS, MAGIC_COOKIE}`
+  below are re-exported from `dig-stun` for consumer convenience; only `stun::discover_reflexive_address`
+  is genuinely this crate's own (it composes `dig_ip::connect` with the re-exported
+  `query_reflexive_address` — `dig-ip` is ALSO L00, so folding it into `dig-stun` would be a
+  forbidden same-level edge, Appendix B). The parser accepts BOTH `FAMILY_IPV4` and `FAMILY_IPV6`
+  XOR-MAPPED-ADDRESS attributes; reflexive-address discovery is family-agnostic.
+- **Reconciliation (NORMATIVE).** `dig-stun`'s address-scope table is RECONCILED against dig-node's
+  on-chain advertisement gate, whose range table had independently drifted from this crate's own
+  (`dig-stun` `SPEC.md` §5.4). Three ranges this crate's PRE-ADOPTION guard used to accept as a
+  usable reflexive candidate are now rejected: `192.0.0.0/24` (IETF protocol assignment, RFC 6890),
+  `2001:2::/48` (benchmarking, RFC 5180), and `100::/64` (discard-only, RFC 6666) — none is a range
+  any legitimate STUN server can ever answer with. Every other classification is unchanged (private/
+  CGNAT/ULA remain accepted, per the guard note below). Pinned by
+  `reflexive_guard_tests::rejects_ranges_newly_tightened_by_the_dig_stun_reconciliation` (pure
+  classifier) and `tests/socket_io.rs::stun_rejects_reconciled_never_dialable_ranges` (the same
+  three ranges exercised end-to-end through `query_reflexive_address` over a real socket).
 - **Reflexive discovery is happy-eyeballs across BOTH families (NORMATIVE, CLAUDE.md §5.2).**
   `stun::discover_reflexive_address(stun_servers, local, timeout)` races a STUN Binding transaction
   over the `local ∩ stun_servers` family intersection via `dig_ip::connect` — **IPv6-first with IPv4
