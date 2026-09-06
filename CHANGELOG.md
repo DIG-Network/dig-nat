@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.21.2] - 2026-09-06
+
+### Refactor
+- **stun:** Adopt dig-stun, delete the rival codec (#32)
+
 ## [0.21.1] - 2026-09-04
 
 ### Documentation
